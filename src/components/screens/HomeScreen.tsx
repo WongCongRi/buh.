@@ -1,24 +1,32 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRight,
+  Bell,
   CalendarPlus,
   Check,
   ChevronLeft,
   ChevronRight,
   ChevronUp,
   Plus,
+  RefreshCw,
+  Trash2,
 } from 'lucide-react';
 import { AnimatePresence, motion } from 'motion/react';
 import { TODAY_DATE_KEY } from '../../data/initialData';
+import { useOnlineStatus } from '../../hooks/useOnlineStatus';
 import {
   CalendarEvent,
   DefaultHome,
   FoldPosture,
+  GoogleCalendarSyncState,
+  GoogleTasksSyncState,
   NoteItem,
   ScreenId,
   TaskItem,
 } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
+import { CalendarConfirmModal, PendingCalendarMutation } from '../CalendarConfirmModal';
+import { GoogleSignInButton } from '../GoogleSignInButton';
 import { TaskDetailPane } from './TaskDetailPane';
 import { TaskDetailSheet } from './TaskDetailSheet';
 
@@ -33,10 +41,15 @@ interface HomeScreenProps {
   selectedTaskId: string | null;
   hingeAwareSplit: boolean;
   googleCalendarSync: boolean;
+  googleTasksSync: boolean;
+  googleCalendar: GoogleCalendarSyncState;
+  googleTasks: GoogleTasksSyncState;
   onSelectTask: (taskId: string | null) => void;
   onToggleTask: (taskId: string) => void;
   onUpdateTask: (task: TaskItem) => void;
   onDeleteTask: (taskId: string) => void;
+  onSyncGoogleTask: (task: TaskItem) => void;
+  onPushLocalTaskToGoogle: (task: TaskItem) => void;
   onAddEvent: (ev: CalendarEvent) => void;
   onConvertEventToTask: (ev: CalendarEvent) => void;
   onUpdateNote: (note: NoteItem) => void;
@@ -76,9 +89,10 @@ const MON_FIRST_LABELS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
 function parseLocalDate(dateKey: string): Date {
   const [yStr, mStr, dStr] = dateKey.split('-');
-  const y = Number(yStr) || 2026;
-  const m = (Number(mStr) || 11) - 1;
-  const d = Number(dStr) || 23;
+  const fallback = new Date();
+  const y = Number(yStr) || fallback.getFullYear();
+  const m = (Number(mStr) || fallback.getMonth() + 1) - 1;
+  const d = Number(dStr) || fallback.getDate();
   return new Date(y, m, d);
 }
 
@@ -153,23 +167,33 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   selectedTaskId,
   hingeAwareSplit,
   googleCalendarSync,
+  googleTasksSync,
+  googleCalendar,
+  googleTasks,
   onSelectTask,
   onToggleTask,
   onUpdateTask,
   onDeleteTask,
+  onSyncGoogleTask,
+  onPushLocalTaskToGoogle,
   onAddEvent,
   onConvertEventToTask,
   onUpdateNote,
   onNavigateScreen,
   onOpenNote,
 }) => {
+  const isOnline = useOnlineStatus();
+  const todayDate = useMemo(() => parseLocalDate(TODAY_DATE_KEY), []);
+  const todayYear = todayDate.getFullYear();
+  const todayMonth = todayDate.getMonth();
+
   const [selectedDateKey, setSelectedDateKey] = useState(TODAY_DATE_KEY);
   const [calendarExpanded, setCalendarExpanded] = useState(false);
-  const [viewYear, setViewYear] = useState(2026);
-  const [viewMonth, setViewMonth] = useState(10); // 0-indexed (10 = November)
+  const [viewYear, setViewYear] = useState(todayYear);
+  const [viewMonth, setViewMonth] = useState(todayMonth);
   const [monthSlideDir, setMonthSlideDir] = useState<1 | -1>(1);
   const [yearPickerOpen, setYearPickerOpen] = useState(false);
-  const [yearWindowStart, setYearWindowStart] = useState(2024);
+  const [yearWindowStart, setYearWindowStart] = useState(todayYear - 2);
   const [yearSlideDir, setYearSlideDir] = useState<1 | -1>(1);
   const [pullOffset, setPullOffset] = useState(0);
 
@@ -179,6 +203,8 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const [newBlockTime, setNewBlockTime] = useState('16:00');
   const [newBlockList, setNewBlockList] = useState(taskLists[0] || 'Work');
   const [convertedNotice, setConvertedNotice] = useState<string | null>(null);
+  const [pendingMutation, setPendingMutation] = useState<PendingCalendarMutation | null>(null);
+  const [mutationBusy, setMutationBusy] = useState(false);
 
   const swipeOriginRef = useRef<{ x: number; y: number } | null>(null);
   const yearSwipeOriginXRef = useRef<number | null>(null);
@@ -200,7 +226,12 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const inboxTasks = tasks.filter((t) => t.isInbox);
   const dayEvents = events
     .filter((e) => e.dateKey === selectedDateKey)
-    .sort((a, b) => a.startTime.localeCompare(b.startTime));
+    .sort((a, b) => {
+      const aFull = a.startTime === 'Full';
+      const bFull = b.startTime === 'Full';
+      if (aFull !== bFull) return aFull ? -1 : 1;
+      return a.startTime.localeCompare(b.startTime);
+    });
 
   // Checked-off tasks stay visible and shift cleanly to the bottom
   const primaryList = [...(defaultHome === DefaultHome.Inbox ? inboxTasks : dayTasks)].sort(
@@ -236,6 +267,29 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     });
   };
 
+  const saveLocalBlock = (
+    title: string,
+    dateKey: string,
+    startTime: string,
+    endTime: string,
+    calendarName: string
+  ) => {
+    const created: CalendarEvent = {
+      id: `ev-${Date.now()}`,
+      title,
+      dateKey,
+      startTime,
+      endTime,
+      durationMinutes: 60,
+      calendarName,
+      location: 'Focus block',
+      source: 'local',
+    };
+    onAddEvent(created);
+    setNewBlockTitle('');
+    setShowAddBlock(false);
+  };
+
   const handleCreateBlock = (e: React.FormEvent) => {
     e.preventDefault();
     const title = newBlockTitle.trim();
@@ -243,19 +297,77 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     const [hh, mm] = newBlockTime.split(':').map((n) => parseInt(n, 10));
     const endHour = (hh + 1) % 24;
     const endTime = `${endHour < 10 ? `0${endHour}` : endHour}:${mm < 10 ? `0${mm}` : mm}`;
-    const created: CalendarEvent = {
-      id: `ev-${Date.now()}`,
-      title,
-      dateKey: selectedDateKey,
-      startTime: newBlockTime,
-      endTime,
-      durationMinutes: 60,
-      calendarName: taskLists.includes(newBlockList) ? newBlockList : taskLists[0] || 'Work',
-      location: 'Focus block',
-    };
-    onAddEvent(created);
-    setNewBlockTitle('');
-    setShowAddBlock(false);
+    const calName = taskLists.includes(newBlockList) ? newBlockList : taskLists[0] || 'Work';
+
+    if (googleCalendarSync && (googleCalendar.isConnected || (!isOnline && Boolean(googleCalendar.userEmail)))) {
+      if (!isOnline) {
+        void googleCalendar.onCreateGoogleEvent({
+          title,
+          dateKey: selectedDateKey,
+          startTime: newBlockTime,
+          endTime,
+          calendarName: calName,
+        });
+        setNewBlockTitle('');
+        setShowAddBlock(false);
+        setConvertedNotice(`Saved "${title}" offline · will sync when online`);
+        window.setTimeout(() => setConvertedNotice(null), 2600);
+        return;
+      }
+      // Explicit user confirmation required before writing to Google Calendar
+      setPendingMutation({
+        action: 'create',
+        title,
+        dateKey: selectedDateKey,
+        startTime: newBlockTime,
+        endTime,
+        calendarName: calName,
+      });
+      return;
+    }
+
+    saveLocalBlock(title, selectedDateKey, newBlockTime, endTime, calName);
+  };
+
+  const handleConfirmMutation = async () => {
+    if (!pendingMutation || mutationBusy) return;
+    setMutationBusy(true);
+    try {
+      if (pendingMutation.action === 'create') {
+        await googleCalendar.onCreateGoogleEvent({
+          title: pendingMutation.title,
+          dateKey: pendingMutation.dateKey,
+          startTime: pendingMutation.startTime,
+          endTime: pendingMutation.endTime,
+          calendarName: pendingMutation.calendarName,
+        });
+        setNewBlockTitle('');
+        setShowAddBlock(false);
+        setConvertedNotice(
+          isOnline
+            ? `Added "${pendingMutation.title}" to Google Calendar`
+            : `Saved "${pendingMutation.title}" offline · will sync when online`
+        );
+        window.setTimeout(() => setConvertedNotice(null), 2600);
+      } else {
+        await googleCalendar.onDeleteGoogleEvent(
+          pendingMutation.eventId,
+          pendingMutation.googleEventId
+        );
+        setConvertedNotice(
+          isOnline
+            ? `Removed "${pendingMutation.title}" from Google Calendar`
+            : `Removed "${pendingMutation.title}" offline · will sync when online`
+        );
+        window.setTimeout(() => setConvertedNotice(null), 2600);
+      }
+      setPendingMutation(null);
+    } catch {
+      // Error surfaced via googleCalendar.error
+      setPendingMutation(null);
+    } finally {
+      setMutationBusy(false);
+    }
   };
 
   const handleConvert = (ev: CalendarEvent) => {
@@ -264,23 +376,52 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     window.setTimeout(() => setConvertedNotice(null), 2400);
   };
 
-  const handleCalendarPointerStart = (x: number, y: number) => {
-    swipeOriginRef.current = { x, y };
+  const resetCalendarGesture = () => {
+    swipeOriginRef.current = null;
+    setPullOffset(0);
+    window.setTimeout(() => {
+      didSwipeRef.current = false;
+    }, 60);
+  };
+
+  const handleCalendarPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    // Only track primary mouse button or touch/pen
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    swipeOriginRef.current = { x: e.clientX, y: e.clientY };
     didSwipeRef.current = false;
   };
 
-  const handleCalendarPointerMove = (x: number, y: number) => {
+  const handleCalendarPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!swipeOriginRef.current) return;
-    const dx = x - swipeOriginRef.current.x;
-    const dy = y - swipeOriginRef.current.y;
+    // Guard against missed pointerup when mouse button was released outside container
+    if (e.pointerType === 'mouse' && e.buttons === 0) {
+      resetCalendarGesture();
+      return;
+    }
 
-    // Live interactive pull resistance when collapsed
-    if (!calendarExpanded && dy > 0 && Math.abs(dy) > Math.abs(dx)) {
-      setPullOffset(Math.min(20, dy * 0.45));
+    const dx = e.clientX - swipeOriginRef.current.x;
+    const dy = e.clientY - swipeOriginRef.current.y;
+    const absX = Math.abs(dx);
+    const absY = Math.abs(dy);
+
+    // Capture pointer only after real drag slop so taps on day buttons always work cleanly
+    if (absX > 8 || absY > 8) {
+      try {
+        if (!e.currentTarget.hasPointerCapture(e.pointerId)) {
+          e.currentTarget.setPointerCapture(e.pointerId);
+        }
+      } catch {
+        // Ignore if pointer capture is unavailable
+      }
+    }
+
+    // Lightweight GPU-only visual pull feedback on the pill handle when collapsed
+    if (!calendarExpanded && dy > 0 && absY > absX) {
+      setPullOffset(Math.min(10, dy * 0.35));
     }
 
     // Horizontal swipe in monthly view -> prev / next month
-    if (calendarExpanded && Math.abs(dx) > 28 && Math.abs(dx) > Math.abs(dy) * 1.15) {
+    if (calendarExpanded && absX > 30 && absX > absY * 1.2) {
       stepMonth(dx < 0 ? 1 : -1);
       swipeOriginRef.current = null;
       didSwipeRef.current = true;
@@ -289,7 +430,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     // Vertical swipe down -> expand monthly view
-    if (!calendarExpanded && dy > 22 && Math.abs(dy) >= Math.abs(dx)) {
+    if (!calendarExpanded && dy > 20 && absY >= absX) {
       const dt = parseLocalDate(selectedDateKey);
       setViewYear(dt.getFullYear());
       setViewMonth(dt.getMonth());
@@ -301,7 +442,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
 
     // Vertical swipe up in monthly view -> collapse back to week strip
-    if (calendarExpanded && dy < -22 && Math.abs(dy) >= Math.abs(dx)) {
+    if (calendarExpanded && dy < -20 && absY >= absX) {
       setCalendarExpanded(false);
       setYearPickerOpen(false);
       swipeOriginRef.current = null;
@@ -310,12 +451,15 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
     }
   };
 
-  const handleCalendarPointerEnd = () => {
-    swipeOriginRef.current = null;
-    setPullOffset(0);
-    window.setTimeout(() => {
-      didSwipeRef.current = false;
-    }, 60);
+  const handleCalendarPointerEnd = (e: React.PointerEvent<HTMLDivElement>) => {
+    try {
+      if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+        e.currentTarget.releasePointerCapture(e.pointerId);
+      }
+    } catch {
+      // Ignore
+    }
+    resetCalendarGesture();
   };
 
   const handleYearRibbonMove = (x: number) => {
@@ -340,34 +484,25 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
   const yearChoices = Array.from({ length: 5 }, (_, i) => yearWindowStart + i);
 
   const renderCalendarSection = (compact = false) => (
-    <motion.div
-      layout
-      transition={{ duration: 0.28, ease: [0.16, 1, 0.3, 1] }}
-      onPointerDown={(e) => handleCalendarPointerStart(e.clientX, e.clientY)}
-      onPointerMove={(e) => handleCalendarPointerMove(e.clientX, e.clientY)}
+    <div
+      onPointerDown={handleCalendarPointerDown}
+      onPointerMove={handleCalendarPointerMove}
       onPointerUp={handleCalendarPointerEnd}
       onPointerCancel={handleCalendarPointerEnd}
-      onTouchStart={(e) => {
-        if (e.touches[0]) handleCalendarPointerStart(e.touches[0].clientX, e.touches[0].clientY);
-      }}
-      onTouchMove={(e) => {
-        if (e.touches[0]) handleCalendarPointerMove(e.touches[0].clientX, e.touches[0].clientY);
-      }}
-      onTouchEnd={handleCalendarPointerEnd}
-      style={!calendarExpanded && pullOffset > 0 ? { paddingBottom: `${pullOffset * 0.35}px` } : undefined}
+      onLostPointerCapture={resetCalendarGesture}
       className="select-none touch-none overflow-hidden"
     >
-      <AnimatePresence mode="wait" initial={false}>
+      <AnimatePresence initial={false}>
         {calendarExpanded ? (
           <motion.div
             key="month-view"
-            initial={{ opacity: 0, height: 46, scaleY: 0.94 }}
-            animate={{ opacity: 1, height: 'auto', scaleY: 1 }}
-            exit={{ opacity: 0, height: 46, scaleY: 0.94 }}
-            transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
-            style={{ transformOrigin: 'top center' }}
-            className={`${tokens.cardBg} ${tokens.cardRadius} px-2 pt-1.5 pb-1 space-y-1 overflow-hidden`}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.22, ease: [0.22, 1, 0.36, 1] }}
+            className={`${tokens.cardBg} ${tokens.cardRadius} overflow-hidden`}
           >
+            <div className="px-2 pt-1.5 pb-1 space-y-1">
             {/* Month + Swipeable Year Header */}
             <div className="flex items-center justify-between gap-1 px-0.5">
               <div className="flex items-center gap-0.5 min-w-0">
@@ -396,6 +531,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   }}
                   onPointerMove={(e) => {
                     if (yearSwipeOriginXRef.current === null) return;
+                    if (e.pointerType === 'mouse' && e.buttons === 0) {
+                      yearSwipeOriginXRef.current = null;
+                      return;
+                    }
                     const dx = e.clientX - yearSwipeOriginXRef.current;
                     if (Math.abs(dx) > 18) {
                       stepSelectedYear(dx < 0 ? 1 : -1);
@@ -407,21 +546,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     e.stopPropagation();
                     yearSwipeOriginXRef.current = null;
                   }}
-                  onTouchStart={(e) => {
-                    e.stopPropagation();
-                    if (e.touches[0]) yearSwipeOriginXRef.current = e.touches[0].clientX;
-                  }}
-                  onTouchMove={(e) => {
-                    e.stopPropagation();
-                    if (yearSwipeOriginXRef.current === null || !e.touches[0]) return;
-                    const dx = e.touches[0].clientX - yearSwipeOriginXRef.current;
-                    if (Math.abs(dx) > 18) {
-                      stepSelectedYear(dx < 0 ? 1 : -1);
-                      yearSwipeOriginXRef.current = null;
-                      didSwipeRef.current = true;
-                    }
-                  }}
-                  onTouchEnd={(e) => {
+                  onPointerCancel={(e) => {
                     e.stopPropagation();
                     yearSwipeOriginXRef.current = null;
                   }}
@@ -445,13 +570,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               </div>
 
               <div className="flex items-center gap-1 shrink-0">
-                {(selectedDateKey !== TODAY_DATE_KEY || viewYear !== 2026 || viewMonth !== 10) && (
+                {(selectedDateKey !== TODAY_DATE_KEY || viewYear !== todayYear || viewMonth !== todayMonth) && (
                   <button
                     type="button"
                     onClick={() => {
                       setSelectedDateKey(TODAY_DATE_KEY);
-                      setViewYear(2026);
-                      setViewMonth(10);
+                      setViewYear(todayYear);
+                      setViewMonth(todayMonth);
                       setYearPickerOpen(false);
                       setCalendarExpanded(false);
                     }}
@@ -489,6 +614,10 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   }}
                   onPointerMove={(e) => {
                     e.stopPropagation();
+                    if (e.pointerType === 'mouse' && e.buttons === 0) {
+                      yearSwipeOriginXRef.current = null;
+                      return;
+                    }
                     handleYearRibbonMove(e.clientX);
                   }}
                   onPointerUp={(e) => {
@@ -498,16 +627,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                       didSwipeRef.current = false;
                     }, 50);
                   }}
-                  onTouchStart={(e) => {
-                    e.stopPropagation();
-                    if (e.touches[0]) yearSwipeOriginXRef.current = e.touches[0].clientX;
-                    didSwipeRef.current = false;
-                  }}
-                  onTouchMove={(e) => {
-                    e.stopPropagation();
-                    if (e.touches[0]) handleYearRibbonMove(e.touches[0].clientX);
-                  }}
-                  onTouchEnd={(e) => {
+                  onPointerCancel={(e) => {
                     e.stopPropagation();
                     yearSwipeOriginXRef.current = null;
                   }}
@@ -642,14 +762,16 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             >
               <span className="w-7 h-0.5 rounded-full bg-stone-300 dark:bg-stone-600" />
             </button>
+            </div>
           </motion.div>
         ) : (
           <motion.div
             key="week-view"
-            initial={{ opacity: 0.6, y: -6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0.6, y: 6 }}
-            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+            className="overflow-hidden"
           >
             <div className="grid grid-cols-7 gap-1">
               {weekDays.map((day) => {
@@ -702,6 +824,11 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               onClick={() => setCalendarExpanded(true)}
               title="Swipe down or tap for month view"
               aria-label="Swipe down or tap to expand monthly calendar"
+              style={
+                pullOffset > 0
+                  ? { transform: `translateY(${pullOffset}px)`, transition: 'none' }
+                  : { transform: 'translateY(0px)', transition: 'transform 160ms ease-out' }
+              }
               className="w-full pt-1 pb-0.5 flex items-center justify-center group"
             >
               <span className="w-7 h-0.5 rounded-full bg-stone-300 dark:bg-stone-600 group-hover:bg-[var(--tf-accent)] transition-colors" />
@@ -709,7 +836,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </motion.div>
         )}
       </AnimatePresence>
-    </motion.div>
+    </div>
   );
 
   const renderScheduleSection = (compact = false) => (
@@ -720,18 +847,51 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             Schedule
           </span>
           <span className="text-[10px] text-stone-400 dark:text-stone-500 truncate">
-            · {googleCalendarSync ? 'Synced' : 'Local'}
+            ·{' '}
+            {googleCalendarSync
+              ? googleCalendar.isConnected
+                ? 'Google'
+                : 'Local'
+              : 'Local'}
           </span>
+          {googleCalendarSync && googleCalendar.isConnected && (
+            <button
+              type="button"
+              disabled={googleCalendar.isSyncing}
+              onClick={() => googleCalendar.onSyncNow()}
+              title="Sync Google Calendar"
+              aria-label="Sync Google Calendar"
+              className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-2.5 h-2.5 ${googleCalendar.isSyncing ? 'animate-spin' : ''}`} />
+            </button>
+          )}
         </div>
-        <button
-          type="button"
-          onClick={() => setShowAddBlock((v) => !v)}
-          className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} whitespace-nowrap shrink-0`}
-        >
-          <Plus className="w-2.5 h-2.5" />
-          Block
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {googleCalendarSync && !googleCalendar.isConnected && (
+            <GoogleSignInButton
+              compact
+              onClick={() => googleCalendar.onSignIn()}
+              loading={googleCalendar.isSigningIn}
+              label={googleCalendar.userEmail ? 'Reconnect' : 'Connect'}
+            />
+          )}
+          <button
+            type="button"
+            onClick={() => setShowAddBlock((v) => !v)}
+            className={`inline-flex items-center gap-0.5 px-1.5 py-0.5 text-[10px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} whitespace-nowrap shrink-0`}
+          >
+            <Plus className="w-2.5 h-2.5" />
+            Block
+          </button>
+        </div>
       </div>
+
+      {googleCalendar.error && (
+        <div className="px-2 py-1 text-[10px] text-rose-600 dark:text-rose-400 bg-rose-500/10 rounded-lg">
+          {googleCalendar.error}
+        </div>
+      )}
 
       {showAddBlock && (
         <form onSubmit={handleCreateBlock} className={`${tokens.cardBg} ${tokens.cardRadius} p-2 space-y-1.5`}>
@@ -804,14 +964,14 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               } border-b last:border-b-0 ${tokens.divider}`}
             >
               <div className="flex items-center gap-2 min-w-0">
-                <span className="font-mono-tabular text-[10px] text-stone-500 dark:text-stone-400 shrink-0 w-9">
+                <span className="font-mono-tabular text-[10px] text-stone-500 dark:text-stone-400 shrink-0 w-9 truncate">
                   {ev.startTime}
                 </span>
                 <div className="min-w-0">
                   <p className="text-[12px] font-medium text-stone-900 dark:text-stone-100 truncate leading-tight">
                     {ev.title}
                   </p>
-                  {!compact && (
+                  {(!compact || ev.source === 'google') && (
                     <p className="text-[10px] text-stone-500 dark:text-stone-400 truncate leading-tight">
                       {ev.calendarName}
                       {ev.location ? ` · ${ev.location}` : ''}
@@ -819,15 +979,43 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                   )}
                 </div>
               </div>
-              <button
-                type="button"
-                onClick={() => handleConvert(ev)}
-                title="Add as task"
-                aria-label={`Convert ${ev.title} to task`}
-                className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] shrink-0"
-              >
-                <CalendarPlus className="w-3.5 h-3.5" />
-              </button>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleConvert(ev)}
+                  title="Add as task"
+                  aria-label={`Convert ${ev.title} to task`}
+                  className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] shrink-0"
+                >
+                  <CalendarPlus className="w-3.5 h-3.5" />
+                </button>
+                {ev.source === 'google' && ev.googleEventId && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (!isOnline || !googleCalendar.isConnected) {
+                        void googleCalendar.onDeleteGoogleEvent(ev.id, ev.googleEventId!);
+                        setConvertedNotice(`Removed "${ev.title}" offline · will sync when online`);
+                        window.setTimeout(() => setConvertedNotice(null), 2600);
+                        return;
+                      }
+                      setPendingMutation({
+                        action: 'delete',
+                        eventId: ev.id,
+                        googleEventId: ev.googleEventId!,
+                        title: ev.title,
+                        dateKey: ev.dateKey,
+                        startTime: ev.startTime,
+                      });
+                    }}
+                    title="Delete from Google Calendar"
+                    aria-label={`Delete ${ev.title} from Google Calendar`}
+                    className="p-0.5 text-stone-400 hover:text-rose-500 shrink-0"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                )}
+              </div>
             </div>
           ))}
         </div>
@@ -881,6 +1069,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               <>
                 <span aria-hidden="true">·</span>
                 <span className={`font-medium ${tokens.accentText}`}>High</span>
+              </>
+            )}
+            {(task.reminders?.length ?? 0) > 0 && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className={`inline-flex items-center gap-0.5 ${tokens.accentText}`}
+                  title={`${task.reminders!.length} notification${task.reminders!.length > 1 ? 's' : ''}`}
+                >
+                  <Bell className="w-2.5 h-2.5" />
+                  {task.reminders!.length > 1 && <span>{task.reminders!.length}</span>}
+                </span>
+              </>
+            )}
+            {task.source === 'google' && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span className={`font-medium ${tokens.accentText}`}>Google</span>
               </>
             )}
           </div>
@@ -973,9 +1179,33 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         ? 'Priority queue'
         : 'Tasks';
 
+  const confirmModal = (
+    <CalendarConfirmModal
+      pending={pendingMutation}
+      tokens={tokens}
+      busy={mutationBusy}
+      onCancel={() => setPendingMutation(null)}
+      onConfirm={handleConfirmMutation}
+      onSaveLocalOnly={
+        pendingMutation?.action === 'create'
+          ? () => {
+              saveLocalBlock(
+                pendingMutation.title,
+                pendingMutation.dateKey,
+                pendingMutation.startTime,
+                pendingMutation.endTime,
+                pendingMutation.calendarName
+              );
+              setPendingMutation(null);
+            }
+          : undefined
+      }
+    />
+  );
+
   if (isFlex) {
     return (
-      <div className="h-full flex flex-col">
+      <div className="relative h-full flex flex-col">
         <div className="h-[44%] overflow-y-auto device-scroll px-3.5 py-1.5 space-y-1.5">
           {renderGreeting(true)}
           {renderCalendarSection(true)}
@@ -987,7 +1217,7 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           </span>
         </div>
 
-        <div className="flex-1 overflow-y-auto device-scroll px-3.5 py-1.5 space-y-2">
+        <div className="flex-1 overflow-y-auto device-scroll px-3.5 pt-1.5 pb-20 space-y-2">
           {renderScheduleSection(true)}
           <div className="space-y-1">
             <div className="flex items-center justify-between">
@@ -1008,18 +1238,24 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
           task={selectedTask}
           tokens={tokens}
           taskLists={taskLists}
-          heightClass="h-[85%]"
+          heightClass="h-[94%]"
           onClose={() => onSelectTask(null)}
+          onToggleTask={onToggleTask}
           onUpdateTask={onUpdateTask}
           onDeleteTask={onDeleteTask}
+          isDirtyGoogleTask={Boolean(selectedTask && googleTasks.dirtyTaskIds.includes(selectedTask.id))}
+          onSyncGoogleTask={onSyncGoogleTask}
+          canPushToGoogle={googleTasksSync && googleTasks.isConnected}
+          onPushToGoogle={onPushLocalTaskToGoogle}
         />
+        {confirmModal}
       </div>
     );
   }
 
   if (isExpanded) {
     return (
-      <div className={`h-full grid grid-cols-2 ${hingeAwareSplit ? 'gap-5' : 'gap-3'} px-3.5 py-2 overflow-hidden`}>
+      <div className={`relative h-full grid grid-cols-2 ${hingeAwareSplit ? 'gap-5' : 'gap-3'} px-3.5 py-2 overflow-hidden`}>
         {/* Left Pane: Greeting + Tasks for Selected Date */}
         <div className="flex flex-col h-full overflow-y-auto device-scroll pr-0.5 space-y-2">
           {renderGreeting()}
@@ -1062,8 +1298,13 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
               tokens={tokens}
               taskLists={taskLists}
               onClose={() => onSelectTask(null)}
+              onToggleTask={onToggleTask}
               onUpdateTask={onUpdateTask}
               onDeleteTask={onDeleteTask}
+              isDirtyGoogleTask={googleTasks.dirtyTaskIds.includes(selectedTask.id)}
+              onSyncGoogleTask={onSyncGoogleTask}
+              canPushToGoogle={googleTasksSync && googleTasks.isConnected}
+              onPushToGoogle={onPushLocalTaskToGoogle}
             />
           ) : (
             <>
@@ -1098,6 +1339,22 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
                     {renderCalendarSection()}
                     {renderScheduleSection()}
                   </>
+                )}
+
+                {rightPaneMode === 'note' && !primaryNote && (
+                  <div className={`${tokens.cardBg} ${tokens.cardRadius} p-4 text-center space-y-2`}>
+                    <p className="text-xs font-medium text-stone-700 dark:text-stone-300">No notes yet</p>
+                    <p className="text-[11px] text-stone-400">
+                      Create a note to keep checklists or ideas pinned here.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => onNavigateScreen(ScreenId.Notes)}
+                      className={`px-2.5 py-1 text-[11px] font-medium ${tokens.accentBg} ${tokens.buttonRadius}`}
+                    >
+                      Open Notes
+                    </button>
+                  </div>
                 )}
 
                 {rightPaneMode === 'note' && primaryNote && (
@@ -1168,13 +1425,14 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
             </>
           )}
         </div>
+        {confirmModal}
       </div>
     );
   }
 
   // Cover Display (10:16) — Compact overview maximizing info density on shorter screen height
   return (
-    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-11 space-y-1.5">
+    <div className="relative h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-20 space-y-1.5">
       {renderGreeting(true)}
       {renderCalendarSection(true)}
       {renderScheduleSection(true)}
@@ -1236,11 +1494,17 @@ export const HomeScreen: React.FC<HomeScreenProps> = ({
         task={selectedTask}
         tokens={tokens}
         taskLists={taskLists}
-        heightClass="h-[80%]"
+        heightClass="h-[94%]"
         onClose={() => onSelectTask(null)}
+        onToggleTask={onToggleTask}
         onUpdateTask={onUpdateTask}
         onDeleteTask={onDeleteTask}
+        isDirtyGoogleTask={Boolean(selectedTask && googleTasks.dirtyTaskIds.includes(selectedTask.id))}
+        onSyncGoogleTask={onSyncGoogleTask}
+        canPushToGoogle={googleTasksSync && googleTasks.isConnected}
+        onPushToGoogle={onPushLocalTaskToGoogle}
       />
+      {confirmModal}
     </div>
   );
 };

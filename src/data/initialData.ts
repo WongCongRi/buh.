@@ -20,7 +20,24 @@ export const INITIAL_DECISIONS: DesignDecisions = {
 
 export const INITIAL_RECENT_COLORS: string[] = ['#7BB6E0'];
 
-export const TODAY_DATE_KEY = '2026-11-23';
+function formatLocalDateKey(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+export function getTodayDateKey(): string {
+  return formatLocalDateKey(new Date());
+}
+
+export function getTomorrowDateKey(): string {
+  const now = new Date();
+  return formatLocalDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
+}
+
+export const TODAY_DATE_KEY = getTodayDateKey();
+export const TOMORROW_DATE_KEY = getTomorrowDateKey();
 
 export const INITIAL_LISTS: string[] = ['Work', 'Projects', 'Personal'];
 
@@ -28,240 +45,21 @@ export const INITIAL_SETTINGS: AppSettingsState = {
   hingeAwareSplit: true,
   oneHandedCoverReach: true,
   googleCalendarSync: true,
+  googleTasksSync: true,
   nlpQuickParse: true,
   morningDigestTime: '08:00 AM',
+  taskRemindersEnabled: true,
+  reminderSound: true,
 };
 
-export const INITIAL_TASKS: TaskItem[] = [
-  {
-    id: 't-1',
-    title: 'Review project proposal',
-    timeLabel: '09:30 AM',
-    dateKey: '2026-11-23',
-    category: 'Work',
-    priority: 'High',
-    completed: false,
-    isInbox: false,
-    notes: 'Check scope milestones, Fold 8 adaptive breakpoints, and Q1 delivery dates before signing off.',
-    subtasks: [
-      { id: 'st-1', title: 'Verify Kotlin Multiplatform vs native Android scope', done: true },
-      { id: 'st-2', title: 'Confirm Room schema migration notes', done: false },
-      { id: 'st-3', title: 'Send marked-up PDF back to Elena', done: false },
-    ],
-  },
-  {
-    id: 't-2',
-    title: 'Call supplier',
-    timeLabel: '11:00 AM',
-    dateKey: '2026-11-23',
-    category: 'Work',
-    priority: 'Normal',
-    completed: false,
-    isInbox: false,
-    notes: 'Confirm December shipping lead times and revised unit pricing for batch 4.',
-    subtasks: [
-      { id: 'st-4', title: 'Ask for updated tracking sheet', done: false },
-    ],
-  },
-  {
-    id: 't-3',
-    title: 'Prepare weekly report',
-    timeLabel: '02:00 PM',
-    dateKey: '2026-11-23',
-    category: 'Projects',
-    priority: 'Normal',
-    completed: false,
-    isInbox: false,
-    notes: 'Pull completion metrics from sprint 12 and summarise blockers for Monday standup.',
-    subtasks: [
-      { id: 'st-5', title: 'Compile sprint velocity figures', done: true },
-      { id: 'st-6', title: 'Write executive 3-line summary', done: false },
-    ],
-  },
-  {
-    id: 't-4',
-    title: 'Read and organise notes',
-    timeLabel: 'No time set',
-    dateKey: '2026-11-23',
-    category: 'Personal',
-    priority: 'Low',
-    completed: false,
-    isInbox: false,
-    notes: 'Archive meeting fragments from last Friday and link action items to Projects.',
-    subtasks: [],
-  },
-  {
-    id: 't-5',
-    title: 'Test Fold 8 cover screen thumb reach',
-    timeLabel: '04:30 PM',
-    dateKey: '2026-11-24',
-    category: 'Projects',
-    priority: 'High',
-    completed: false,
-    isInbox: false,
-    notes: 'Ensure quick-add FAB and bottom bar remain comfortably reachable single-handed.',
-    subtasks: [],
-  },
-  {
-    id: 't-6',
-    title: 'Pick up espresso beans on way home',
-    timeLabel: 'No time set',
-    dateKey: '2026-11-23',
-    category: 'Inbox',
-    priority: 'Low',
-    completed: false,
-    isInbox: true,
-    notes: 'Captured quickly while walking — assign to Personal or Shopping.',
-    subtasks: [],
-  },
-  {
-    id: 't-7',
-    title: 'Check TickTick CSV export field mapping',
-    timeLabel: 'No time set',
-    dateKey: '2026-11-23',
-    category: 'Inbox',
-    priority: 'Normal',
-    completed: false,
-    isInbox: true,
-    notes: 'Verify priority integers (0, 1, 3, 5) match TickTick import specification.',
-    subtasks: [],
-  },
-  {
-    id: 't-8',
-    title: 'Morning inbox triage',
-    timeLabel: '08:30 AM',
-    dateKey: '2026-11-23',
-    category: 'Work',
-    priority: 'Normal',
-    completed: true,
-    isInbox: false,
-    notes: 'Cleared overnight messages and flagged priority items.',
-    subtasks: [],
-  },
-];
+export const INITIAL_TASKS: TaskItem[] = [];
 
-export const INITIAL_EVENTS: CalendarEvent[] = [
-  {
-    id: 'ev-1',
-    title: 'Proposal Walkthrough',
-    dateKey: '2026-11-23',
-    startTime: '09:30',
-    endTime: '10:15',
-    durationMinutes: 45,
-    calendarName: 'Work',
-    location: 'Studio Meet · Room B',
-    linkedTaskId: 't-1',
-  },
-  {
-    id: 'ev-2',
-    title: 'Supplier Sync Call',
-    dateKey: '2026-11-23',
-    startTime: '11:00',
-    endTime: '11:30',
-    durationMinutes: 30,
-    calendarName: 'Work',
-    location: 'Phone · Direct line',
-    linkedTaskId: 't-2',
-  },
-  {
-    id: 'ev-3',
-    title: 'Weekly Report Focus Block',
-    dateKey: '2026-11-23',
-    startTime: '14:00',
-    endTime: '15:30',
-    durationMinutes: 90,
-    calendarName: 'Projects',
-    location: 'Deep Focus',
-    linkedTaskId: 't-3',
-  },
-  {
-    id: 'ev-4',
-    title: 'Evening Walk & Reading',
-    dateKey: '2026-11-23',
-    startTime: '18:00',
-    endTime: '18:45',
-    durationMinutes: 45,
-    calendarName: 'Personal',
-    location: 'Riverside trail',
-  },
-  {
-    id: 'ev-5',
-    title: 'Fold 8 Layout Critique',
-    dateKey: '2026-11-24',
-    startTime: '10:00',
-    endTime: '11:00',
-    durationMinutes: 60,
-    calendarName: 'Projects',
-    location: 'Design Review',
-  },
-  {
-    id: 'ev-6',
-    title: 'Dentist Appointment',
-    dateKey: '2026-11-25',
-    startTime: '15:00',
-    endTime: '16:00',
-    durationMinutes: 60,
-    calendarName: 'Personal',
-    location: 'Central Clinic',
-  },
-];
+export const INITIAL_EVENTS: CalendarEvent[] = [];
 
-export const INITIAL_NOTES: NoteItem[] = [
-  {
-    id: 'n-1',
-    title: 'buh. Fold 8 Ergonomics',
-    folder: 'Product',
-    updatedAt: 'Today, 09:12 AM',
-    pinned: true,
-    blocks: [
-      { id: 'b-1', type: 'heading', text: 'Core posture principles' },
-      {
-        id: 'b-2',
-        type: 'paragraph',
-        text: 'Design for the standard Samsung Galaxy Z Fold 8 first: narrow one-handed cover display outside, balanced two-pane workspace when unfolded.',
-      },
-      { id: 'b-3', type: 'checklist', text: 'Keep primary actions in the lower 40% thumb zone on Cover display', checked: true },
-      { id: 'b-4', type: 'checklist', text: 'Respect center hinge crease margin (24dp clearance) on Inner display', checked: true },
-      { id: 'b-5', type: 'checklist', text: 'Support Flex mode top-preview / bottom-controls split', checked: false },
-    ],
-  },
-  {
-    id: 'n-2',
-    title: 'Proposal Review Talking Points',
-    folder: 'Work',
-    updatedAt: 'Yesterday, 06:40 PM',
-    pinned: true,
-    blocks: [
-      { id: 'b-6', type: 'heading', text: 'Milestone 1 Deliverables' },
-      { id: 'b-7', type: 'bullet', text: 'Room local database wired to reactive Kotlin Flows' },
-      { id: 'b-8', type: 'bullet', text: 'Natural language time extraction ("at 2pm", "tomorrow")' },
-      { id: 'b-9', type: 'bullet', text: 'One-tap TickTick CSV export bundle' },
-    ],
-  },
-  {
-    id: 'n-3',
-    title: 'Quiet Morning Routine',
-    folder: 'Personal',
-    updatedAt: 'Nov 20, 08:15 AM',
-    pinned: false,
-    blocks: [
-      {
-        id: 'b-10',
-        type: 'paragraph',
-        text: 'Open Today view first with no overdue red badges or anxiety counters. Three priority commitments maximum before noon.',
-      },
-      { id: 'b-11', type: 'checklist', text: 'Review Today agenda with coffee', checked: true },
-      { id: 'b-12', type: 'checklist', text: 'Triage Inbox items before 9:00 AM', checked: false },
-    ],
-  },
-];
+export const INITIAL_NOTES: NoteItem[] = [];
 
-export const WEEK_DAYS = [
-  { dateKey: '2026-11-23', short: 'MON', dayNum: '23', fullLabel: 'Monday, 23 November' },
-  { dateKey: '2026-11-24', short: 'TUE', dayNum: '24', fullLabel: 'Tuesday, 24 November' },
-  { dateKey: '2026-11-25', short: 'WED', dayNum: '25', fullLabel: 'Wednesday, 25 November' },
-  { dateKey: '2026-11-26', short: 'THU', dayNum: '26', fullLabel: 'Thursday, 26 November' },
-  { dateKey: '2026-11-27', short: 'FRI', dayNum: '27', fullLabel: 'Friday, 27 November' },
-  { dateKey: '2026-11-28', short: 'SAT', dayNum: '28', fullLabel: 'Saturday, 28 November' },
-  { dateKey: '2026-11-29', short: 'SUN', dayNum: '29', fullLabel: 'Sunday, 29 November' },
-];
+export const DEMO_SEED_IDS = {
+  tasks: new Set(['t-1', 't-2', 't-3', 't-4', 't-5', 't-6', 't-7', 't-8']),
+  events: new Set(['ev-1', 'ev-2', 'ev-3', 'ev-4', 'ev-5', 'ev-6']),
+  notes: new Set(['n-1', 'n-2', 'n-3']),
+};

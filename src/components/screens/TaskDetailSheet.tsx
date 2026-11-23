@@ -12,20 +12,30 @@ interface TaskDetailSheetProps {
   highlightQuery?: string;
   onDismissHighlight?: () => void;
   onClose: () => void;
+  onToggleTask?: (taskId: string) => void;
   onUpdateTask: (updated: TaskItem) => void;
   onDeleteTask: (taskId: string) => void;
+  isDirtyGoogleTask?: boolean;
+  onSyncGoogleTask?: (task: TaskItem) => void;
+  canPushToGoogle?: boolean;
+  onPushToGoogle?: (task: TaskItem) => void;
 }
 
 export const TaskDetailSheet: React.FC<TaskDetailSheetProps> = ({
   task,
   tokens,
   taskLists,
-  heightClass = 'h-[82%]',
+  heightClass = 'h-[94%]',
   highlightQuery = '',
   onDismissHighlight,
   onClose,
+  onToggleTask,
   onUpdateTask,
   onDeleteTask,
+  isDirtyGoogleTask = false,
+  onSyncGoogleTask,
+  canPushToGoogle = false,
+  onPushToGoogle,
 }) => {
   const [dragY, setDragY] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
@@ -171,8 +181,13 @@ export const TaskDetailSheet: React.FC<TaskDetailSheetProps> = ({
               highlightQuery={highlightQuery}
               onDismissHighlight={onDismissHighlight}
               onClose={onClose}
+              onToggleTask={onToggleTask}
               onUpdateTask={onUpdateTask}
               onDeleteTask={onDeleteTask}
+              isDirtyGoogleTask={isDirtyGoogleTask}
+              onSyncGoogleTask={onSyncGoogleTask}
+              canPushToGoogle={canPushToGoogle}
+              onPushToGoogle={onPushToGoogle}
               bodyScrollRef={bodyScrollRef}
             />
           </motion.div>

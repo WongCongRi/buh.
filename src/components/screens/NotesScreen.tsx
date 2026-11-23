@@ -1,8 +1,76 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { ArrowLeft, Check, CheckSquare, Heading2, List, Pin, Plus, Trash2, Type } from 'lucide-react';
+import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { ArrowLeft, Check, CheckSquare, Heading2, List, Pin, Plus, Trash2, X } from 'lucide-react';
 import { FoldPosture, NoteBlock, NoteItem } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
 import { HighlightedText } from '../HighlightedText';
+
+interface AutoGrowParagraphProps {
+  value: string;
+  placeholder: string;
+  onChange: (value: string) => void;
+  onKeyDown?: (e: React.KeyboardEvent<HTMLTextAreaElement>) => void;
+  onCaretChange?: (caret: number) => void;
+  inputRef: (el: HTMLTextAreaElement | null) => void;
+}
+
+const AutoGrowParagraph: React.FC<AutoGrowParagraphProps> = ({
+  value,
+  placeholder,
+  onChange,
+  onKeyDown,
+  onCaretChange,
+  inputRef,
+}) => {
+  const localRef = useRef<HTMLTextAreaElement | null>(null);
+
+  const syncHeight = () => {
+    const el = localRef.current;
+    if (!el) return;
+    el.style.height = 'auto';
+    el.style.height = `${el.scrollHeight}px`;
+  };
+
+  useLayoutEffect(() => {
+    syncHeight();
+  }, [value]);
+
+  useEffect(() => {
+    const el = localRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => {
+      syncHeight();
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  const reportCaret = (el: HTMLTextAreaElement) => {
+    onCaretChange?.(el.selectionStart ?? el.value.length);
+  };
+
+  return (
+    <textarea
+      ref={(el) => {
+        localRef.current = el;
+        inputRef(el);
+      }}
+      rows={1}
+      value={value}
+      placeholder={placeholder}
+      onFocus={(e) => reportCaret(e.currentTarget)}
+      onClick={(e) => reportCaret(e.currentTarget)}
+      onKeyUp={(e) => reportCaret(e.currentTarget)}
+      onSelect={(e) => reportCaret(e.currentTarget)}
+      onChange={(e) => {
+        onChange(e.target.value);
+        reportCaret(e.currentTarget);
+      }}
+      onKeyDown={onKeyDown}
+      onInput={syncHeight}
+      className="block w-full bg-transparent text-[11.5px] leading-snug text-stone-600 dark:text-stone-300 focus:outline-none resize-none overflow-hidden min-h-[1.5rem]"
+    />
+  );
+};
 
 interface NotesScreenProps {
   posture: FoldPosture;
@@ -41,10 +109,49 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
 }) => {
   const [editingBlockId, setEditingBlockId] = useState<string | null>(null);
   const firstMatchRef = useRef<HTMLDivElement | null>(null);
+  const titleInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingFocusTitleNoteIdRef = useRef<string | null>(null);
+  const blockInputRefs = useRef<Record<string, HTMLInputElement | HTMLTextAreaElement | null>>({});
+  const pendingFocusRef = useRef<{ blockId: string; caret: 'start' | 'end' } | null>(null);
+  const activeBlockRef = useRef<{ blockId: string; caret: number } | null>(null);
 
   const activeNote = notes.find((n) => n.id === selectedNoteId) || notes[0];
   const isNoteHighlighted =
     Boolean(activeNote && highlightedNoteId === activeNote.id && highlightQuery.trim());
+
+  const latestActiveNoteRef = useRef<NoteItem | undefined>(activeNote);
+  latestActiveNoteRef.current = activeNote;
+  const onDeleteNoteRef = useRef(onDeleteNote);
+  onDeleteNoteRef.current = onDeleteNote;
+  const onUpdateNoteRef = useRef(onUpdateNote);
+  onUpdateNoteRef.current = onUpdateNote;
+  const finalizedDeletedIdRef = useRef<string | null>(null);
+
+  const finalizeNote = (note?: NoteItem) => {
+    if (!note || finalizedDeletedIdRef.current === note.id) return;
+    const hasTitle = note.title.trim().length > 0;
+    const hasContent = note.blocks.some((b) => b.text.trim().length > 0);
+    if (!hasTitle && !hasContent) {
+      finalizedDeletedIdRef.current = note.id;
+      onDeleteNoteRef.current(note.id);
+    } else if (!hasTitle && hasContent) {
+      onUpdateNoteRef.current({ ...note, title: 'Untitled Note' });
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      finalizeNote(latestActiveNoteRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    activeBlockRef.current = null;
+    if (pendingFocusTitleNoteIdRef.current && pendingFocusTitleNoteIdRef.current === activeNote?.id) {
+      pendingFocusTitleNoteIdRef.current = null;
+      titleInputRef.current?.focus();
+    }
+  }, [activeNote?.id, coverEditing]);
 
   useEffect(() => {
     setEditingBlockId(null);
@@ -53,8 +160,27 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
     }
   }, [isNoteHighlighted, highlightedNoteId, highlightQuery]);
 
+  useEffect(() => {
+    const pending = pendingFocusRef.current;
+    if (!pending) return;
+    const el = blockInputRefs.current[pending.blockId];
+    if (!el) return;
+    pendingFocusRef.current = null;
+    el.focus();
+    const pos = pending.caret === 'end' ? el.value.length : 0;
+    try {
+      el.setSelectionRange(pos, pos);
+    } catch {
+      // Some input types do not support selection range
+    }
+    activeBlockRef.current = { blockId: pending.blockId, caret: pos };
+    el.scrollIntoView({ block: 'nearest' });
+  }, [activeNote?.id, activeNote?.blocks]);
+
   const handleCreate = () => {
+    finalizeNote(activeNote);
     const newId = onCreateNote();
+    pendingFocusTitleNoteIdRef.current = newId;
     onSelectNoteId(newId);
     if (posture === FoldPosture.Cover) {
       onSetCoverEditing(true);
@@ -70,23 +196,46 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
     });
   };
 
-  const handleRemoveBlock = (blockId: string) => {
-    if (!activeNote || activeNote.blocks.length <= 1) return;
-    onUpdateNote({
-      ...activeNote,
-      updatedAt: 'Edited just now',
-      blocks: activeNote.blocks.filter((b) => b.id !== blockId),
-    });
+  const handleRemoveBlock = (blockId: string, focusPrevious = false) => {
+    if (!activeNote) return;
+    const idx = activeNote.blocks.findIndex((b) => b.id === blockId);
+    const remaining = activeNote.blocks.filter((b) => b.id !== blockId);
+    if (remaining.length > 0) {
+      if (focusPrevious) {
+        const targetBlock = remaining[Math.max(0, idx - 1)];
+        if (targetBlock) {
+          pendingFocusRef.current = { blockId: targetBlock.id, caret: 'end' };
+        }
+      }
+      onUpdateNote({
+        ...activeNote,
+        updatedAt: 'Edited just now',
+        blocks: remaining,
+      });
+    } else {
+      const replacementId = `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      if (focusPrevious) {
+        pendingFocusRef.current = { blockId: replacementId, caret: 'start' };
+      }
+      onUpdateNote({
+        ...activeNote,
+        updatedAt: 'Edited just now',
+        blocks: [{ id: replacementId, type: 'paragraph', text: '' }],
+      });
+    }
   };
+
+  const makeBlockId = () => `b-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
 
   const handleAppendBlock = (type: NoteBlock['type'], afterBlockId?: string) => {
     if (!activeNote) return;
     const newBlock: NoteBlock = {
-      id: `b-${Date.now()}`,
+      id: makeBlockId(),
       type,
-      text: type === 'heading' ? 'New section' : type === 'checklist' ? '' : '',
+      text: '',
       checked: type === 'checklist' ? false : undefined,
     };
+    pendingFocusRef.current = { blockId: newBlock.id, caret: 'end' };
     if (afterBlockId) {
       const idx = activeNote.blocks.findIndex((b) => b.id === afterBlockId);
       const next = [...activeNote.blocks];
@@ -99,6 +248,125 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
         blocks: [...activeNote.blocks, newBlock],
       });
     }
+  };
+
+  const handleStartFormattedBlock = (type: 'heading' | 'checklist' | 'bullet') => {
+    if (!activeNote) return;
+
+    const newBlock: NoteBlock = {
+      id: makeBlockId(),
+      type,
+      text: '',
+      checked: type === 'checklist' ? false : undefined,
+    };
+    pendingFocusRef.current = { blockId: newBlock.id, caret: 'start' };
+
+    const blocks = activeNote.blocks;
+    if (blocks.length === 0) {
+      onUpdateNote({ ...activeNote, updatedAt: 'Edited just now', blocks: [newBlock] });
+      return;
+    }
+
+    // Determine the active block and caret position (prefer live DOM selection if still focused)
+    const tracked = activeBlockRef.current;
+    let targetIdx = tracked ? blocks.findIndex((b) => b.id === tracked.blockId) : -1;
+    let caret = tracked?.caret ?? 0;
+
+    if (targetIdx === -1) {
+      targetIdx = blocks.length - 1;
+      caret = blocks[targetIdx].text.length;
+    } else {
+      const liveEl = blockInputRefs.current[blocks[targetIdx].id];
+      if (liveEl && document.activeElement === liveEl && typeof liveEl.selectionStart === 'number') {
+        caret = liveEl.selectionStart;
+      }
+    }
+
+    const targetBlock = blocks[targetIdx];
+
+    if (targetBlock.type === 'paragraph') {
+      const text = targetBlock.text;
+      const safeCaret = Math.max(0, Math.min(caret, text.length));
+      const lineStart = safeCaret === 0 ? 0 : text.lastIndexOf('\n', safeCaret - 1) + 1;
+      const nextNewline = text.indexOf('\n', safeCaret);
+      const lineEnd = nextNewline === -1 ? text.length : nextNewline;
+      const currentLine = text.slice(lineStart, lineEnd);
+
+      // If cursor is on an empty line inside the paragraph, start the formatted block on THAT exact line
+      if (currentLine.trim().length === 0) {
+        const beforeText = lineStart > 0 ? text.slice(0, lineStart - 1) : '';
+        const afterText = lineEnd < text.length ? text.slice(lineEnd + 1) : '';
+        const replacement: NoteBlock[] = [];
+
+        if (beforeText.length > 0) {
+          replacement.push({ ...targetBlock, text: beforeText });
+        }
+        replacement.push(newBlock);
+        if (afterText.length > 0) {
+          replacement.push({ id: makeBlockId(), type: 'paragraph', text: afterText });
+        }
+
+        const next = [...blocks];
+        next.splice(targetIdx, 1, ...replacement);
+        onUpdateNote({ ...activeNote, updatedAt: 'Edited just now', blocks: next });
+        return;
+      }
+
+      // Cursor is on a non-empty line inside a paragraph: insert right after the current line
+      const beforeText = text.slice(0, lineEnd);
+      const afterText = lineEnd < text.length ? text.slice(lineEnd + 1) : '';
+      const replacement: NoteBlock[] = [{ ...targetBlock, text: beforeText }, newBlock];
+      if (afterText.length > 0) {
+        replacement.push({ id: makeBlockId(), type: 'paragraph', text: afterText });
+      }
+      const next = [...blocks];
+      next.splice(targetIdx, 1, ...replacement);
+      onUpdateNote({ ...activeNote, updatedAt: 'Edited just now', blocks: next });
+      return;
+    }
+
+    // If cursor is on an empty heading/checklist/list row, convert it in-place on the same line
+    if (!targetBlock.text.trim()) {
+      const next = blocks.map((b, i) => (i === targetIdx ? newBlock : b));
+      onUpdateNote({ ...activeNote, updatedAt: 'Edited just now', blocks: next });
+      return;
+    }
+
+    // Otherwise insert directly after the active block
+    const next = [...blocks];
+    next.splice(targetIdx + 1, 0, newBlock);
+    onUpdateNote({ ...activeNote, updatedAt: 'Edited just now', blocks: next });
+  };
+
+  const handleConvertBlockToParagraph = (blockId: string) => {
+    if (!activeNote) return;
+    pendingFocusRef.current = { blockId, caret: 'start' };
+    onUpdateNote({
+      ...activeNote,
+      updatedAt: 'Edited just now',
+      blocks: activeNote.blocks.map((b) =>
+        b.id === blockId ? { id: b.id, type: 'paragraph', text: '' } : b
+      ),
+    });
+  };
+
+  const handleFocusDefaultWritingArea = () => {
+    if (!activeNote) return;
+    const last = activeNote.blocks[activeNote.blocks.length - 1];
+    if (last && last.type === 'paragraph') {
+      const el = blockInputRefs.current[last.id];
+      if (el) {
+        el.focus();
+        const pos = el.value.length;
+        try {
+          el.setSelectionRange(pos, pos);
+        } catch {
+          // ignore
+        }
+        return;
+      }
+    }
+    handleAppendBlock('paragraph');
   };
 
   const renderNoteList = () => (
@@ -145,6 +413,9 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                 key={note.id}
                 type="button"
                 onClick={() => {
+                  if (activeNote && activeNote.id !== note.id) {
+                    finalizeNote(activeNote);
+                  }
                   onSelectNoteId(note.id);
                   if (posture === FoldPosture.Cover) onSetCoverEditing(true);
                 }}
@@ -154,7 +425,11 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
               >
                 <div className="flex items-center justify-between gap-2">
                   <p className="text-[13px] font-semibold text-stone-900 dark:text-stone-100 truncate">
-                    <HighlightedText text={note.title} query={highlightQuery} active={listHighlight} />
+                    <HighlightedText
+                      text={note.title.trim() || 'Untitled Note'}
+                      query={highlightQuery}
+                      active={listHighlight}
+                    />
                   </p>
                   {note.pinned && <Pin className={`w-3 h-3 shrink-0 ${tokens.accentText}`} />}
                 </div>
@@ -196,7 +471,10 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
             {showBack && (
               <button
                 type="button"
-                onClick={() => onSetCoverEditing(false)}
+                onClick={() => {
+                  finalizeNote(activeNote);
+                  onSetCoverEditing(false);
+                }}
                 className="p-1 -ml-1 text-stone-500 hover:text-stone-900 dark:hover:text-stone-100"
                 aria-label="Back to notes"
               >
@@ -237,6 +515,7 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
             <button
               type="button"
               onClick={() => {
+                finalizedDeletedIdRef.current = activeNote.id;
                 onDeleteNote(activeNote.id);
                 onSetCoverEditing(false);
               }}
@@ -249,7 +528,8 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
         </div>
 
         {/* Rich Text Canvas */}
-        <div className="flex-1 overflow-y-auto device-scroll p-2.5 space-y-1.5">
+        <div className="flex-1 overflow-y-auto device-scroll p-2.5 flex flex-col">
+          <div className="space-y-1.5">
           {isNoteHighlighted && activeNote.title.toLowerCase().includes(trimmedQuery) ? (
             <div
               role="button"
@@ -262,18 +542,32 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
             </div>
           ) : (
             <input
+              ref={titleInputRef}
               type="text"
               value={activeNote.title}
+              placeholder="Title"
               onChange={(e) =>
                 onUpdateNote({ ...activeNote, title: e.target.value, updatedAt: 'Edited just now' })
               }
-              className="w-full bg-transparent font-display text-base font-semibold text-stone-900 dark:text-stone-100 focus:outline-none"
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  const firstBlock = activeNote.blocks[0];
+                  if (firstBlock) {
+                    const el = blockInputRefs.current[firstBlock.id];
+                    el?.focus();
+                  } else {
+                    handleAppendBlock('paragraph');
+                  }
+                }
+              }}
+              className="w-full bg-transparent font-display text-base font-semibold text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none"
               aria-label="Note title"
             />
           )}
 
           <div className="space-y-1.5">
-            {activeNote.blocks.map((block) => {
+            {activeNote.blocks.map((block, blockIdx) => {
               const blockMatches =
                 isNoteHighlighted &&
                 editingBlockId !== block.id &&
@@ -300,10 +594,34 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                       </div>
                     ) : (
                       <input
+                        ref={(el) => {
+                          blockInputRefs.current[block.id] = el;
+                        }}
                         type="text"
                         value={block.text}
                         placeholder="Section heading..."
-                        onChange={(e) => handleUpdateBlock(block.id, { text: e.target.value })}
+                        onFocus={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                        }}
+                        onChange={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                          handleUpdateBlock(block.id, { text: e.target.value });
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                            e.preventDefault();
+                            handleAppendBlock('paragraph', block.id);
+                          } else if (e.key === 'Backspace' && !block.text) {
+                            e.preventDefault();
+                            handleRemoveBlock(block.id, true);
+                          }
+                        }}
                         className="w-full bg-transparent font-display text-xs font-semibold text-stone-800 dark:text-stone-200 pt-0.5 focus:outline-none"
                       />
                     )}
@@ -339,7 +657,7 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                           onDismissHighlight?.();
                         }}
                         onKeyDown={(e) => e.key === 'Enter' && onDismissHighlight?.()}
-                        className={`flex-1 text-[11.5px] leading-snug cursor-text ${
+                        className={`flex-1 min-w-0 text-[11.5px] leading-snug cursor-text ${
                           block.checked ? 'line-through text-stone-400' : 'text-stone-700 dark:text-stone-200'
                         }`}
                       >
@@ -347,26 +665,55 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                       </div>
                     ) : (
                       <input
+                        ref={(el) => {
+                          blockInputRefs.current[block.id] = el;
+                        }}
                         type="text"
+                        enterKeyHint="next"
                         value={block.text}
-                        placeholder="To-do item (Enter for next)..."
-                        onChange={(e) => handleUpdateBlock(block.id, { text: e.target.value })}
+                        placeholder="To-do item..."
+                        onFocus={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                        }}
+                        onChange={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                          handleUpdateBlock(block.id, { text: e.target.value });
+                        }}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
+                          if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
                             e.preventDefault();
-                            handleAppendBlock('checklist', block.id);
+                            if (!block.text.trim()) {
+                              handleConvertBlockToParagraph(block.id);
+                            } else {
+                              handleAppendBlock('checklist', block.id);
+                            }
                           } else if (e.key === 'Backspace' && !block.text) {
                             e.preventDefault();
-                            handleRemoveBlock(block.id);
+                            handleRemoveBlock(block.id, true);
                           }
                         }}
-                        className={`flex-1 bg-transparent text-[11.5px] leading-snug focus:outline-none ${
+                        className={`flex-1 min-w-0 bg-transparent text-[11.5px] leading-snug focus:outline-none ${
                           block.checked
                             ? 'line-through text-stone-400'
                             : 'text-stone-700 dark:text-stone-200'
                         }`}
                       />
                     )}
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveBlock(block.id)}
+                      aria-label="Remove checklist row"
+                      title="Remove row"
+                      className="p-0.5 text-stone-400 hover:text-rose-500 dark:text-stone-500 dark:hover:text-rose-400 rounded transition-colors shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 );
               }
@@ -376,7 +723,7 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                   <div
                     key={block.id}
                     ref={assignRef ? firstMatchRef : undefined}
-                    className="flex items-start gap-2 pl-1"
+                    className="flex items-start gap-2 pl-1 group"
                   >
                     <span className="mt-1.5 w-1 h-1 rounded-full bg-stone-400 dark:bg-stone-500 shrink-0" />
                     {blockMatches ? (
@@ -388,28 +735,57 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                           onDismissHighlight?.();
                         }}
                         onKeyDown={(e) => e.key === 'Enter' && onDismissHighlight?.()}
-                        className="flex-1 text-[11.5px] leading-snug text-stone-700 dark:text-stone-200 cursor-text"
+                        className="flex-1 min-w-0 text-[11.5px] leading-snug text-stone-700 dark:text-stone-200 cursor-text"
                       >
                         <HighlightedText text={block.text} query={highlightQuery} />
                       </div>
                     ) : (
                       <input
+                        ref={(el) => {
+                          blockInputRefs.current[block.id] = el;
+                        }}
                         type="text"
+                        enterKeyHint="next"
                         value={block.text}
-                        placeholder="List item (Enter for next)..."
-                        onChange={(e) => handleUpdateBlock(block.id, { text: e.target.value })}
+                        placeholder="List item..."
+                        onFocus={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                        }}
+                        onChange={(e) => {
+                          activeBlockRef.current = {
+                            blockId: block.id,
+                            caret: e.currentTarget.selectionStart ?? e.currentTarget.value.length,
+                          };
+                          handleUpdateBlock(block.id, { text: e.target.value });
+                        }}
                         onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
+                          if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
                             e.preventDefault();
-                            handleAppendBlock('bullet', block.id);
+                            if (!block.text.trim()) {
+                              handleConvertBlockToParagraph(block.id);
+                            } else {
+                              handleAppendBlock('bullet', block.id);
+                            }
                           } else if (e.key === 'Backspace' && !block.text) {
                             e.preventDefault();
-                            handleRemoveBlock(block.id);
+                            handleRemoveBlock(block.id, true);
                           }
                         }}
-                        className="flex-1 bg-transparent text-[11.5px] leading-snug text-stone-700 dark:text-stone-200 focus:outline-none"
+                        className="flex-1 min-w-0 bg-transparent text-[11.5px] leading-snug text-stone-700 dark:text-stone-200 focus:outline-none"
                       />
                     )}
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveBlock(block.id)}
+                      aria-label="Remove list row"
+                      title="Remove row"
+                      className="p-0.5 text-stone-400 hover:text-rose-500 dark:text-stone-500 dark:hover:text-rose-400 rounded transition-colors shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
                   </div>
                 );
               }
@@ -425,62 +801,75 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
                         onDismissHighlight?.();
                       }}
                       onKeyDown={(e) => e.key === 'Enter' && onDismissHighlight?.()}
-                      className="text-[11.5px] leading-snug text-stone-600 dark:text-stone-300 cursor-text"
+                      className="text-[11.5px] leading-snug text-stone-600 dark:text-stone-300 cursor-text whitespace-pre-wrap break-words"
                     >
                       <HighlightedText text={block.text} query={highlightQuery} />
                     </div>
                   ) : (
-                    <textarea
-                      rows={2}
+                    <AutoGrowParagraph
+                      inputRef={(el) => {
+                        blockInputRefs.current[block.id] = el;
+                      }}
                       value={block.text}
-                      placeholder="Write paragraph..."
-                      onChange={(e) => handleUpdateBlock(block.id, { text: e.target.value })}
-                      className="w-full bg-transparent text-[11.5px] leading-snug text-stone-600 dark:text-stone-300 focus:outline-none resize-none"
+                      placeholder={
+                        blockIdx === 0 && activeNote.blocks.length === 1 ? 'Start writing...' : ''
+                      }
+                      onCaretChange={(pos) => {
+                        activeBlockRef.current = { blockId: block.id, caret: pos };
+                      }}
+                      onChange={(text) => handleUpdateBlock(block.id, { text })}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Backspace' && !block.text && activeNote.blocks.length > 1) {
+                          e.preventDefault();
+                          handleRemoveBlock(block.id, true);
+                        }
+                      }}
                     />
                   )}
                 </div>
               );
             })}
           </div>
+          </div>
+          {/* Open writing canvas below blocks — tapping continues typing in a default paragraph */}
+          <div
+            className="flex-1 min-h-[48px] cursor-text"
+            onClick={handleFocusDefaultWritingArea}
+            aria-hidden="true"
+          />
         </div>
 
-        {/* Formatting Toolbar */}
-        <div className={`px-2.5 py-1.5 border-t ${tokens.divider} ${tokens.subtleBg} flex items-center gap-1 shrink-0 overflow-x-auto`}>
+        {/* Formatting Toolbar — paragraphs are default; only explicit block formats shown */}
+        <div className={`px-1.5 py-1.5 border-t ${tokens.divider} ${tokens.subtleBg} grid grid-cols-3 gap-1 shrink-0`}>
           <button
             type="button"
-            onClick={() => handleAppendBlock('heading')}
-            className="inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => handleStartFormattedBlock('heading')}
+            className="flex items-center justify-center gap-1 px-1 py-1 text-[10px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap min-w-0"
             title="Add Heading"
           >
-            <Heading2 className="w-3 h-3" />
-            Heading
+            <Heading2 className="w-3 h-3 shrink-0" />
+            <span className="truncate">Heading</span>
           </button>
           <button
             type="button"
-            onClick={() => handleAppendBlock('paragraph')}
-            className="inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap"
-            title="Add Text"
-          >
-            <Type className="w-3 h-3" />
-            Text
-          </button>
-          <button
-            type="button"
-            onClick={() => handleAppendBlock('checklist')}
-            className="inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => handleStartFormattedBlock('checklist')}
+            className="flex items-center justify-center gap-1 px-1 py-1 text-[10px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap min-w-0"
             title="Add Checklist"
           >
-            <CheckSquare className="w-3 h-3" />
-            Checklist
+            <CheckSquare className="w-3 h-3 shrink-0" />
+            <span className="truncate">Checklist</span>
           </button>
           <button
             type="button"
-            onClick={() => handleAppendBlock('bullet')}
-            className="inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap"
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => handleStartFormattedBlock('bullet')}
+            className="flex items-center justify-center gap-1 px-1 py-1 text-[10px] font-medium text-stone-600 dark:text-stone-300 hover:bg-white dark:hover:bg-stone-700 rounded transition-colors whitespace-nowrap min-w-0"
             title="Add Bullet"
           >
-            <List className="w-3 h-3" />
-            List
+            <List className="w-3 h-3 shrink-0" />
+            <span className="truncate">List</span>
           </button>
         </div>
       </div>
@@ -505,14 +894,22 @@ export const NotesScreen: React.FC<NotesScreenProps> = ({
             Flex hinge · Note switcher
           </span>
         </div>
-        <div className="flex-1 overflow-y-auto device-scroll px-3.5 py-2">{renderNoteList()}</div>
+        <div className="flex-1 overflow-y-auto device-scroll px-3.5 pt-2 pb-20">{renderNoteList()}</div>
+      </div>
+    );
+  }
+
+  if (coverEditing) {
+    return (
+      <div className="h-full overflow-hidden px-3 py-1.5 flex flex-col">
+        {renderEditor(true)}
       </div>
     );
   }
 
   return (
-    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-11">
-      {coverEditing ? <div className="h-full pb-1">{renderEditor(true)}</div> : renderNoteList()}
+    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-20">
+      {renderNoteList()}
     </div>
   );
 };

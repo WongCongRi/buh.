@@ -159,7 +159,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                 Search across all tasks and notes
               </p>
               <p className="text-[11px] text-stone-400">
-                Try keywords like "proposal", "Fold 8", "supplier", or "TickTick".
+                Search by title, list, subtasks, or note content.
               </p>
             </div>
           ) : results.length === 0 ? (

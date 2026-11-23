@@ -1,20 +1,42 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
+  Bell,
+  BellOff,
   Check,
+  ChevronDown,
+  ChevronUp,
   Download,
   GripVertical,
+  LogOut,
   Moon,
   Pencil,
   Plus,
+  RefreshCw,
+  Smartphone,
   Sun,
   Trash2,
   X,
 } from 'lucide-react';
-import { AppSettingsState, FoldPosture, TaskItem } from '../../types/taskflow';
+import {
+  AppSettingsState,
+  FoldPosture,
+  GoogleCalendarSyncState,
+  GoogleTasksSyncState,
+  TaskItem,
+} from '../../types/taskflow';
 import { normalizeHex } from '../../utils/colorUtils';
+import {
+  dispatchTestNotification,
+  getNotificationPermissionState,
+  isAndroidDevice,
+  isEmbeddedIframe,
+  NotificationSupportState,
+  requestAppNotificationPermission,
+} from '../../utils/taskReminders';
 import { StyleThemeTokens } from '../../utils/themeTokens';
+import { GoogleSignInButton } from '../GoogleSignInButton';
 
 interface SettingsScreenProps {
   posture: FoldPosture;
@@ -33,6 +55,8 @@ interface SettingsScreenProps {
   settings: AppSettingsState;
   onUpdateSettings: (patch: Partial<AppSettingsState>) => void;
   tasks: TaskItem[];
+  googleCalendar: GoogleCalendarSyncState;
+  googleTasks: GoogleTasksSyncState;
 }
 
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({
@@ -52,6 +76,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   settings,
   onUpdateSettings,
   tasks,
+  googleCalendar,
+  googleTasks,
 }) => {
   const [showExportPreview, setShowExportPreview] = useState(false);
   const [newListName, setNewListName] = useState('');
@@ -59,8 +85,103 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   const [editingDraft, setEditingDraft] = useState('');
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [dropIndex, setDropIndex] = useState<number | null>(null);
+  const [notifPerm, setNotifPerm] = useState<NotificationSupportState>(() =>
+    getNotificationPermissionState()
+  );
+  const [notifBusy, setNotifBusy] = useState(false);
+  const [notifFeedback, setNotifFeedback] = useState<string | null>(null);
+  const [showAndroidGuide, setShowAndroidGuide] = useState<boolean>(
+    () => getNotificationPermissionState() === 'denied' || isAndroidDevice()
+  );
   const debounceRef = useRef<number | null>(null);
   const currentHex = normalizeHex(accentColor);
+  const inIframe = isEmbeddedIframe();
+
+  // Auto-refresh notification permission when returning from Android System Settings
+  useEffect(() => {
+    const refreshPerm = () => {
+      const next = getNotificationPermissionState();
+      setNotifPerm(next);
+      if (next === 'denied') {
+        setShowAndroidGuide(true);
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') refreshPerm();
+    };
+    window.addEventListener('focus', refreshPerm);
+    document.addEventListener('visibilitychange', onVisible);
+
+    let permStatus: PermissionStatus | null = null;
+    if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
+      navigator.permissions
+        .query({ name: 'notifications' as PermissionName })
+        .then((status) => {
+          permStatus = status;
+          permStatus.onchange = refreshPerm;
+        })
+        .catch(() => {
+          // Permissions API not available for notifications in all browsers
+        });
+    }
+
+    return () => {
+      window.removeEventListener('focus', refreshPerm);
+      document.removeEventListener('visibilitychange', onVisible);
+      if (permStatus) permStatus.onchange = null;
+    };
+  }, []);
+
+  const handleEnableNotifications = async () => {
+    if (notifBusy) return;
+    setNotifBusy(true);
+    setNotifFeedback(null);
+    try {
+      const result = await requestAppNotificationPermission();
+      setNotifPerm(result);
+      if (result === 'granted') {
+        const test = await dispatchTestNotification(settings.reminderSound !== false);
+        setNotifFeedback(
+          test.delivered
+            ? 'Notifications allowed — buh. is now registered in Android system settings.'
+            : 'Permission granted. You can customize alerts in Android system settings.'
+        );
+      } else if (result === 'denied') {
+        setShowAndroidGuide(true);
+        setNotifFeedback('Permission is blocked. Enable notifications in Android system settings below.');
+      } else if (result === 'unsupported') {
+        setNotifFeedback('System notifications are unsupported in this browser; in-app alerts remain active.');
+      } else {
+        setNotifFeedback(
+          inIframe
+            ? 'Preview frame blocked the prompt — open buh. directly or install the app on Android to allow notifications.'
+            : 'Prompt dismissed — tap Enable again when ready.'
+        );
+      }
+    } finally {
+      setNotifBusy(false);
+    }
+  };
+
+  const handleSendTestNotification = async () => {
+    if (notifBusy) return;
+    setNotifBusy(true);
+    setNotifFeedback(null);
+    try {
+      const res = await dispatchTestNotification(settings.reminderSound !== false);
+      setNotifPerm(res.permission);
+      if (res.delivered) {
+        setNotifFeedback('Test alert sent — check your notification shade or Android App Info.');
+      } else if (res.permission === 'denied') {
+        setShowAndroidGuide(true);
+        setNotifFeedback('Blocked in system settings — follow the Android steps below to enable.');
+      } else {
+        setNotifFeedback('Could not deliver system notification right now.');
+      }
+    } finally {
+      setNotifBusy(false);
+    }
+  };
 
   const handlePickerChange = (rawHex: string) => {
     const normalized = normalizeHex(rawHex);
@@ -378,6 +499,157 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     </div>
   );
 
+  const notificationsCard = (
+    <div className="space-y-1">
+      <span className="text-[10.5px] font-medium text-stone-400 dark:text-stone-500 px-1">
+        Notifications
+      </span>
+      <div className={`${tokens.cardBg} ${tokens.cardRadius} overflow-hidden`}>
+        {/* System Permission Row */}
+        <div className={`px-2.5 py-2 border-b ${tokens.divider} space-y-1.5`}>
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0 flex items-center gap-2">
+              <span
+                className={`w-6 h-6 rounded-full flex items-center justify-center shrink-0 ${
+                  notifPerm === 'granted'
+                    ? `${tokens.accentSoftBg} ${tokens.accentText}`
+                    : notifPerm === 'denied'
+                      ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400'
+                      : `${tokens.subtleBg} text-stone-500 dark:text-stone-400`
+                }`}
+              >
+                {notifPerm === 'denied' ? (
+                  <BellOff className="w-3.5 h-3.5" />
+                ) : (
+                  <Bell className="w-3.5 h-3.5" />
+                )}
+              </span>
+              <div className="min-w-0">
+                <p className="text-[11.5px] font-medium text-stone-900 dark:text-stone-100 leading-tight">
+                  System notifications
+                </p>
+                <p className="text-[10px] text-stone-500 dark:text-stone-400 leading-tight mt-0.5 truncate">
+                  {notifPerm === 'granted'
+                    ? 'Allowed · Registered for Android alerts'
+                    : notifPerm === 'denied'
+                      ? 'Blocked in system / browser settings'
+                      : notifPerm === 'unsupported'
+                        ? 'In-app alerts only on this browser'
+                        : 'Tap Enable to register in Android settings'}
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1 shrink-0">
+              {notifPerm === 'default' && (
+                <button
+                  type="button"
+                  disabled={notifBusy}
+                  onClick={() => void handleEnableNotifications()}
+                  className={`px-2.5 py-1 text-[10.5px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} hover:opacity-90 disabled:opacity-60`}
+                >
+                  {notifBusy ? 'Requesting...' : 'Enable'}
+                </button>
+              )}
+              {notifPerm === 'granted' && (
+                <button
+                  type="button"
+                  disabled={notifBusy}
+                  onClick={() => void handleSendTestNotification()}
+                  className={`px-2 py-1 text-[10.5px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} hover:opacity-90 disabled:opacity-60`}
+                >
+                  {notifBusy ? 'Sending...' : 'Send test'}
+                </button>
+              )}
+              {notifPerm === 'denied' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = getNotificationPermissionState();
+                    setNotifPerm(next);
+                    setNotifFeedback(
+                      next === 'granted'
+                        ? 'Notifications are now enabled.'
+                        : 'Still blocked — enable under Android App Info → Notifications.'
+                    );
+                  }}
+                  className={`inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius}`}
+                >
+                  <RefreshCw className="w-3 h-3" />
+                  Recheck
+                </button>
+              )}
+            </div>
+          </div>
+
+          {notifFeedback && (
+            <p className={`text-[10px] leading-snug ${tokens.accentText}`}>{notifFeedback}</p>
+          )}
+
+          {inIframe && notifPerm !== 'granted' && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-400 leading-snug">
+              Open buh. as an installed app or direct browser tab on Android to trigger the OS notification permission prompt.
+            </p>
+          )}
+        </div>
+
+        {/* Reminder Toggles */}
+        {renderToggleRow(
+          'Task reminder alerts',
+          'Notify at relative offsets and exact reminder times',
+          settings.taskRemindersEnabled !== false,
+          () => onUpdateSettings({ taskRemindersEnabled: !(settings.taskRemindersEnabled !== false) })
+        )}
+        {renderToggleRow(
+          'Alert sound chime',
+          'Play a soft chime when a reminder triggers',
+          settings.reminderSound !== false,
+          () => onUpdateSettings({ reminderSound: !(settings.reminderSound !== false) })
+        )}
+
+        {/* Android System Settings Instructions */}
+        <div className={`px-2.5 py-1.5 border-t ${tokens.divider}`}>
+          <button
+            type="button"
+            onClick={() => setShowAndroidGuide((v) => !v)}
+            className="w-full flex items-center justify-between gap-2 text-left py-0.5"
+          >
+            <span className="inline-flex items-center gap-1.5 text-[10.5px] font-medium text-stone-700 dark:text-stone-200">
+              <Smartphone className="w-3 h-3 text-stone-400 shrink-0" />
+              Android system settings setup
+            </span>
+            {showAndroidGuide ? (
+              <ChevronUp className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+            )}
+          </button>
+
+          {showAndroidGuide && (
+            <div className="mt-1.5 space-y-1 text-[10px] text-stone-500 dark:text-stone-400 leading-relaxed">
+              <p>
+                <strong className="text-stone-700 dark:text-stone-200">1. Register permission:</strong>{' '}
+                Tap <strong>Enable</strong> above (or <strong>Send test</strong>) first so Android creates the notification channel for <strong>buh.</strong>
+              </p>
+              <p>
+                <strong className="text-stone-700 dark:text-stone-200">2. Installed app (Android / Samsung):</strong>{' '}
+                Long-press the <strong>buh.</strong> icon → <strong>App info (ⓘ)</strong> → <strong>Notifications</strong> → turn on <strong>Allow notifications</strong> (or open <strong>Settings → Apps → buh. → Notifications</strong>).
+              </p>
+              <p>
+                <strong className="text-stone-700 dark:text-stone-200">3. In Chrome / Samsung Internet:</strong>{' '}
+                Tap the <strong>tune / lock icon</strong> in the address bar → <strong>Permissions</strong> → <strong>Notifications</strong> → <strong>Allow</strong>.
+              </p>
+              <p>
+                <strong className="text-stone-700 dark:text-stone-200">4. Reliable timing on Galaxy Fold:</strong>{' '}
+                In <strong>App info → Battery</strong>, select <strong>Unrestricted</strong> so Android doesn&apos;t delay scheduled alerts.
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+
   const adaptiveCard = (
     <div className="space-y-1">
       <span className="text-[10.5px] font-medium text-stone-400 dark:text-stone-500 px-1">Adaptive Layout</span>
@@ -398,16 +670,107 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     </div>
   );
 
+  const isAnyGoogleSyncing = googleCalendar.isSyncing || googleTasks.isSyncing;
+  const combinedGoogleError = googleTasks.error || googleCalendar.error;
+  const lastGoogleUpdate = googleTasks.lastSyncedAt || googleCalendar.lastSyncedAt;
+  const pendingOfflineCount = googleTasks.pendingSyncCount ?? googleCalendar.pendingSyncCount ?? 0;
+
   const integrationsCard = (
     <div className="space-y-1">
-      <span className="text-[10.5px] font-medium text-stone-400 dark:text-stone-500 px-1">Calendar & Export</span>
+      <span className="text-[10.5px] font-medium text-stone-400 dark:text-stone-500 px-1">Google Sync & Export</span>
       <div className={`${tokens.cardBg} ${tokens.cardRadius} overflow-hidden`}>
         {renderToggleRow(
           'Google Calendar sync',
-          'Mirror scheduled blocks into overview',
+          googleCalendar.isConnected
+            ? `Synced with ${googleCalendar.userEmail || 'Google account'}`
+            : 'Connect Google to view & add calendar events',
           settings.googleCalendarSync,
           () => onUpdateSettings({ googleCalendarSync: !settings.googleCalendarSync })
         )}
+        {renderToggleRow(
+          'Google Tasks sync',
+          googleTasks.isConnected
+            ? `${googleTasks.syncedCount} synced tasks across ${Math.max(1, googleTasks.taskLists.length)} list${googleTasks.taskLists.length === 1 ? '' : 's'}`
+            : 'Sync task lists, due dates, and completion status',
+          settings.googleTasksSync,
+          () => onUpdateSettings({ googleTasksSync: !settings.googleTasksSync })
+        )}
+        <div className={`px-3 py-2 border-b ${tokens.divider} space-y-1.5`}>
+          {googleCalendar.isConnected ? (
+            <div className="flex items-center justify-between gap-2">
+              <div className="min-w-0">
+                <p className="text-[11px] font-medium text-stone-800 dark:text-stone-100 truncate">
+                  {googleCalendar.userEmail || 'Google account connected'}
+                </p>
+                <p className="text-[10px] text-stone-500 dark:text-stone-400 truncate tabular-nums">
+                  {googleCalendar.syncedCount} events · {googleTasks.syncedCount} tasks
+                  {lastGoogleUpdate ? ` · ${lastGoogleUpdate}` : ''}
+                </p>
+              </div>
+              <div className="flex items-center gap-1 shrink-0">
+                <button
+                  type="button"
+                  disabled={isAnyGoogleSyncing}
+                  onClick={() => {
+                    void googleCalendar.onSyncNow();
+                    void googleTasks.onSyncNow();
+                  }}
+                  aria-label="Sync Google Calendar and Tasks now"
+                  className={`inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} disabled:opacity-60`}
+                >
+                  <RefreshCw className={`w-3 h-3 ${isAnyGoogleSyncing ? 'animate-spin' : ''}`} />
+                  Sync
+                </button>
+                <button
+                  type="button"
+                  onClick={() => googleCalendar.onSignOut()}
+                  aria-label="Disconnect Google account"
+                  title="Sign out"
+                  className={`p-1 ${tokens.subtleBg} text-stone-500 hover:text-rose-500 ${tokens.buttonRadius} transition-colors`}
+                >
+                  <LogOut className="w-3 h-3" />
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <GoogleSignInButton
+                onClick={() => googleCalendar.onSignIn()}
+                loading={googleCalendar.isSigningIn}
+                label={googleCalendar.userEmail ? 'Reconnect Google' : 'Sign in with Google'}
+              />
+              <p className="text-[10px] text-stone-400 dark:text-stone-500 leading-snug">
+                {googleCalendar.userEmail
+                  ? `Signed in as ${googleCalendar.userEmail}. Tap above to resume live Google Calendar & Tasks sync.`
+                  : 'Sign in with your Google account to sync Calendar events and Google Tasks into buh.'}
+              </p>
+            </div>
+          )}
+          {pendingOfflineCount > 0 && (
+            <div
+              className={`flex items-center justify-between gap-2 px-2 py-1.5 ${tokens.accentSoftBg} ${tokens.buttonRadius}`}
+            >
+              <span className={`text-[10px] font-medium ${tokens.accentText}`}>
+                {pendingOfflineCount} offline change{pendingOfflineCount === 1 ? '' : 's'} queued to sync
+              </span>
+              {googleTasks.onSyncPending && (
+                <button
+                  type="button"
+                  disabled={isAnyGoogleSyncing}
+                  onClick={() => googleTasks.onSyncPending?.()}
+                  className={`px-2 py-0.5 text-[10px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} shrink-0 disabled:opacity-60`}
+                >
+                  Sync now
+                </button>
+              )}
+            </div>
+          )}
+          {combinedGoogleError && (
+            <p className="text-[10px] text-rose-600 dark:text-rose-400 leading-snug">
+              {combinedGoogleError}
+            </p>
+          )}
+        </div>
         {renderToggleRow(
           'Natural language parse',
           'Highlight and extract times and lists while typing',
@@ -435,7 +798,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   );
 
   return (
-    <div className={`h-full overflow-y-auto device-scroll ${posture === FoldPosture.Inner ? 'px-4 py-2' : 'px-3 pt-1.5 pb-12'}`}>
+    <div className={`h-full overflow-y-auto device-scroll ${posture === FoldPosture.Inner ? 'px-4 py-2' : 'px-3 pt-1.5 pb-20'}`}>
       <div className="flex items-center justify-between mb-1.5">
         <h2 className={`font-display font-semibold text-stone-900 dark:text-stone-100 ${tokens.headingScale}`}>
           Settings
@@ -449,12 +812,14 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             {listsCard}
           </div>
           <div className="space-y-2">
+            {notificationsCard}
             {adaptiveCard}
             {integrationsCard}
           </div>
         </div>
       ) : (
         <div className="space-y-1.5">
+          {notificationsCard}
           {appearanceCard}
           {listsCard}
           {adaptiveCard}

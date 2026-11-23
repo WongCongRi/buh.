@@ -44,6 +44,15 @@ export interface SubTask {
   done: boolean;
 }
 
+export interface TaskReminder {
+  id: string;
+  mode: 'relative' | 'exact';
+  offsetMinutes?: number;
+  dateKey?: string; // 'YYYY-MM-DD'
+  time24?: string; // 'HH:MM'
+  firedAt?: number;
+}
+
 export interface TaskItem {
   id: string;
   title: string;
@@ -55,6 +64,11 @@ export interface TaskItem {
   isInbox: boolean;
   notes: string;
   subtasks: SubTask[];
+  reminders?: TaskReminder[];
+  source?: 'local' | 'google';
+  googleTaskId?: string;
+  googleTaskListId?: string;
+  googleTaskListTitle?: string;
 }
 
 export interface CalendarEvent {
@@ -67,6 +81,9 @@ export interface CalendarEvent {
   calendarName: string;
   location?: string;
   linkedTaskId?: string;
+  source?: 'local' | 'google';
+  googleEventId?: string;
+  htmlLink?: string;
 }
 
 export interface NoteBlock {
@@ -97,6 +114,67 @@ export interface AppSettingsState {
   hingeAwareSplit: boolean;
   oneHandedCoverReach: boolean;
   googleCalendarSync: boolean;
+  googleTasksSync: boolean;
   nlpQuickParse: boolean;
   morningDigestTime: string;
+  taskRemindersEnabled: boolean;
+  reminderSound: boolean;
+}
+
+export interface GoogleCalendarSyncState {
+  isConnected: boolean;
+  userEmail: string | null;
+  isSigningIn: boolean;
+  isSyncing: boolean;
+  lastSyncedAt: string | null;
+  syncedCount: number;
+  pendingSyncCount?: number;
+  error: string | null;
+  onSignIn: () => Promise<void>;
+  onSignOut: () => Promise<void>;
+  onSyncNow: () => Promise<void>;
+  onSyncPending?: () => void;
+  onCreateGoogleEvent: (input: {
+    title: string;
+    dateKey: string;
+    startTime: string;
+    endTime: string;
+    calendarName: string;
+  }) => Promise<void>;
+  onDeleteGoogleEvent: (eventId: string, googleEventId: string) => Promise<void>;
+}
+
+export interface GoogleTaskListInfo {
+  id: string;
+  title: string;
+}
+
+export interface GoogleTasksSyncState {
+  isConnected: boolean;
+  userEmail: string | null;
+  isSigningIn: boolean;
+  isSyncing: boolean;
+  lastSyncedAt: string | null;
+  syncedCount: number;
+  pendingSyncCount?: number;
+  taskLists: GoogleTaskListInfo[];
+  dirtyTaskIds: string[];
+  error: string | null;
+  onSignIn: () => Promise<void>;
+  onSignOut: () => Promise<void>;
+  onSyncNow: () => Promise<void>;
+  onSyncPending?: () => void;
+  onCreateGoogleTask: (input: {
+    title: string;
+    notes?: string;
+    dateKey?: string;
+    timeLabel?: string;
+    priority?: TaskPriority;
+    taskListId?: string;
+    category?: string;
+    reminders?: TaskReminder[];
+  }) => Promise<void>;
+  onUpdateGoogleTask: (task: TaskItem) => Promise<void>;
+  onToggleGoogleTask: (task: TaskItem) => Promise<void>;
+  onDeleteGoogleTask: (task: TaskItem) => Promise<void>;
 }

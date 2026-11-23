@@ -12,9 +12,11 @@ import {
   Play,
   Send,
   Trash2,
+  WifiOff,
   X,
 } from 'lucide-react';
 import { TODAY_DATE_KEY } from '../../data/initialData';
+import { useOnlineStatus } from '../../hooks/useOnlineStatus';
 import { CalendarEvent, FoldPosture, NoteItem, TaskItem } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
 
@@ -337,6 +339,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   onSaveAsTask,
   onSaveAsNote,
 }) => {
+  const isOnline = useOnlineStatus();
   const [promptInput, setPromptInput] = useState('');
   const [includeAgenda, setIncludeAgenda] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
@@ -377,10 +380,74 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
 
     return [
       activeTasks.length > 0 ? `Tasks:\n${activeTasks.join('\n')}` : '',
-      todayEvents.length > 0 ? `Schedule (Mon 23 Nov):\n${todayEvents.join('\n')}` : '',
+      todayEvents.length > 0 ? `Schedule (Today, ${TODAY_DATE_KEY}):\n${todayEvents.join('\n')}` : '',
     ]
       .filter(Boolean)
       .join('\n\n');
+  };
+
+  const runOfflineWorkspaceLookup = (query: string) => {
+    const terms = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((t) => t.length >= 2);
+    const matchesText = (text: string) => {
+      const lower = text.toLowerCase();
+      return terms.length === 0 ? lower.includes(query.toLowerCase()) : terms.some((t) => lower.includes(t));
+    };
+
+    const matchedTasks = tasks.filter((t) =>
+      matchesText(`${t.title} ${t.notes} ${t.category} ${t.subtasks.map((s) => s.title).join(' ')}`)
+    );
+    const matchedEvents = events.filter((e) =>
+      matchesText(`${e.title} ${e.location || ''} ${e.calendarName}`)
+    );
+    const matchedNotes = notes.filter((n) =>
+      matchesText(`${n.title} ${n.folder} ${n.blocks.map((b) => b.text).join(' ')}`)
+    );
+
+    const lines: string[] = [];
+    if (matchedTasks.length > 0) {
+      lines.push(`**Saved tasks (${matchedTasks.length})**`);
+      for (const t of matchedTasks.slice(0, 5)) {
+        lines.push(`- ${t.title} (${t.dateKey} · ${t.timeLabel} · ${t.category}${t.completed ? ' · Done' : ''})`);
+      }
+    }
+    if (matchedEvents.length > 0) {
+      lines.push(`**Saved schedule (${matchedEvents.length})**`);
+      for (const ev of matchedEvents.slice(0, 5)) {
+        lines.push(`- ${ev.title} (${ev.dateKey} · ${ev.startTime}${ev.location ? ` · ${ev.location}` : ''})`);
+      }
+    }
+    if (matchedNotes.length > 0) {
+      lines.push(`**Saved notes (${matchedNotes.length})**`);
+      for (const n of matchedNotes.slice(0, 4)) {
+        const snippet = n.blocks.map((b) => b.text).filter(Boolean).join(' ').slice(0, 90);
+        lines.push(`- **${n.title || 'Untitled Note'}**${snippet ? `: ${snippet}` : ''}`);
+      }
+    }
+
+    const answer =
+      lines.length > 0
+        ? lines.join('\n')
+        : `Offline workspace lookup found no saved tasks, schedule items, or notes matching "${query}". Live web search will resume automatically when you reconnect.`;
+
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const created: QuickCheckEntry = {
+      id: `qc-offline-${Date.now()}`,
+      prompt: query,
+      answer,
+      sources: [],
+      media: [],
+      webSearchQueries: [],
+      timestamp: `${timeStr} · Offline`,
+      usedAgenda: true,
+    };
+    onAddEntry(created);
+    setSelectedEntryId(created.id);
+    setPlayingVideoKey(null);
+    setPromptInput('');
   };
 
   const runQuickCheck = async (rawPrompt: string) => {
@@ -388,6 +455,11 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     if (!query || isLoading) return;
 
     setErrorMsg(null);
+    if (!isOnline) {
+      runOfflineWorkspaceLookup(query);
+      return;
+    }
+
     setIsLoading(true);
     setPromptInput('');
 
@@ -435,9 +507,13 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       setSelectedEntryId(created.id);
       setPlayingVideoKey(null);
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Unable to reach Gemini quick-check service.';
-      setErrorMsg(msg);
-      setPromptInput(query);
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        runOfflineWorkspaceLookup(query);
+      } else {
+        const msg = err instanceof Error ? err.message : 'Unable to reach quick-check service.';
+        setErrorMsg(msg);
+        setPromptInput(query);
+      }
     } finally {
       setIsLoading(false);
     }
@@ -499,7 +575,11 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         type="text"
         value={promptInput}
         onChange={(e) => setPromptInput(e.target.value)}
-        placeholder="Ask anything on the live web..."
+        placeholder={
+          isOnline
+            ? 'Ask anything on the live web...'
+            : 'Search saved tasks, notes & schedule offline...'
+        }
         disabled={isLoading}
         aria-label="Ask Lookup"
         className={`flex-1 text-xs px-2.5 py-1.5 ${tokens.subtleBg} text-stone-900 dark:text-stone-100 placeholder:text-stone-400 ${tokens.buttonRadius} focus:outline-none disabled:opacity-60`}
@@ -922,6 +1002,17 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         >
           <Check className="w-3 h-3 shrink-0" />
           <span>{savedFeedback}</span>
+        </div>
+      )}
+
+      {!isOnline && (
+        <div
+          className={`flex items-start gap-2 px-2.5 py-2 ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-600 dark:text-stone-300 text-[11px]`}
+        >
+          <WifiOff className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
+          <span className="leading-snug">
+            Offline — live web search resumes when connected. You can search saved tasks, notes, and schedule below or review past lookups.
+          </span>
         </div>
       )}
 

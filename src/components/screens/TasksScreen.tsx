@@ -1,7 +1,9 @@
 import React, { useEffect, useState } from 'react';
-import { Check, ChevronRight } from 'lucide-react';
-import { FoldPosture, TaskItem } from '../../types/taskflow';
+import { Bell, Check, ChevronRight, RefreshCw } from 'lucide-react';
+import { TODAY_DATE_KEY } from '../../data/initialData';
+import { FoldPosture, GoogleTasksSyncState, TaskItem } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
+import { GoogleSignInButton } from '../GoogleSignInButton';
 import { HighlightedText } from '../HighlightedText';
 import { TaskDetailPane } from './TaskDetailPane';
 import { TaskDetailSheet } from './TaskDetailSheet';
@@ -13,6 +15,8 @@ interface TasksScreenProps {
   taskLists: string[];
   selectedTaskId: string | null;
   hingeAwareSplit: boolean;
+  googleTasksSync: boolean;
+  googleTasks: GoogleTasksSyncState;
   highlightedTaskId?: string | null;
   highlightQuery?: string;
   onDismissHighlight?: () => void;
@@ -20,6 +24,8 @@ interface TasksScreenProps {
   onToggleTask: (id: string) => void;
   onUpdateTask: (task: TaskItem) => void;
   onDeleteTask: (id: string) => void;
+  onSyncGoogleTask: (task: TaskItem) => void;
+  onPushLocalTaskToGoogle: (task: TaskItem) => void;
 }
 
 type TaskFilter = 'all' | 'today' | 'inbox' | 'high' | 'done';
@@ -31,6 +37,8 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   taskLists,
   selectedTaskId,
   hingeAwareSplit,
+  googleTasksSync,
+  googleTasks,
   highlightedTaskId = null,
   highlightQuery = '',
   onDismissHighlight,
@@ -38,6 +46,8 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   onToggleTask,
   onUpdateTask,
   onDeleteTask,
+  onSyncGoogleTask,
+  onPushLocalTaskToGoogle,
 }) => {
   const [filter, setFilter] = useState<TaskFilter>('all');
   const [listFilter, setListFilter] = useState<string>('ALL');
@@ -66,7 +76,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
 
       switch (filter) {
         case 'today':
-          return !t.isInbox && t.dateKey === '2026-11-23';
+          return !t.isInbox && t.dateKey === TODAY_DATE_KEY;
         case 'inbox':
           return t.isInbox;
         case 'high':
@@ -92,28 +102,71 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
     { id: 'done', label: 'Done' },
   ];
 
-  const allListOptions = Array.from(new Set([...taskLists, 'Inbox']));
+  const allListOptions = Array.from(
+    new Set([
+      ...taskLists,
+      ...(googleTasksSync && googleTasks.isConnected
+        ? googleTasks.taskLists.map((l) => l.title)
+        : []),
+      'Inbox',
+    ])
+  );
 
   const renderList = () => (
     <div className="space-y-1.5">
       <div className="flex items-center justify-between gap-2">
-        <h2 className={`font-display font-semibold text-stone-900 dark:text-stone-100 ${tokens.headingScale}`}>
-          Tasks
-        </h2>
-        <select
-          aria-label="Filter tasks by list"
-          value={listFilter}
-          onChange={(e) => setListFilter(e.target.value)}
-          className={`text-[10.5px] font-medium px-2 py-0.5 ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} focus:outline-none`}
-        >
-          <option value="ALL">All lists</option>
-          {allListOptions.map((listName) => (
-            <option key={listName} value={listName}>
-              {listName}
-            </option>
-          ))}
-        </select>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <h2 className={`font-display font-semibold text-stone-900 dark:text-stone-100 ${tokens.headingScale}`}>
+            Tasks
+          </h2>
+          {googleTasksSync && googleTasks.isConnected && (
+            <>
+              <span className="text-[10px] text-stone-400 dark:text-stone-500 truncate">
+                · Google
+              </span>
+              <button
+                type="button"
+                disabled={googleTasks.isSyncing}
+                onClick={() => googleTasks.onSyncNow()}
+                title="Sync Google Tasks"
+                aria-label="Sync Google Tasks"
+                className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${googleTasks.isSyncing ? 'animate-spin' : ''}`} />
+              </button>
+            </>
+          )}
+        </div>
+        <div className="flex items-center gap-1.5 shrink-0">
+          {googleTasksSync && !googleTasks.isConnected && (
+            <GoogleSignInButton
+              compact
+              onClick={() => googleTasks.onSignIn()}
+              loading={googleTasks.isSigningIn}
+              label={googleTasks.userEmail ? 'Reconnect' : 'Connect'}
+            />
+          )}
+          <select
+            aria-label="Filter tasks by list"
+            value={listFilter}
+            onChange={(e) => setListFilter(e.target.value)}
+            className={`text-[10.5px] font-medium px-2 py-0.5 ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} focus:outline-none max-w-[110px]`}
+          >
+            <option value="ALL">All lists</option>
+            {allListOptions.map((listName) => (
+              <option key={listName} value={listName}>
+                {listName}
+              </option>
+            ))}
+          </select>
+        </div>
       </div>
+
+      {googleTasks.error && (
+        <div className="px-2 py-1 text-[10px] text-rose-600 dark:text-rose-400 bg-rose-500/10 rounded-lg">
+          {googleTasks.error}
+        </div>
+      )}
 
       {/* Filter Tabs */}
       <div className="flex items-center justify-between gap-1">
@@ -201,6 +254,26 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                         <span className={`font-medium ${tokens.accentText}`}>High</span>
                       </>
                     )}
+                    {(task.reminders?.length ?? 0) > 0 && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span
+                          className={`inline-flex items-center gap-0.5 ${tokens.accentText}`}
+                          title={`${task.reminders!.length} notification${task.reminders!.length > 1 ? 's' : ''}`}
+                        >
+                          <Bell className="w-2.5 h-2.5" />
+                          {task.reminders!.length > 1 && <span>{task.reminders!.length}</span>}
+                        </span>
+                      </>
+                    )}
+                    {task.source === 'google' && (
+                      <>
+                        <span aria-hidden="true">·</span>
+                        <span className={`font-medium ${tokens.accentText}`}>
+                          {googleTasks.dirtyTaskIds.includes(task.id) ? 'Google · Unsynced' : 'Google'}
+                        </span>
+                      </>
+                    )}
                   </div>
                 </button>
                 <button
@@ -220,6 +293,8 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   );
 
   const detailHighlight = selectedTask && highlightedTaskId === selectedTask.id ? highlightQuery : '';
+  const selectedIsDirty = Boolean(selectedTask && googleTasks.dirtyTaskIds.includes(selectedTask.id));
+  const canPushToGoogle = googleTasksSync && googleTasks.isConnected;
 
   if (posture === FoldPosture.Inner) {
     return (
@@ -232,8 +307,13 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
             taskLists={taskLists}
             highlightQuery={detailHighlight}
             onDismissHighlight={onDismissHighlight}
+            onToggleTask={onToggleTask}
             onUpdateTask={onUpdateTask}
             onDeleteTask={onDeleteTask}
+            isDirtyGoogleTask={selectedIsDirty}
+            onSyncGoogleTask={onSyncGoogleTask}
+            canPushToGoogle={canPushToGoogle}
+            onPushToGoogle={onPushLocalTaskToGoogle}
           />
         </div>
       </div>
@@ -241,6 +321,8 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   }
 
   if (posture === FoldPosture.Flex) {
+    const flexTask = selectedTask || filteredTasks[0] || null;
+    const flexIsDirty = Boolean(flexTask && googleTasks.dirtyTaskIds.includes(flexTask.id));
     return (
       <div className="h-full flex flex-col">
         <div className="h-[46%] overflow-y-auto device-scroll px-3.5 py-2">{renderList()}</div>
@@ -251,13 +333,19 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
         </div>
         <div className="flex-1 overflow-hidden p-2">
           <TaskDetailPane
-            task={selectedTask || filteredTasks[0] || null}
+            task={flexTask}
             tokens={tokens}
             taskLists={taskLists}
             highlightQuery={detailHighlight}
             onDismissHighlight={onDismissHighlight}
+            onToggleTask={onToggleTask}
             onUpdateTask={onUpdateTask}
             onDeleteTask={onDeleteTask}
+            isDirtyGoogleTask={flexIsDirty}
+            onSyncGoogleTask={onSyncGoogleTask}
+            canPushToGoogle={canPushToGoogle}
+            onPushToGoogle={onPushLocalTaskToGoogle}
+            extraBottomClearance
           />
         </div>
       </div>
@@ -265,18 +353,23 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   }
 
   return (
-    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-11">
+    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-20">
       {renderList()}
       <TaskDetailSheet
         task={selectedTaskId ? selectedTask : null}
         tokens={tokens}
         taskLists={taskLists}
-        heightClass="h-[82%]"
+        heightClass="h-[94%]"
         highlightQuery={detailHighlight}
         onDismissHighlight={onDismissHighlight}
         onClose={() => onSelectTask(null)}
+        onToggleTask={onToggleTask}
         onUpdateTask={onUpdateTask}
         onDeleteTask={onDeleteTask}
+        isDirtyGoogleTask={selectedIsDirty}
+        onSyncGoogleTask={onSyncGoogleTask}
+        canPushToGoogle={canPushToGoogle}
+        onPushToGoogle={onPushLocalTaskToGoogle}
       />
     </div>
   );

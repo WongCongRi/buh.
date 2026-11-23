@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from 'react';
 import {
   Battery,
+  Bell,
+  Check,
   CheckSquare,
   FileText,
   HelpCircle,
@@ -14,29 +16,67 @@ import {
   Wifi,
   X,
 } from 'lucide-react';
+import { TODAY_DATE_KEY, TOMORROW_DATE_KEY } from '../data/initialData';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
 import {
   AppSettingsState,
   CalendarEvent,
   DefaultHome,
   DesignDecisions,
   FoldPosture,
+  GoogleCalendarSyncState,
+  GoogleTasksSyncState,
   NavMode,
   NoteItem,
   QuickCaptureMode,
   ScreenId,
   TaskItem,
 } from '../types/taskflow';
+import {
+  loadCachedLookupEntries,
+  saveCachedLookupEntries,
+} from '../utils/offlineSync';
 import { parseQuickTaskInput } from '../utils/quickAddParser';
+import {
+  formatReminderLabel,
+  getNotificationPermissionState,
+  requestAppNotificationPermission,
+} from '../utils/taskReminders';
 import { getDeviceStyleTokens } from '../utils/themeTokens';
 import { GlobalSearchModal, SearchSelection } from './GlobalSearchModal';
+import {
+  GoogleTaskConfirmModal,
+  PendingGoogleTaskMutation,
+} from './GoogleTaskConfirmModal';
 import { NlpTaskInput } from './NlpTaskInput';
+import { PWAInstallButton } from './PWAInstallButton';
 import { HomeScreen } from './screens/HomeScreen';
 import { NotesScreen } from './screens/NotesScreen';
 import { QuickCheckEntry, QuickCheckScreen } from './screens/QuickCheckScreen';
 import { SettingsScreen } from './screens/SettingsScreen';
 import { TasksScreen } from './screens/TasksScreen';
 
+export interface ActiveReminderAlert {
+  id: string;
+  taskId: string;
+  reminderId: string;
+  taskTitle: string;
+  label: string;
+  category: string;
+}
+
+function formatPreviewDateKey(dateKey: string): string {
+  if (dateKey === TODAY_DATE_KEY) return 'Today';
+  if (dateKey === TOMORROW_DATE_KEY) return 'Tomorrow';
+  const [yStr, mStr, dStr] = dateKey.split('-');
+  const dt = new Date(Number(yStr), Number(mStr) - 1, Number(dStr));
+  if (Number.isNaN(dt.getTime())) return dateKey;
+  return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
 interface FoldDeviceFrameProps {
+  standalone?: boolean;
+  onExitStandalone?: () => void;
   posture: FoldPosture;
   decisions: DesignDecisions;
   activeScreen: ScreenId;
@@ -66,9 +106,16 @@ interface FoldDeviceFrameProps {
   recentColors: string[];
   onPreviewAccentColor: (hex: string) => void;
   onSelectAccentColor: (hex: string) => void;
+  googleCalendar: GoogleCalendarSyncState;
+  googleTasks: GoogleTasksSyncState;
+  activeReminderAlerts?: ActiveReminderAlert[];
+  onDismissReminderAlert?: (alertId: string) => void;
+  onCompleteFromReminderAlert?: (alertId: string, taskId: string) => void;
 }
 
 export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
+  standalone = false,
+  onExitStandalone,
   posture,
   decisions,
   activeScreen,
@@ -98,7 +145,13 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   recentColors,
   onPreviewAccentColor,
   onSelectAccentColor,
+  googleCalendar,
+  googleTasks,
+  activeReminderAlerts = [],
+  onDismissReminderAlert,
+  onCompleteFromReminderAlert,
 }) => {
+  const isOnline = useOnlineStatus();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedNoteId, setSelectedNoteId] = useState<string>(notes[0]?.id || '');
   const [coverNoteEditing, setCoverNoteEditing] = useState(false);
@@ -109,7 +162,182 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   const [moreDrawerOpen, setMoreDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchHighlight, setSearchHighlight] = useState<SearchSelection | null>(null);
-  const [quickCheckEntries, setQuickCheckEntries] = useState<QuickCheckEntry[]>([]);
+  const [quickCheckEntries, setQuickCheckEntries] = useState<QuickCheckEntry[]>(() =>
+    loadCachedLookupEntries()
+  );
+  const [pendingTaskMutation, setPendingTaskMutation] =
+    useState<PendingGoogleTaskMutation | null>(null);
+  const [pendingReplaceLocalId, setPendingReplaceLocalId] = useState<string | null>(null);
+  const [taskMutationBusy, setTaskMutationBusy] = useState(false);
+  const [taskSyncToast, setTaskSyncToast] = useState<string | null>(null);
+
+  useEffect(() => {
+    saveCachedLookupEntries(quickCheckEntries);
+  }, [quickCheckEntries]);
+
+  const showTaskToast = (msg: string) => {
+    setTaskSyncToast(msg);
+    window.setTimeout(() => setTaskSyncToast(null), 2600);
+  };
+
+  const resolveGoogleTargetList = (category?: string) => {
+    const matched =
+      (category &&
+        googleTasks.taskLists.find((l) => l.title.toLowerCase() === category.toLowerCase())) ||
+      googleTasks.taskLists[0];
+    return matched || { id: '@default', title: 'My Tasks' };
+  };
+
+  const requestAddTask = (created: TaskItem) => {
+    const wantsGoogleSync =
+      settings.googleTasksSync && (googleTasks.isConnected || Boolean(googleTasks.userEmail));
+    if (wantsGoogleSync && isOnline && googleTasks.isConnected) {
+      const target = resolveGoogleTargetList(created.category);
+      setPendingReplaceLocalId(null);
+      setPendingTaskMutation({
+        action: 'create',
+        task: created,
+        targetListId: target.id,
+        targetListTitle: target.title,
+      });
+      return;
+    }
+    if (wantsGoogleSync && !isOnline) {
+      const target = resolveGoogleTargetList(created.category);
+      void googleTasks.onCreateGoogleTask({
+        title: created.title,
+        notes: created.notes,
+        dateKey: created.isInbox ? undefined : created.dateKey,
+        timeLabel: created.timeLabel,
+        priority: created.priority,
+        taskListId: target.id,
+        category: target.title,
+        reminders: created.reminders,
+      });
+      showTaskToast(`Saved "${created.title}" offline · will sync when online`);
+      return;
+    }
+    onAddTask(created);
+    if (!isOnline) {
+      showTaskToast(`Saved "${created.title}" offline`);
+    }
+  };
+
+  const requestPushLocalTaskToGoogle = (task: TaskItem) => {
+    if (!settings.googleTasksSync || !googleTasks.isConnected) return;
+    const target = resolveGoogleTargetList(task.category);
+    setPendingReplaceLocalId(task.id);
+    setPendingTaskMutation({
+      action: 'create',
+      task,
+      targetListId: target.id,
+      targetListTitle: target.title,
+    });
+  };
+
+  const requestToggleTask = (taskId: string) => {
+    const found = tasks.find((t) => t.id === taskId);
+    if (found?.source === 'google') {
+      if (!isOnline || !googleTasks.isConnected) {
+        void googleTasks.onToggleGoogleTask(found);
+        showTaskToast(
+          !found.completed
+            ? `Completed "${found.title}" offline · will sync when online`
+            : `Reopened "${found.title}" offline · will sync when online`
+        );
+        return;
+      }
+      setPendingReplaceLocalId(null);
+      setPendingTaskMutation({
+        action: 'toggle',
+        task: found,
+        nextCompleted: !found.completed,
+      });
+      return;
+    }
+    onToggleTask(taskId);
+  };
+
+  const requestDeleteTask = (taskId: string) => {
+    const found = tasks.find((t) => t.id === taskId);
+    if (found?.source === 'google') {
+      if (!isOnline || !googleTasks.isConnected) {
+        void googleTasks.onDeleteGoogleTask(found);
+        if (selectedTaskId === taskId) setSelectedTaskId(null);
+        showTaskToast(`Deleted "${found.title}" offline · will sync when online`);
+        return;
+      }
+      setPendingReplaceLocalId(null);
+      setPendingTaskMutation({
+        action: 'delete',
+        task: found,
+      });
+      return;
+    }
+    onDeleteTask(taskId);
+    if (selectedTaskId === taskId) setSelectedTaskId(null);
+  };
+
+  const requestSyncGoogleTaskUpdate = (task: TaskItem) => {
+    if (task.source !== 'google') return;
+    if (!isOnline || !googleTasks.isConnected) {
+      void googleTasks.onUpdateGoogleTask(task);
+      showTaskToast(`Queued "${task.title}" to sync when online`);
+      return;
+    }
+    setPendingReplaceLocalId(null);
+    setPendingTaskMutation({
+      action: 'update',
+      task,
+    });
+  };
+
+  const handleConfirmTaskMutation = async () => {
+    if (!pendingTaskMutation || taskMutationBusy) return;
+    setTaskMutationBusy(true);
+    try {
+      if (pendingTaskMutation.action === 'create') {
+        await googleTasks.onCreateGoogleTask({
+          title: pendingTaskMutation.task.title,
+          notes: pendingTaskMutation.task.notes,
+          dateKey: pendingTaskMutation.task.isInbox
+            ? undefined
+            : pendingTaskMutation.task.dateKey,
+          timeLabel: pendingTaskMutation.task.timeLabel,
+          priority: pendingTaskMutation.task.priority,
+          taskListId: pendingTaskMutation.targetListId,
+          category: pendingTaskMutation.targetListTitle,
+          reminders: pendingTaskMutation.task.reminders,
+        });
+        if (pendingReplaceLocalId) {
+          onDeleteTask(pendingReplaceLocalId);
+          if (selectedTaskId === pendingReplaceLocalId) setSelectedTaskId(null);
+        }
+        showTaskToast(`Added "${pendingTaskMutation.task.title}" to Google Tasks`);
+      } else if (pendingTaskMutation.action === 'toggle') {
+        await googleTasks.onToggleGoogleTask(pendingTaskMutation.task);
+        showTaskToast(
+          pendingTaskMutation.nextCompleted
+            ? `Completed "${pendingTaskMutation.task.title}" in Google Tasks`
+            : `Reopened "${pendingTaskMutation.task.title}" in Google Tasks`
+        );
+      } else if (pendingTaskMutation.action === 'update') {
+        await googleTasks.onUpdateGoogleTask(pendingTaskMutation.task);
+        showTaskToast(`Updated "${pendingTaskMutation.task.title}" in Google Tasks`);
+      } else if (pendingTaskMutation.action === 'delete') {
+        await googleTasks.onDeleteGoogleTask(pendingTaskMutation.task);
+        if (selectedTaskId === pendingTaskMutation.task.id) setSelectedTaskId(null);
+        showTaskToast(`Deleted "${pendingTaskMutation.task.title}" from Google Tasks`);
+      }
+      setPendingTaskMutation(null);
+      setPendingReplaceLocalId(null);
+    } catch {
+      setPendingTaskMutation(null);
+      setPendingReplaceLocalId(null);
+    } finally {
+      setTaskMutationBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (!searchHighlight) return;
@@ -176,8 +404,12 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
       isInbox: chosenCategory === 'Inbox',
       notes: '',
       subtasks: [],
+      reminders: parsed.reminders.length > 0 ? parsed.reminders : undefined,
     };
-    onAddTask(created);
+    if (parsed.reminders.length > 0 && getNotificationPermissionState() === 'default') {
+      void requestAppNotificationPermission();
+    }
+    requestAddTask(created);
     clearFn();
   };
 
@@ -212,6 +444,20 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     decisions.quickCapture === QuickCaptureMode.Fab ||
     decisions.quickCapture === QuickCaptureMode.Both;
 
+  const showRailFab =
+    showFab && posture === FoldPosture.Inner && activeScreen !== ScreenId.Agent;
+
+  const showFloatingFab =
+    showFab &&
+    posture !== FoldPosture.Inner &&
+    activeScreen !== ScreenId.Agent &&
+    !(activeScreen === ScreenId.Notes && posture === FoldPosture.Cover && coverNoteEditing) &&
+    !(
+      Boolean(selectedTaskId) &&
+      (activeScreen === ScreenId.Home ||
+        (activeScreen === ScreenId.Tasks && posture === FoldPosture.Cover))
+    );
+
   // Chassis width per standard Galaxy Z Fold 8 posture (5.5" 10:16 cover, 7.6" 4:3 inner)
   const chassisWidthClass =
     posture === FoldPosture.Cover
@@ -236,18 +482,19 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
             taskLists={taskLists}
             selectedTaskId={selectedTaskId}
             hingeAwareSplit={settings.hingeAwareSplit}
+            googleTasksSync={settings.googleTasksSync}
+            googleTasks={googleTasks}
             highlightedTaskId={
               searchHighlight?.targetType === 'task' ? searchHighlight.targetId : null
             }
             highlightQuery={searchHighlight?.targetType === 'task' ? searchHighlight.query : ''}
             onDismissHighlight={() => setSearchHighlight(null)}
             onSelectTask={setSelectedTaskId}
-            onToggleTask={onToggleTask}
+            onToggleTask={requestToggleTask}
             onUpdateTask={onUpdateTask}
-            onDeleteTask={(id) => {
-              onDeleteTask(id);
-              if (selectedTaskId === id) setSelectedTaskId(null);
-            }}
+            onDeleteTask={requestDeleteTask}
+            onSyncGoogleTask={requestSyncGoogleTaskUpdate}
+            onPushLocalTaskToGoogle={requestPushLocalTaskToGoogle}
           />
         );
       case ScreenId.Agent:
@@ -263,11 +510,11 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
             onAddEntry={(entry) => setQuickCheckEntries((prev) => [...prev, entry])}
             onClearEntries={() => setQuickCheckEntries([])}
             onSaveAsTask={(title, body) =>
-              onAddTask({
+              requestAddTask({
                 id: `t-qc-${Date.now()}`,
                 title,
                 timeLabel: 'No time set',
-                dateKey: '2026-11-23',
+                dateKey: TODAY_DATE_KEY,
                 category: 'Inbox',
                 priority: 'Normal',
                 completed: false,
@@ -322,6 +569,8 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
             settings={settings}
             onUpdateSettings={onUpdateSettings}
             tasks={tasks}
+            googleCalendar={googleCalendar}
+            googleTasks={googleTasks}
           />
         );
       case ScreenId.Home:
@@ -338,13 +587,15 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
             selectedTaskId={selectedTaskId}
             hingeAwareSplit={settings.hingeAwareSplit}
             googleCalendarSync={settings.googleCalendarSync}
+            googleTasksSync={settings.googleTasksSync}
+            googleCalendar={googleCalendar}
+            googleTasks={googleTasks}
             onSelectTask={setSelectedTaskId}
-            onToggleTask={onToggleTask}
+            onToggleTask={requestToggleTask}
             onUpdateTask={onUpdateTask}
-            onDeleteTask={(id) => {
-              onDeleteTask(id);
-              if (selectedTaskId === id) setSelectedTaskId(null);
-            }}
+            onDeleteTask={requestDeleteTask}
+            onSyncGoogleTask={requestSyncGoogleTaskUpdate}
+            onPushLocalTaskToGoogle={requestPushLocalTaskToGoogle}
             onAddEvent={onAddEvent}
             onConvertEventToTask={onConvertEventToTask}
             onUpdateNote={onUpdateNote}
@@ -363,51 +614,57 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     }
   };
 
-  return (
-    <div className="flex flex-col items-center justify-center w-full">
-      {/* Galaxy Z Fold 8 Hardware Chassis */}
-      <div
-        className={`relative ${chassisWidthClass} p-[9px] bg-[#1D1F1E] dark:bg-[#080908] shadow-2xl shadow-stone-900/20 dark:shadow-black/60 border border-stone-700/60 transition-[max-width,border-radius] duration-300 ease-out flex flex-col`}
-      >
-        {/* Left Titanium Hinge Spine on Cover Display */}
-        {posture === FoldPosture.Cover && (
-          <div
-            aria-hidden="true"
-            className="absolute -left-[5px] top-10 bottom-10 w-[5px] rounded-l-md bg-gradient-to-b from-stone-600 via-stone-400 to-stone-600 opacity-85"
-          />
-        )}
-
-        {/* Inner Display Area with exact Fold 8 Aspect Ratio */}
-        <div
-          className={`relative w-full overflow-hidden ${screenAspectClass} ${tokens.surfaceBg} flex flex-col`}
-        >
-          {/* Simulated Android Status Bar */}
-          <div className="h-6 px-3.5 flex items-center justify-between text-[10px] font-medium text-stone-700 dark:text-stone-300 shrink-0 select-none">
-            <span className="font-mono-tabular">09:41</span>
-            {posture === FoldPosture.Cover && (
-              <span className="w-2 h-2 rounded-full bg-stone-900 dark:bg-black border border-stone-700" />
-            )}
-            <div className="flex items-center gap-1">
-              <Wifi className="w-2.5 h-2.5" />
-              <Battery className="w-3 h-3" />
-            </div>
+  const innerAppContent = (
+    <div
+      className={
+        standalone
+          ? `relative w-full h-[100dvh] overflow-hidden ${tokens.surfaceBg} flex flex-col pt-[env(safe-area-inset-top)] pb-[env(safe-area-inset-bottom)]`
+          : `relative w-full overflow-hidden ${screenAspectClass} ${tokens.surfaceBg} flex flex-col`
+      }
+    >
+      {/* Simulated Android Status Bar (Preview Studio only) */}
+      {!standalone && (
+        <div className="h-6 px-3.5 flex items-center justify-between text-[10px] font-medium text-stone-700 dark:text-stone-300 shrink-0 select-none">
+          <span className="font-mono-tabular">09:41</span>
+          {posture === FoldPosture.Cover && (
+            <span className="w-2 h-2 rounded-full bg-stone-900 dark:bg-black border border-stone-700" />
+          )}
+          <div className="flex items-center gap-1">
+            <Wifi className="w-2.5 h-2.5" />
+            <Battery className="w-3 h-3" />
           </div>
+        </div>
+      )}
 
-          {/* App Brand Bar */}
-          <div className={`px-3.5 py-1 flex items-center justify-between border-b ${tokens.divider} shrink-0`}>
-            <span className="font-display text-[14.5px] font-bold tracking-tight text-stone-900 dark:text-stone-100">
-              buh.
-            </span>
+      {/* App Brand Bar */}
+      <div
+        className={`px-3.5 ${standalone ? 'py-2' : 'py-1'} flex items-center justify-between border-b ${tokens.divider} shrink-0`}
+      >
+        <span className="font-display text-[14.5px] font-bold tracking-tight text-stone-900 dark:text-stone-100">
+          buh.
+        </span>
+        <div className="flex items-center gap-1.5">
+          {standalone && <PWAInstallButton compact />}
+          {standalone && onExitStandalone && (
             <button
               type="button"
-              onClick={() => setSearchOpen(true)}
-              aria-label="Global search tasks and notes"
-              title="Search tasks & notes"
-              className={`p-1 ${tokens.subtleBg} text-stone-600 dark:text-stone-300 hover:text-[var(--tf-accent-text)] ${tokens.buttonRadius} transition-colors`}
+              onClick={onExitStandalone}
+              className={`px-2 py-1 text-[10.5px] font-medium ${tokens.subtleBg} text-stone-600 dark:text-stone-300 ${tokens.buttonRadius} hover:opacity-85 transition-opacity`}
             >
-              <Search className="w-3.5 h-3.5" />
+              Studio
             </button>
-          </div>
+          )}
+          <button
+            type="button"
+            onClick={() => setSearchOpen(true)}
+            aria-label="Global search tasks and notes"
+            title="Search tasks & notes"
+            className={`p-1 ${tokens.subtleBg} text-stone-600 dark:text-stone-300 hover:text-[var(--tf-accent-text)] ${tokens.buttonRadius} transition-colors`}
+          >
+            <Search className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      </div>
 
           {/* Persistent Quick-Capture Input Bar (if selected) */}
           {showPersistentBar && (
@@ -423,7 +680,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                 onChange={setQuickBarText}
                 nlpEnabled={settings.nlpQuickParse}
                 availableLists={taskLists}
-                placeholder="Quick add task (e.g. Draft memo at 3pm #work)..."
+                placeholder="Quick add (e.g. Memo 3pm remind 10m before #work)..."
                 paddingClassName="px-2.5 py-1"
                 className={`flex-1 ${tokens.subtleBg} ${tokens.buttonRadius}`}
               />
@@ -511,6 +768,17 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                         </button>
                       );
                     })}
+                {showRailFab && (
+                  <button
+                    type="button"
+                    onClick={() => setFabModalOpen(true)}
+                    aria-label="Quick add task"
+                    title="Quick add task"
+                    className={`mt-auto w-10 h-10 ${tokens.accentBg} rounded-full shadow-md shadow-stone-900/15 flex items-center justify-center hover:scale-105 active:scale-95 transition-transform shrink-0`}
+                  >
+                    <Plus className="w-4.5 h-4.5" />
+                  </button>
+                )}
               </aside>
             )}
 
@@ -541,8 +809,8 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                 </div>
               )}
 
-              {/* Floating + Capture Button (if selected, hidden on Lookup screen) */}
-              {showFab && activeScreen !== ScreenId.Agent && (
+              {/* Floating + Capture Button (Cover/Flex only; docked in rail on Inner, hidden on Lookup/Note Editor/Task Sheet) */}
+              {showFloatingFab && (
                 <button
                   type="button"
                   onClick={() => setFabModalOpen(true)}
@@ -594,7 +862,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       onChange={setFabText}
                       nlpEnabled={settings.nlpQuickParse}
                       availableLists={taskLists}
-                      placeholder="e.g. Call electrician tomorrow 10am #personal high"
+                      placeholder="e.g. Dentist tomorrow 2pm remind 1h before #personal"
                       paddingClassName="px-3 py-2.5"
                       className={`w-full ${tokens.subtleBg} ${tokens.buttonRadius}`}
                     />
@@ -622,12 +890,26 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       })}
                     </div>
 
+                    {settings.nlpQuickParse && fabParsedPreview.reminders.length > 0 && (
+                      <div className="flex flex-wrap items-center gap-1">
+                        {fabParsedPreview.reminders.map((rem) => (
+                          <span
+                            key={rem.id}
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-medium tabular-nums ${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder} ${tokens.buttonRadius}`}
+                          >
+                            <Bell className="w-2.5 h-2.5 shrink-0" />
+                            {formatReminderLabel(rem)}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[10.5px] text-stone-400 truncate tabular-nums">
                         {settings.nlpQuickParse && fabText.trim()
-                          ? `${fabParsedPreview.category} · ${
-                              fabParsedPreview.dateKey === '2026-11-24' ? 'Tomorrow' : 'Today'
-                            } · ${fabParsedPreview.timeLabel}${
+                          ? `${fabParsedPreview.category} · ${formatPreviewDateKey(
+                              fabParsedPreview.dateKey
+                            )} · ${fabParsedPreview.timeLabel}${
                               fabParsedPreview.priority !== 'Normal'
                                 ? ` · ${fabParsedPreview.priority}`
                                 : ''
@@ -795,7 +1077,112 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
             onClose={() => setSearchOpen(false)}
             onSelectResult={handleSelectSearchResult}
           />
-        </div>
+
+          {/* Explicit Confirmation Dialog for Google Tasks Mutations */}
+          <GoogleTaskConfirmModal
+            pending={pendingTaskMutation}
+            tokens={tokens}
+            busy={taskMutationBusy}
+            onCancel={() => {
+              setPendingTaskMutation(null);
+              setPendingReplaceLocalId(null);
+            }}
+            onConfirm={handleConfirmTaskMutation}
+            onSaveLocalOnly={
+              pendingTaskMutation?.action === 'create' && !pendingReplaceLocalId
+                ? () => {
+                    onAddTask(pendingTaskMutation.task);
+                    setPendingTaskMutation(null);
+                  }
+                : undefined
+            }
+          />
+
+          {activeReminderAlerts.length > 0 && (
+            <div className="absolute top-10 inset-x-3 z-50 flex flex-col gap-1.5 pointer-events-none">
+              {activeReminderAlerts.slice(0, 3).map((alert) => (
+                <div
+                  key={alert.id}
+                  role="alert"
+                  className={`pointer-events-auto flex items-center gap-2 px-2.5 py-2 bg-white dark:bg-[#1A1E1C] border ${tokens.accentBorder} shadow-lg shadow-stone-900/15 dark:shadow-black/50 ${tokens.cardRadius}`}
+                >
+                  <span
+                    className={`w-6 h-6 rounded-full ${tokens.accentSoftBg} ${tokens.accentText} flex items-center justify-center shrink-0`}
+                  >
+                    <Bell className="w-3.5 h-3.5" />
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedTaskId(alert.taskId);
+                      onChangeScreen(ScreenId.Tasks);
+                      onDismissReminderAlert?.(alert.id);
+                    }}
+                    className="flex-1 min-w-0 text-left"
+                  >
+                    <p className="text-[11.5px] font-semibold text-stone-900 dark:text-stone-100 truncate leading-tight">
+                      {alert.taskTitle}
+                    </p>
+                    <p className="text-[10px] text-stone-500 dark:text-stone-400 truncate leading-tight mt-0.5 tabular-nums">
+                      {alert.label} · {alert.category}
+                    </p>
+                  </button>
+                  {onCompleteFromReminderAlert && (
+                    <button
+                      type="button"
+                      onClick={() => onCompleteFromReminderAlert(alert.id, alert.taskId)}
+                      className={`inline-flex items-center gap-1 px-2 py-1 text-[10px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} shrink-0 hover:opacity-90`}
+                    >
+                      <Check className="w-3 h-3" />
+                      Done
+                    </button>
+                  )}
+                  {onDismissReminderAlert && (
+                    <button
+                      type="button"
+                      onClick={() => onDismissReminderAlert(alert.id)}
+                      aria-label="Dismiss reminder"
+                      className="p-1 text-stone-400 hover:text-stone-800 dark:hover:text-stone-100 shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {taskSyncToast && (
+            <div className="pointer-events-none absolute top-10 inset-x-3 z-40 flex justify-center">
+              <div
+                className={`px-2.5 py-1 text-[10.5px] font-medium shadow-md ${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder} ${tokens.buttonRadius} max-w-full truncate`}
+              >
+                {taskSyncToast}
+              </div>
+            </div>
+          )}
+    </div>
+  );
+
+  if (standalone) {
+    return innerAppContent;
+  }
+
+  return (
+    <div className="flex flex-col items-center justify-center w-full">
+      {/* Galaxy Z Fold 8 Hardware Chassis */}
+      <div
+        className={`relative ${chassisWidthClass} p-[9px] bg-[#1D1F1E] dark:bg-[#080908] shadow-2xl shadow-stone-900/20 dark:shadow-black/60 border border-stone-700/60 transition-[max-width,border-radius] duration-300 ease-out flex flex-col`}
+      >
+        {/* Left Titanium Hinge Spine on Cover Display */}
+        {posture === FoldPosture.Cover && (
+          <div
+            aria-hidden="true"
+            className="absolute -left-[5px] top-10 bottom-10 w-[5px] rounded-l-md bg-gradient-to-b from-stone-600 via-stone-400 to-stone-600 opacity-85"
+          />
+        )}
+
+        {innerAppContent}
       </div>
 
       {/* Subtle Device Dimension Caption */}

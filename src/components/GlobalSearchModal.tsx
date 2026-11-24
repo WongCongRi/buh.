@@ -3,6 +3,8 @@ import { CheckSquare, FileText, Search, X } from 'lucide-react';
 import { NoteItem, TaskItem } from '../types/taskflow';
 import { StyleThemeTokens } from '../utils/themeTokens';
 import { HighlightedText } from './HighlightedText';
+import { MarkdownPreviewText } from './MarkdownPreviewText';
+import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
 export interface SearchSelection {
   targetType: 'task' | 'note';
@@ -26,6 +28,7 @@ interface SearchMatchItem {
   title: string;
   meta: string;
   snippet: string;
+  markdownEnabled?: boolean;
 }
 
 export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
@@ -37,6 +40,8 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
   onSelectResult,
 }) => {
   const [query, setQuery] = useState('');
+
+  useBackLayer(open, onClose, 20);
 
   const results = useMemo<SearchMatchItem[]>(() => {
     const q = query.trim().toLowerCase();
@@ -83,6 +88,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
           title: note.title,
           meta: `Note · ${note.folder} · ${note.updatedAt}`,
           snippet,
+          markdownEnabled: Boolean(note.markdownEnabled),
         });
       }
     }
@@ -113,8 +119,8 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
         onClick={(e) => e.stopPropagation()}
       >
         {/* Search Input Header */}
-        <div className={`flex items-center gap-2 px-3 py-2.5 border-b ${tokens.divider}`}>
-          <Search className="w-3.5 h-3.5 text-stone-400 shrink-0" />
+        <div className={`flex items-center gap-2.5 px-3.5 py-3 border-b ${tokens.divider}`}>
+          <Search className="w-[18px] h-[18px] text-stone-400 shrink-0" />
           <input
             type="text"
             autoFocus
@@ -130,13 +136,13 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
             }}
             placeholder="Search tasks and notes..."
             aria-label="Global search across tasks and notes"
-            className="flex-1 bg-transparent text-xs text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none"
+            className="flex-1 bg-transparent text-[15px] text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none"
           />
           {query && (
             <button
               type="button"
               onClick={() => setQuery('')}
-              className="text-[11px] text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 px-1"
+              className="text-[13px] text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 px-1.5"
             >
               Clear
             </button>
@@ -145,29 +151,29 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
             type="button"
             onClick={onClose}
             aria-label="Close global search"
-            className="p-1 text-stone-400 hover:text-stone-800 dark:hover:text-stone-100 rounded"
+            className="p-1.5 text-stone-400 hover:text-stone-800 dark:hover:text-stone-100 rounded-lg"
           >
-            <X className="w-3.5 h-3.5" />
+            <X className="w-[18px] h-[18px]" />
           </button>
         </div>
 
         {/* Results */}
         <div className="flex-1 overflow-y-auto device-scroll">
           {!query.trim() ? (
-            <div className="p-4 text-center space-y-1">
-              <p className="text-xs font-medium text-stone-700 dark:text-stone-200">
+            <div className="p-6 text-center space-y-1.5">
+              <p className="text-[14.5px] font-medium text-stone-700 dark:text-stone-200">
                 Search across all tasks and notes
               </p>
-              <p className="text-[11px] text-stone-400">
+              <p className="text-[13px] text-stone-400">
                 Search by title, list, subtasks, or note content.
               </p>
             </div>
           ) : results.length === 0 ? (
-            <div className="p-5 text-center space-y-1">
-              <p className="text-xs font-medium text-stone-700 dark:text-stone-200">
+            <div className="p-6 text-center space-y-1.5">
+              <p className="text-[14.5px] font-medium text-stone-700 dark:text-stone-200">
                 No matches for "{query.trim()}"
               </p>
-              <p className="text-[11px] text-stone-400">
+              <p className="text-[13px] text-stone-400">
                 Try another keyword from your tasks, subtasks, or notes.
               </p>
             </div>
@@ -178,23 +184,27 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                   key={item.id}
                   type="button"
                   onClick={() => handleChoose(item)}
-                  className="w-full text-left px-3 py-2.5 hover:bg-stone-50 dark:hover:bg-white/[0.03] transition-colors flex items-start gap-2.5"
+                  className="w-full text-left px-3.5 py-3 hover:bg-stone-50 dark:hover:bg-white/[0.03] transition-colors flex items-start gap-3"
                 >
                   <span className="mt-0.5 text-stone-400 shrink-0">
                     {item.targetType === 'task' ? (
-                      <CheckSquare className="w-3.5 h-3.5" />
+                      <CheckSquare className="w-4 h-4" />
                     ) : (
-                      <FileText className="w-3.5 h-3.5" />
+                      <FileText className="w-4 h-4" />
                     )}
                   </span>
                   <div className="flex-1 min-w-0">
-                    <p className="text-xs font-semibold text-stone-900 dark:text-stone-100 truncate">
+                    <p className="text-[15px] font-semibold text-stone-900 dark:text-stone-100 truncate">
                       <HighlightedText text={item.title} query={query} />
                     </p>
-                    <p className="text-[11px] text-stone-500 dark:text-stone-400 truncate mt-0.5">
-                      <HighlightedText text={item.snippet} query={query} />
+                    <p className="text-[13px] text-stone-500 dark:text-stone-400 truncate mt-0.5">
+                      {item.markdownEnabled ? (
+                        <MarkdownPreviewText text={item.snippet} query={query} highlightActive />
+                      ) : (
+                        <HighlightedText text={item.snippet} query={query} />
+                      )}
                     </p>
-                    <p className="text-[10px] text-stone-400 dark:text-stone-500 mt-0.5 tabular-nums">
+                    <p className="text-[12px] text-stone-400 dark:text-stone-500 mt-0.5 tabular-nums">
                       {item.meta}
                     </p>
                   </div>

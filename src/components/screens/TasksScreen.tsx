@@ -113,15 +113,15 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   );
 
   const renderList = () => (
-    <div className="space-y-1.5">
+    <div className="space-y-2.5">
       <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-1.5 min-w-0">
+        <div className="flex items-center gap-2 min-w-0">
           <h2 className={`font-display font-semibold text-stone-900 dark:text-stone-100 ${tokens.headingScale}`}>
             Tasks
           </h2>
           {googleTasksSync && googleTasks.isConnected && (
             <>
-              <span className="text-[10px] text-stone-400 dark:text-stone-500 truncate">
+              <span className="text-[12px] text-stone-400 dark:text-stone-500 truncate">
                 · Google
               </span>
               <button
@@ -130,14 +130,14 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                 onClick={() => googleTasks.onSyncNow()}
                 title="Sync Google Tasks"
                 aria-label="Sync Google Tasks"
-                className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
+                className="p-1 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
               >
-                <RefreshCw className={`w-3 h-3 ${googleTasks.isSyncing ? 'animate-spin' : ''}`} />
+                <RefreshCw className={`w-4 h-4 ${googleTasks.isSyncing ? 'animate-spin' : ''}`} />
               </button>
             </>
           )}
         </div>
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-2 shrink-0">
           {googleTasksSync && !googleTasks.isConnected && (
             <GoogleSignInButton
               compact
@@ -150,7 +150,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
             aria-label="Filter tasks by list"
             value={listFilter}
             onChange={(e) => setListFilter(e.target.value)}
-            className={`text-[10.5px] font-medium px-2 py-0.5 ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} focus:outline-none max-w-[110px]`}
+            className={`text-[13px] font-medium px-2.5 py-1.5 ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} focus:outline-none max-w-[140px]`}
           >
             <option value="ALL">All lists</option>
             {allListOptions.map((listName) => (
@@ -163,14 +163,18 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
       </div>
 
       {googleTasks.error && (
-        <div className="px-2 py-1 text-[10px] text-rose-600 dark:text-rose-400 bg-rose-500/10 rounded-lg">
+        <div className="px-3 py-2 text-[12.5px] text-rose-600 dark:text-rose-400 bg-rose-500/10 rounded-lg">
           {googleTasks.error}
         </div>
       )}
 
       {/* Filter Tabs */}
-      <div className="flex items-center justify-between gap-1">
-        <div className="flex items-center gap-1 overflow-x-auto">
+      <div className="flex items-center justify-between gap-2">
+        <div
+          className={`flex items-center gap-1.5 ${
+            posture === FoldPosture.Inner ? 'flex-wrap min-w-0' : 'overflow-x-auto'
+          }`}
+        >
           {filterOptions.map((opt) => {
             const active = filter === opt.id;
             return (
@@ -178,7 +182,11 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                 key={opt.id}
                 type="button"
                 onClick={() => setFilter(opt.id)}
-                className={`px-2 py-0.5 text-[10.5px] font-medium transition-colors whitespace-nowrap shrink-0 ${tokens.buttonRadius} ${
+                className={`${
+                  posture === FoldPosture.Inner
+                    ? 'px-2.5 py-1 text-[12.5px]'
+                    : 'px-3 py-1.5 text-[13px]'
+                } font-medium transition-colors whitespace-nowrap shrink-0 ${tokens.buttonRadius} ${
                   active
                     ? `${tokens.accentBg}`
                     : `${tokens.subtleBg} text-stone-600 dark:text-stone-300 hover:opacity-85`
@@ -189,15 +197,15 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
             );
           })}
         </div>
-        <span className="text-[10px] text-stone-400 tabular-nums shrink-0">{filteredTasks.length}</span>
+        <span className="text-[12px] text-stone-400 tabular-nums shrink-0">{filteredTasks.length}</span>
       </div>
 
       {/* Task Rows */}
       <div className={`${tokens.cardBg} ${tokens.cardRadius} overflow-hidden`}>
         {filteredTasks.length === 0 ? (
-          <div className="p-5 text-center space-y-1">
-            <p className="text-xs font-medium text-stone-700 dark:text-stone-300">No tasks match this view</p>
-            <p className="text-[11px] text-stone-400">Try another filter or add a new task.</p>
+          <div className="p-6 text-center space-y-1.5">
+            <p className="text-[14.5px] font-medium text-stone-700 dark:text-stone-300">No tasks match this view</p>
+            <p className="text-[13px] text-stone-400">Try another filter or add a new task.</p>
           </div>
         ) : (
           filteredTasks.map((task) => {
@@ -206,21 +214,21 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
             return (
               <div
                 key={task.id}
-                className={`flex items-center gap-2.5 ${tokens.rowPadding} border-b last:border-b-0 ${tokens.divider} transition-colors ${
+                className={`flex items-center gap-3 ${tokens.rowPadding} border-b last:border-b-0 ${tokens.divider} transition-colors ${
                   isSelected ? tokens.accentSoftBg : ''
                 }`}
               >
                 <button
                   type="button"
                   onClick={() => onToggleTask(task.id)}
-                  className={`w-4 h-4 rounded-full border flex items-center justify-center shrink-0 transition-colors ${
+                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
                     task.completed
                       ? `${tokens.accentBg} border-transparent`
                       : 'border-stone-300 dark:border-stone-600'
                   }`}
                   aria-label={`Toggle ${task.title}`}
                 >
-                  {task.completed && <Check className="w-2.5 h-2.5" />}
+                  {task.completed && <Check className="w-3 h-3" />}
                 </button>
                 <button
                   type="button"
@@ -228,13 +236,13 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                   className="flex-1 min-w-0 text-left"
                 >
                   <p
-                    className={`text-[13px] font-medium truncate ${
+                    className={`text-[15px] font-medium truncate leading-snug ${
                       task.completed ? 'line-through text-stone-400' : 'text-stone-900 dark:text-stone-100'
                     }`}
                   >
                     <HighlightedText text={task.title} query={highlightQuery} active={isHighlighted} />
                   </p>
-                  <div className="flex items-center gap-1.5 mt-0.5 text-[11px] text-stone-500 dark:text-stone-400 tabular-nums">
+                  <div className="flex items-center gap-1.5 mt-0.5 text-[12.5px] text-stone-500 dark:text-stone-400 tabular-nums flex-wrap">
                     <span>{task.timeLabel}</span>
                     <span aria-hidden="true">·</span>
                     <span>
@@ -261,7 +269,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                           className={`inline-flex items-center gap-0.5 ${tokens.accentText}`}
                           title={`${task.reminders!.length} notification${task.reminders!.length > 1 ? 's' : ''}`}
                         >
-                          <Bell className="w-2.5 h-2.5" />
+                          <Bell className="w-3.5 h-3.5" />
                           {task.reminders!.length > 1 && <span>{task.reminders!.length}</span>}
                         </span>
                       </>
@@ -279,10 +287,10 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
                 <button
                   type="button"
                   onClick={() => onSelectTask(task.id)}
-                  className="p-0.5 text-stone-300 dark:text-stone-600"
+                  className="p-1 text-stone-300 dark:text-stone-600"
                   aria-label="Open task details"
                 >
-                  <ChevronRight className="w-3.5 h-3.5" />
+                  <ChevronRight className="w-4 h-4" />
                 </button>
               </div>
             );
@@ -353,8 +361,10 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   }
 
   return (
-    <div className="h-full overflow-y-auto device-scroll px-3 pt-1.5 pb-20">
-      {renderList()}
+    <div className="relative h-full overflow-hidden">
+      <div className="h-full overflow-y-auto device-scroll px-3.5 pt-2.5 pb-24">
+        {renderList()}
+      </div>
       <TaskDetailSheet
         task={selectedTaskId ? selectedTask : null}
         tokens={tokens}

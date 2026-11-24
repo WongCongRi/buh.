@@ -1,0 +1,12 @@
+[
+  {
+    "relation": ["delegate_permission/common.handle_all_urls"],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "studio.ai.buh_studio.twa",
+      "sha256_cert_fingerprints": [
+        "59:7F:E3:D0:4B:26:E0:34:A8:89:33:77:ED:CE:2A:61:A5:26:D5:FC:25:21:2F:38:0A:9E:C1:09:AC:91:B5:E6"
+      ]
+    }
+  }
+]

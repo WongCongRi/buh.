@@ -21,7 +21,7 @@ export const NlpTaskInput: React.FC<NlpTaskInputProps> = ({
   placeholder,
   autoFocus = false,
   className = '',
-  paddingClassName = 'px-3 py-1.5',
+  paddingClassName = 'px-3.5 py-2',
   ariaLabel = 'Quick add task',
 }) => {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -48,7 +48,7 @@ export const NlpTaskInput: React.FC<NlpTaskInputProps> = ({
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         aria-label={ariaLabel}
-        className={`w-full text-xs leading-4 ${paddingClassName} text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none ${className}`}
+        className={`w-full text-[14.5px] leading-5 ${paddingClassName} text-stone-900 dark:text-stone-100 placeholder:text-stone-400 focus:outline-none ${className}`}
       />
     );
   }
@@ -59,7 +59,7 @@ export const NlpTaskInput: React.FC<NlpTaskInputProps> = ({
       <div
         ref={backdropRef}
         aria-hidden="true"
-        className={`pointer-events-none absolute inset-0 block whitespace-pre overflow-hidden text-xs leading-4 font-normal tracking-normal ${paddingClassName}`}
+        className={`pointer-events-none absolute inset-0 block whitespace-pre overflow-hidden text-[14.5px] leading-5 font-normal tracking-normal ${paddingClassName}`}
       >
         {value ? (
           segments.map((seg, idx) =>
@@ -94,7 +94,7 @@ export const NlpTaskInput: React.FC<NlpTaskInputProps> = ({
         onKeyUp={syncScroll}
         aria-label={ariaLabel}
         spellCheck={false}
-        className={`relative block w-full bg-transparent text-xs leading-4 font-normal tracking-normal ${paddingClassName} text-transparent caret-stone-900 dark:caret-stone-100 selection:bg-[var(--tf-accent-soft)] focus:outline-none`}
+        className={`relative block w-full bg-transparent text-[14.5px] leading-5 font-normal tracking-normal ${paddingClassName} text-transparent caret-stone-900 dark:caret-stone-100 selection:bg-[var(--tf-accent-soft)] focus:outline-none`}
       />
     </div>
   );

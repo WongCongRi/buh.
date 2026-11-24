@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { TODAY_DATE_KEY } from '../../data/initialData';
 import { useOnlineStatus } from '../../hooks/useOnlineStatus';
+import { useBackLayer } from '../../hooks/useAndroidBackNavigation';
 import { CalendarEvent, FoldPosture, NoteItem, TaskItem } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
 
@@ -46,6 +47,10 @@ export interface QuickCheckEntry {
   webSearchQueries: string[];
   timestamp: string;
   usedAgenda: boolean;
+  savedTask?: boolean;
+  savedTaskId?: string;
+  savedNote?: boolean;
+  savedNoteId?: string;
 }
 
 interface QuickCheckScreenProps {
@@ -57,9 +62,12 @@ interface QuickCheckScreenProps {
   notes: NoteItem[];
   entries: QuickCheckEntry[];
   onAddEntry: (entry: QuickCheckEntry) => void;
+  onDeleteEntry: (entryId: string) => void;
   onClearEntries: () => void;
-  onSaveAsTask: (title: string, notes: string) => void;
-  onSaveAsNote: (title: string, body: string) => void;
+  onSaveAsTask: (entryId: string, title: string, notes: string) => void;
+  onRemoveSavedTask: (entryId: string, taskId: string) => void;
+  onSaveAsNote: (entryId: string, title: string, body: string) => void;
+  onRemoveSavedNote: (entryId: string, noteId: string) => void;
 }
 
 interface SuggestedCheck {
@@ -308,19 +316,25 @@ function renderStructuredAnswer(answer: string): React.ReactNode {
     .filter(Boolean);
 
   return (
-    <div className="space-y-1.5 text-[12px] leading-relaxed text-stone-700 dark:text-stone-200">
+    <div className="space-y-2 text-[14.5px] leading-relaxed text-stone-700 dark:text-stone-200 min-w-0 max-w-full break-words [overflow-wrap:anywhere]">
       {lines.map((line, idx) => {
         const isBullet = /^[-*•]\s+/.test(line);
         if (isBullet) {
           const clean = line.replace(/^[-*•]\s+/, '');
           return (
-            <div key={idx} className="flex items-start gap-2 pl-0.5">
-              <span className="mt-1.5 w-1 h-1 rounded-full bg-[var(--tf-accent)] shrink-0" />
-              <span>{renderInlineFormatting(clean)}</span>
+            <div key={idx} className="flex items-start gap-2.5 pl-0.5 min-w-0">
+              <span className="mt-2.5 w-1.5 h-1.5 rounded-full bg-[var(--tf-accent)] shrink-0" />
+              <span className="flex-1 min-w-0 break-words [overflow-wrap:anywhere]">
+                {renderInlineFormatting(clean)}
+              </span>
             </div>
           );
         }
-        return <p key={idx}>{renderInlineFormatting(line)}</p>;
+        return (
+          <p key={idx} className="min-w-0 break-words [overflow-wrap:anywhere]">
+            {renderInlineFormatting(line)}
+          </p>
+        );
       })}
     </div>
   );
@@ -335,9 +349,12 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   notes,
   entries,
   onAddEntry,
+  onDeleteEntry,
   onClearEntries,
   onSaveAsTask,
+  onRemoveSavedTask,
   onSaveAsNote,
+  onRemoveSavedNote,
 }) => {
   const isOnline = useOnlineStatus();
   const [promptInput, setPromptInput] = useState('');
@@ -350,6 +367,9 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   const [lightboxImage, setLightboxImage] = useState<QuickCheckMedia | null>(null);
   const [failedMediaIds, setFailedMediaIds] = useState<Record<string, boolean>>({});
   const feedEndRef = useRef<HTMLDivElement | null>(null);
+
+  useBackLayer(Boolean(lightboxImage), () => setLightboxImage(null), 25);
+  useBackLayer(Boolean(playingVideoKey), () => setPlayingVideoKey(null), 15);
 
   const activeEntry =
     entries.find((e) => e.id === selectedEntryId) || entries[entries.length - 1] || null;
@@ -367,6 +387,18 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     if (entries.length > 0 && feedEndRef.current) {
       feedEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
     }
+  }, [entries.length]);
+
+  useEffect(() => {
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (!vv) return;
+    const onResize = () => {
+      if (entries.length > 0 && feedEndRef.current) {
+        feedEndRef.current.scrollIntoView({ block: 'end' });
+      }
+    };
+    vv.addEventListener('resize', onResize);
+    return () => vv.removeEventListener('resize', onResize);
   }, [entries.length]);
 
   const buildAgendaContext = (): string => {
@@ -527,14 +559,14 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   const renderHeader = () => (
     <div className="flex items-center justify-between gap-2 shrink-0">
       <div className="flex items-center" aria-label="Lookup">
-        <HelpCircle className={`w-5 h-5 ${tokens.accentText}`} />
+        <HelpCircle className={`w-6 h-6 ${tokens.accentText}`} />
       </div>
-      <div className="flex items-center gap-1.5 shrink-0">
+      <div className="flex items-center gap-2 shrink-0">
         <button
           type="button"
           onClick={() => setIncludeAgenda((v) => !v)}
           title="Include today's tasks and calendar in checks"
-          className={`px-2 py-1 text-[10.5px] font-medium ${tokens.buttonRadius} border transition-colors ${
+          className={`px-2.5 py-1.5 text-[13px] font-medium ${tokens.buttonRadius} border transition-colors ${
             includeAgenda
               ? `${tokens.accentSoftBg} ${tokens.accentText} ${tokens.accentBorder}`
               : `${tokens.subtleBg} border-transparent text-stone-600 dark:text-stone-300`
@@ -554,9 +586,9 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
             }}
             aria-label="Clear quick checks"
             title="Clear history"
-            className={`p-1.5 ${tokens.subtleBg} text-stone-400 hover:text-rose-500 ${tokens.buttonRadius} transition-colors`}
+            className={`p-2 ${tokens.subtleBg} text-stone-400 hover:text-rose-500 ${tokens.buttonRadius} transition-colors`}
           >
-            <Trash2 className="w-3.5 h-3.5" />
+            <Trash2 className="w-4 h-4" />
           </button>
         )}
       </div>
@@ -569,12 +601,19 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         e.preventDefault();
         runQuickCheck(promptInput);
       }}
-      className={`flex items-center gap-1.5 pt-1.5 border-t ${tokens.divider} shrink-0`}
+      className={`flex items-center gap-2 pt-2 border-t ${tokens.divider} shrink-0 w-full min-w-0`}
     >
       <input
         type="text"
         value={promptInput}
         onChange={(e) => setPromptInput(e.target.value)}
+        onFocus={() => {
+          window.setTimeout(() => {
+            if (entries.length > 0 && feedEndRef.current) {
+              feedEndRef.current.scrollIntoView({ block: 'end' });
+            }
+          }, 180);
+        }}
         placeholder={
           isOnline
             ? 'Ask anything on the live web...'
@@ -582,35 +621,35 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         }
         disabled={isLoading}
         aria-label="Ask Lookup"
-        className={`flex-1 text-xs px-2.5 py-1.5 ${tokens.subtleBg} text-stone-900 dark:text-stone-100 placeholder:text-stone-400 ${tokens.buttonRadius} focus:outline-none disabled:opacity-60`}
+        className={`flex-1 min-w-0 text-[14.5px] px-3 py-2.5 ${tokens.subtleBg} text-stone-900 dark:text-stone-100 placeholder:text-stone-400 ${tokens.buttonRadius} focus:outline-none disabled:opacity-60`}
       />
       <button
         type="submit"
         disabled={isLoading || !promptInput.trim()}
         aria-label="Run lookup"
-        className={`inline-flex items-center justify-center px-2.5 py-1.5 text-xs font-medium ${tokens.accentBg} ${tokens.buttonRadius} disabled:opacity-45 shrink-0 transition-opacity`}
+        className={`inline-flex items-center justify-center px-3.5 py-2.5 text-[14px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} disabled:opacity-45 shrink-0 transition-opacity`}
       >
-        {isLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+        {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
       </button>
     </form>
   );
 
   const renderStarterChips = () => (
-    <div className="space-y-1.5">
-      <p className="text-[10.5px] font-medium text-stone-500 dark:text-stone-400">
+    <div className="space-y-2 min-w-0 max-w-full">
+      <p className="text-[12.5px] font-medium text-stone-500 dark:text-stone-400">
         Instant live checks
       </p>
-      <div className="grid grid-cols-1 gap-1">
+      <div className="grid grid-cols-1 gap-1.5 min-w-0">
         {relevantChecks.map((item) => (
           <button
             key={item.id}
             type="button"
             disabled={isLoading}
             onClick={() => runQuickCheck(item.prompt)}
-            className={`w-full text-left px-2.5 py-1.5 text-[11.5px] font-medium ${tokens.cardBg} ${tokens.cardRadius} text-stone-700 dark:text-stone-200 hover:border-[var(--tf-accent-border)] transition-colors flex items-center justify-between gap-2`}
+            className={`w-full max-w-full min-w-0 overflow-hidden text-left px-3 py-2.5 text-[14px] font-medium ${tokens.cardBg} ${tokens.cardRadius} text-stone-700 dark:text-stone-200 hover:border-[var(--tf-accent-border)] transition-colors flex items-center justify-between gap-2`}
           >
-            <span className="truncate">{item.prompt}</span>
-            <span className="text-[9.5px] font-mono-tabular text-stone-400 shrink-0">
+            <span className="flex-1 min-w-0 truncate">{item.prompt}</span>
+            <span className="text-[11.5px] font-mono-tabular text-stone-400 shrink-0">
               {item.badge}
             </span>
           </button>
@@ -633,7 +672,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     const shownVideos = videos.slice(0, scope === 'pane' ? 2 : 1);
 
     return (
-      <div className="space-y-2" onClick={(e) => e.stopPropagation()}>
+      <div className="space-y-2 min-w-0 max-w-full overflow-hidden" onClick={(e) => e.stopPropagation()}>
         {shownImages.length > 0 && (
           <div
             className={`grid gap-1.5 ${
@@ -664,8 +703,8 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
                     onError={() => markMediaFailed(failKey)}
                     className="w-full h-full object-cover group-hover:scale-[1.03] transition-transform duration-200"
                   />
-                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-1.5 py-1">
-                    <p className="text-[9.5px] font-medium text-white truncate leading-tight">
+                  <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/30 to-transparent px-2 py-1.5">
+                    <p className="text-[11.5px] font-medium text-white truncate leading-tight">
                       {img.title}
                     </p>
                   </div>
@@ -676,7 +715,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         )}
 
         {shownVideos.length > 0 && (
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             {shownVideos.map((vid) => {
               const playKey = `${scope}:${entry.id}:${vid.id}`;
               const isPlaying = playingVideoKey === playKey;
@@ -728,21 +767,21 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
                           />
                         ) : (
                           <div className="w-full h-full flex items-center justify-center bg-gradient-to-br from-stone-800 to-stone-950">
-                            <Film className="w-7 h-7 text-stone-500" />
+                            <Film className="w-8 h-8 text-stone-500" />
                           </div>
                         )}
                         <div className="absolute inset-0 bg-gradient-to-t from-black/75 via-black/20 to-transparent flex items-center justify-center">
                           <span
-                            className={`w-10 h-10 rounded-full ${tokens.accentBg} shadow-lg flex items-center justify-center group-hover:scale-105 transition-transform`}
+                            className={`w-12 h-12 rounded-full ${tokens.accentBg} shadow-lg flex items-center justify-center group-hover:scale-105 transition-transform`}
                           >
-                            <Play className="w-4 h-4 fill-current ml-0.5" />
+                            <Play className="w-5 h-5 fill-current ml-0.5" />
                           </span>
                         </div>
-                        <div className="absolute inset-x-0 bottom-0 px-2.5 py-1.5 flex items-center justify-between gap-2">
-                          <span className="text-[10.5px] font-medium text-white truncate">
+                        <div className="absolute inset-x-0 bottom-0 px-3 py-2 flex items-center justify-between gap-2">
+                          <span className="text-[12.5px] font-medium text-white truncate">
                             {vid.title}
                           </span>
-                          <span className="text-[9.5px] text-white/80 shrink-0">
+                          <span className="text-[11.5px] text-white/80 shrink-0">
                             {vid.sourceName || 'Video'}
                           </span>
                         </div>
@@ -750,16 +789,16 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
                     )}
                   </div>
 
-                  <div className={`px-2 py-1 flex items-center justify-between gap-2 ${tokens.subtleBg}`}>
-                    <span className="text-[10px] font-medium text-stone-700 dark:text-stone-200 truncate">
+                  <div className={`px-2.5 py-1.5 flex items-center justify-between gap-2 min-w-0 ${tokens.subtleBg}`}>
+                    <span className="flex-1 min-w-0 text-[12px] font-medium text-stone-700 dark:text-stone-200 truncate">
                       {vid.title}
                     </span>
-                    <div className="flex items-center gap-1 shrink-0">
+                    <div className="flex items-center gap-1.5 shrink-0">
                       {isPlaying && (
                         <button
                           type="button"
                           onClick={() => setPlayingVideoKey(null)}
-                          className="px-1.5 py-0.5 text-[9.5px] font-medium text-stone-500 hover:text-stone-900 dark:hover:text-stone-100 rounded"
+                          className="px-2 py-0.5 text-[11.5px] font-medium text-stone-500 hover:text-stone-900 dark:hover:text-stone-100 rounded"
                         >
                           Close
                         </button>
@@ -769,9 +808,9 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
                         target="_blank"
                         rel="noopener noreferrer"
                         aria-label={`Open ${vid.title} in new tab`}
-                        className="p-0.5 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors"
+                        className="p-1 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors"
                       >
-                        <ExternalLink className="w-3 h-3" />
+                        <ExternalLink className="w-3.5 h-3.5" />
                       </a>
                     </div>
                   </div>
@@ -790,15 +829,15 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       <div
         key={entry.id}
         onClick={() => setSelectedEntryId(entry.id)}
-        className={`${tokens.cardBg} ${tokens.cardRadius} p-3 space-y-2 transition-colors ${
+        className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 space-y-2.5 min-w-0 max-w-full overflow-hidden transition-colors ${
           posture === FoldPosture.Inner && isActive ? 'ring-1 ring-[var(--tf-accent-border)]' : ''
         }`}
       >
-        <div className="flex items-start justify-between gap-2">
-          <p className="text-xs font-semibold text-stone-900 dark:text-stone-100 leading-snug">
+        <div className="flex items-start justify-between gap-2 min-w-0">
+          <p className="flex-1 min-w-0 text-[15px] font-semibold text-stone-900 dark:text-stone-100 leading-snug break-words [overflow-wrap:anywhere]">
             {entry.prompt}
           </p>
-          <span className="text-[10px] font-mono-tabular text-stone-400 shrink-0">
+          <span className="text-[12px] font-mono-tabular text-stone-400 shrink-0">
             {entry.timestamp}
           </span>
         </div>
@@ -808,11 +847,11 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         {compactSources && renderMediaSection(entry, 'inline')}
 
         {compactSources && entry.sources.length > 0 && (
-          <div className={`pt-2 border-t ${tokens.divider} space-y-1`}>
-            <p className="text-[10px] font-medium text-stone-400 dark:text-stone-500">
+          <div className={`pt-2.5 border-t ${tokens.divider} space-y-1.5 min-w-0 max-w-full`}>
+            <p className="text-[12px] font-medium text-stone-400 dark:text-stone-500">
               Web sources ({entry.sources.length})
             </p>
-            <div className="space-y-1">
+            <div className="space-y-1.5 min-w-0 max-w-full">
               {entry.sources.slice(0, 3).map((src) => (
                 <a
                   key={src.uri}
@@ -820,42 +859,103 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
                   target="_blank"
                   rel="noopener noreferrer"
                   onClick={(e) => e.stopPropagation()}
-                  className={`flex items-center justify-between gap-2 px-2 py-1 text-[10.5px] ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-700 dark:text-stone-200 hover:text-[var(--tf-accent-text)] transition-colors`}
+                  className={`flex items-center justify-between gap-2 px-2.5 py-1.5 text-[12.5px] min-w-0 max-w-full overflow-hidden ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-700 dark:text-stone-200 hover:text-[var(--tf-accent-text)] transition-colors`}
                 >
-                  <span className="truncate">
+                  <span className="flex-1 min-w-0 truncate">
                     {src.title} · {formatDomain(src.uri)}
                   </span>
-                  <ExternalLink className="w-2.5 h-2.5 shrink-0 text-stone-400" />
+                  <ExternalLink className="w-3.5 h-3.5 shrink-0 text-stone-400" />
                 </a>
               ))}
             </div>
           </div>
         )}
 
-        <div className={`pt-1.5 border-t ${tokens.divider} flex items-center gap-1.5`}>
+        <div className={`pt-2 border-t ${tokens.divider} flex flex-wrap items-center gap-2`}>
+          {(() => {
+            const linkedTask = entry.savedTaskId
+              ? tasks.find((t) => t.id === entry.savedTaskId)
+              : entry.savedTask
+                ? tasks.find((t) => t.title === entry.prompt && t.notes === entry.answer)
+                : undefined;
+            const linkedNote = entry.savedNoteId
+              ? notes.find((n) => n.id === entry.savedNoteId)
+              : entry.savedNote
+                ? notes.find(
+                    (n) =>
+                      n.title === entry.prompt && n.blocks.some((b) => b.text === entry.answer)
+                  )
+                : undefined;
+            const isTaskSaved = Boolean(linkedTask);
+            const isNoteSaved = Boolean(linkedNote);
+
+            return (
+              <>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (linkedTask) {
+                      onRemoveSavedTask(entry.id, linkedTask.id);
+                    } else {
+                      onSaveAsTask(entry.id, entry.prompt, entry.answer);
+                    }
+                  }}
+                  title={isTaskSaved ? 'Tap again to remove task' : 'Add as task'}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12.5px] font-medium ${tokens.buttonRadius} transition-colors ${
+                    isTaskSaved
+                      ? `${tokens.accentBg} shadow-xs hover:opacity-90`
+                      : `${tokens.subtleBg} text-stone-700 dark:text-stone-200 hover:opacity-85`
+                  }`}
+                >
+                  {isTaskSaved ? (
+                    <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                  ) : (
+                    <CheckSquare className="w-3.5 h-3.5" />
+                  )}
+                  {isTaskSaved ? 'Added task' : 'Add task'}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (linkedNote) {
+                      onRemoveSavedNote(entry.id, linkedNote.id);
+                    } else {
+                      onSaveAsNote(entry.id, entry.prompt, entry.answer);
+                      triggerSavedBanner('Saved to Notes');
+                    }
+                  }}
+                  title={isNoteSaved ? 'Tap again to remove note' : 'Save as note'}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12.5px] font-medium ${tokens.buttonRadius} transition-colors ${
+                    isNoteSaved
+                      ? `${tokens.accentBg} shadow-xs hover:opacity-90`
+                      : `${tokens.subtleBg} text-stone-700 dark:text-stone-200 hover:opacity-85`
+                  }`}
+                >
+                  {isNoteSaved ? (
+                    <Check className="w-3.5 h-3.5 stroke-[2.5]" />
+                  ) : (
+                    <FileText className="w-3.5 h-3.5" />
+                  )}
+                  {isNoteSaved ? 'Saved note' : 'Save note'}
+                </button>
+              </>
+            );
+          })()}
           <button
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              onSaveAsTask(entry.prompt, entry.answer);
-              triggerSavedBanner('Added to Tasks');
+              if (selectedEntryId === entry.id) setSelectedEntryId(null);
+              if (playingVideoKey?.startsWith(`${entry.id}:`)) setPlayingVideoKey(null);
+              onDeleteEntry(entry.id);
             }}
-            className={`inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} hover:opacity-85`}
+            aria-label="Delete lookup chat"
+            title="Delete lookup chat"
+            className={`ml-auto p-1.5 text-stone-400 hover:text-rose-500 ${tokens.buttonRadius} transition-colors`}
           >
-            <CheckSquare className="w-3 h-3" />
-            Add task
-          </button>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              onSaveAsNote(entry.prompt, entry.answer);
-              triggerSavedBanner('Saved to Notes');
-            }}
-            className={`inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} hover:opacity-85`}
-          >
-            <FileText className="w-3 h-3" />
-            Save note
+            <Trash2 className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
@@ -870,15 +970,15 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     const activeVideoCount = activeMedia.filter((m) => m.type === 'video').length;
 
     return (
-      <div className="h-full overflow-y-auto device-scroll space-y-2.5 pl-0.5">
+      <div className="h-full min-w-0 max-w-full overflow-y-auto overflow-x-hidden device-scroll space-y-3 pl-0.5">
         {activeEntry && (activeImageCount > 0 || activeVideoCount > 0) && (
-          <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3 space-y-2`}>
+          <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 space-y-2.5 min-w-0 max-w-full overflow-hidden`}>
             <div className="flex items-center justify-between">
-              <span className="text-[11.5px] font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5">
-                <ImageIcon className="w-3.5 h-3.5 text-stone-400" />
+              <span className="text-[13.5px] font-semibold text-stone-800 dark:text-stone-200 flex items-center gap-1.5">
+                <ImageIcon className="w-4 h-4 text-stone-400" />
                 Images & videos
               </span>
-              <span className="text-[10.5px] font-mono-tabular text-stone-400">
+              <span className="text-[12px] font-mono-tabular text-stone-400">
                 {activeImageCount > 0 ? `${activeImageCount} img` : ''}
                 {activeImageCount > 0 && activeVideoCount > 0 ? ' · ' : ''}
                 {activeVideoCount > 0 ? `${activeVideoCount} vid` : ''}
@@ -888,50 +988,50 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
           </div>
         )}
 
-        <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3 space-y-2`}>
+        <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 space-y-2.5 min-w-0 max-w-full overflow-hidden`}>
           <div className="flex items-center justify-between">
-            <span className="text-[11.5px] font-semibold text-stone-800 dark:text-stone-200">
+            <span className="text-[13.5px] font-semibold text-stone-800 dark:text-stone-200">
               Live web sources
             </span>
-            <span className="text-[10.5px] font-mono-tabular text-stone-400">
+            <span className="text-[12px] font-mono-tabular text-stone-400">
               {activeEntry ? `${activeEntry.sources.length} cited` : 'Ready'}
             </span>
           </div>
 
           {!activeEntry ? (
-            <p className="text-[11.5px] text-stone-500 dark:text-stone-400 leading-relaxed">
+            <p className="text-[13.5px] text-stone-500 dark:text-stone-400 leading-relaxed">
               Run a lookup on the left to view embedded images, playable videos, and live web citations.
             </p>
           ) : activeEntry.sources.length === 0 ? (
-            <p className="text-[11.5px] text-stone-500 dark:text-stone-400">
+            <p className="text-[13.5px] text-stone-500 dark:text-stone-400">
               Answered directly without external citations.
             </p>
           ) : (
-            <div className="space-y-1.5">
+            <div className="space-y-2 min-w-0">
               {activeEntry.sources.map((src) => (
                 <a
                   key={src.uri}
                   href={src.uri}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className={`flex items-center justify-between gap-2 px-2.5 py-2 ${tokens.subtleBg} ${tokens.buttonRadius} hover:opacity-90 transition-opacity`}
+                  className={`flex items-center justify-between gap-2 px-3 py-2.5 min-w-0 max-w-full overflow-hidden ${tokens.subtleBg} ${tokens.buttonRadius} hover:opacity-90 transition-opacity`}
                 >
-                  <div className="min-w-0">
-                    <p className="text-[11.5px] font-medium text-stone-800 dark:text-stone-100 truncate">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-[13.5px] font-medium text-stone-800 dark:text-stone-100 truncate">
                       {src.title}
                     </p>
-                    <p className="text-[10px] text-stone-400 truncate">{formatDomain(src.uri)}</p>
+                    <p className="text-[12px] text-stone-400 truncate">{formatDomain(src.uri)}</p>
                   </div>
-                  <ExternalLink className={`w-3.5 h-3.5 shrink-0 ${tokens.accentText}`} />
+                  <ExternalLink className={`w-4 h-4 shrink-0 ${tokens.accentText}`} />
                 </a>
               ))}
             </div>
           )}
 
           {activeEntry && activeEntry.webSearchQueries.length > 0 && (
-            <div className={`pt-2 border-t ${tokens.divider} space-y-1`}>
-              <p className="text-[10px] font-medium text-stone-400">Search queries used</p>
-              <p className="text-[11px] text-stone-600 dark:text-stone-300 leading-snug">
+            <div className={`pt-2.5 border-t ${tokens.divider} space-y-1 min-w-0`}>
+              <p className="text-[12px] font-medium text-stone-400">Search queries used</p>
+              <p className="text-[13px] text-stone-600 dark:text-stone-300 leading-snug break-words [overflow-wrap:anywhere]">
                 {activeEntry.webSearchQueries.join(' · ')}
               </p>
             </div>
@@ -965,17 +1065,17 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
               type="button"
               onClick={() => setLightboxImage(null)}
               aria-label="Close image preview"
-              className="absolute top-2 right-2 p-1.5 rounded-full bg-black/60 text-white hover:bg-black/80 transition-colors"
+              className="absolute top-2.5 right-2.5 p-2 rounded-full bg-black/60 text-white hover:bg-black/80 transition-colors"
             >
-              <X className="w-3.5 h-3.5" />
+              <X className="w-4 h-4" />
             </button>
           </div>
-          <div className="px-3 py-2 flex items-center justify-between gap-2">
+          <div className="px-3.5 py-2.5 flex items-center justify-between gap-2">
             <div className="min-w-0">
-              <p className="text-xs font-semibold text-stone-900 dark:text-stone-100 truncate">
+              <p className="text-[14.5px] font-semibold text-stone-900 dark:text-stone-100 truncate">
                 {lightboxImage.title}
               </p>
-              <p className="text-[10px] text-stone-400 truncate">
+              <p className="text-[12px] text-stone-400 truncate">
                 {lightboxImage.sourceName || formatDomain(lightboxImage.sourceUrl || lightboxImage.url)}
               </p>
             </div>
@@ -983,10 +1083,10 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
               href={lightboxImage.sourceUrl || lightboxImage.url}
               target="_blank"
               rel="noopener noreferrer"
-              className={`inline-flex items-center gap-1 px-2 py-1 text-[10.5px] font-medium ${tokens.subtleBg} ${tokens.accentText} ${tokens.buttonRadius} shrink-0`}
+              className={`inline-flex items-center gap-1.5 px-2.5 py-1.5 text-[12.5px] font-medium ${tokens.subtleBg} ${tokens.accentText} ${tokens.buttonRadius} shrink-0`}
             >
               Open
-              <ExternalLink className="w-3 h-3" />
+              <ExternalLink className="w-3.5 h-3.5" />
             </a>
           </div>
         </div>
@@ -995,42 +1095,42 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   };
 
   const renderFeedBody = (compactSources: boolean) => (
-    <div className="flex-1 overflow-y-auto device-scroll space-y-2.5 pr-0.5">
+    <div className="flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden device-scroll space-y-3 pr-0.5">
       {savedFeedback && (
         <div
-          className={`flex items-center gap-1.5 px-2.5 py-1.5 text-[11px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius}`}
+          className={`flex items-center gap-2 px-3 py-2 text-[13px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius}`}
         >
-          <Check className="w-3 h-3 shrink-0" />
-          <span>{savedFeedback}</span>
+          <Check className="w-4 h-4 shrink-0" />
+          <span className="min-w-0 break-words">{savedFeedback}</span>
         </div>
       )}
 
       {!isOnline && (
         <div
-          className={`flex items-start gap-2 px-2.5 py-2 ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-600 dark:text-stone-300 text-[11px]`}
+          className={`flex items-start gap-2.5 px-3 py-2.5 ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-600 dark:text-stone-300 text-[13px] min-w-0`}
         >
-          <WifiOff className="w-3.5 h-3.5 text-amber-500 shrink-0 mt-0.5" />
-          <span className="leading-snug">
+          <WifiOff className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+          <span className="leading-snug min-w-0 break-words">
             Offline — live web search resumes when connected. You can search saved tasks, notes, and schedule below or review past lookups.
           </span>
         </div>
       )}
 
       {errorMsg && (
-        <div className="flex items-start gap-2 px-3 py-2.5 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-[11.5px]">
+        <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-[13.5px] min-w-0">
           <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <span className="leading-snug">{errorMsg}</span>
+          <span className="leading-snug min-w-0 break-words [overflow-wrap:anywhere]">{errorMsg}</span>
         </div>
       )}
 
       {entries.length === 0 && !isLoading ? (
-        <div className="pt-0.5">{renderStarterChips()}</div>
+        <div className="pt-0.5 min-w-0 max-w-full">{renderStarterChips()}</div>
       ) : (
-        <div className="space-y-2.5">
+        <div className="space-y-3 min-w-0 max-w-full">
           {entries.map((entry) => renderEntryCard(entry, compactSources))}
           {isLoading && (
-            <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3 flex items-center gap-2 text-xs text-stone-500 dark:text-stone-400`}>
-              <Loader2 className={`w-3.5 h-3.5 animate-spin ${tokens.accentText}`} />
+            <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 flex items-center gap-2.5 text-[14px] text-stone-500 dark:text-stone-400`}>
+              <Loader2 className={`w-4 h-4 animate-spin ${tokens.accentText}`} />
               <span>Checking live web results...</span>
             </div>
           )}
@@ -1042,8 +1142,8 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
 
   if (posture === FoldPosture.Inner) {
     return (
-      <div className={`relative h-full grid grid-cols-2 ${hingeAwareSplit ? 'gap-5' : 'gap-3'} px-3.5 py-2 overflow-hidden`}>
-        <div className="h-full flex flex-col gap-2 overflow-hidden">
+      <div className={`relative h-full min-h-0 w-full max-w-full min-w-0 grid grid-cols-2 ${hingeAwareSplit ? 'gap-5' : 'gap-3'} px-3.5 py-2 overflow-hidden`}>
+        <div className="h-full min-h-0 min-w-0 max-w-full flex flex-col gap-2 overflow-hidden">
           {renderHeader()}
           {renderFeedBody(false)}
           {renderComposer()}
@@ -1056,8 +1156,8 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
 
   if (posture === FoldPosture.Flex) {
     return (
-      <div className="relative h-full flex flex-col">
-        <div className="h-[52%] flex flex-col gap-1.5 px-3.5 py-2 overflow-hidden">
+      <div className="relative h-full min-h-0 w-full max-w-full min-w-0 flex flex-col overflow-hidden">
+        <div className="h-[52%] min-h-0 min-w-0 max-w-full flex flex-col gap-1.5 px-3.5 py-2 overflow-hidden">
           {renderHeader()}
           {renderFeedBody(true)}
         </div>
@@ -1066,15 +1166,15 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
             Flex hinge · Quick input
           </span>
         </div>
-        <div className="flex-1 flex flex-col justify-between px-3.5 py-2 gap-1.5 overflow-y-auto device-scroll">
-          <div className="flex flex-wrap gap-1">
+        <div className="flex-1 min-h-0 min-w-0 max-w-full flex flex-col justify-between px-3.5 py-2 gap-2 overflow-y-auto overflow-x-hidden device-scroll">
+          <div className="flex flex-wrap gap-1.5 min-w-0">
             {relevantChecks.slice(0, 3).map((item) => (
               <button
                 key={item.id}
                 type="button"
                 disabled={isLoading}
                 onClick={() => runQuickCheck(item.prompt)}
-                className={`px-2 py-0.5 text-[10.5px] font-medium ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} hover:opacity-85 max-w-full truncate`}
+                className={`px-2.5 py-1 text-[12.5px] font-medium ${tokens.subtleBg} text-stone-700 dark:text-stone-200 ${tokens.buttonRadius} hover:opacity-85 max-w-full truncate`}
               >
                 {item.prompt}
               </button>
@@ -1088,7 +1188,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   }
 
   return (
-    <div className="relative h-full flex flex-col px-3 pt-1.5 pb-2 gap-1.5 overflow-hidden">
+    <div className="relative h-full min-h-0 w-full max-w-full min-w-0 flex flex-col px-3.5 pt-2 pb-2.5 gap-2 overflow-hidden">
       {renderHeader()}
       {renderFeedBody(true)}
       {renderComposer()}

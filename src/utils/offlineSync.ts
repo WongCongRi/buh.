@@ -43,6 +43,7 @@ export type OfflineSyncOp =
       payload: {
         title: string;
         dateKey: string;
+        endDateKey?: string;
         startTime: string;
         endTime: string;
         calendarName: string;

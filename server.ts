@@ -5,7 +5,11 @@ import http from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import zlib from 'zlib';
+import * as webpushModule from 'web-push';
 import { GoogleGenAI } from '@google/genai';
+
+const webpush =
+  (webpushModule as unknown as { default?: typeof webpushModule }).default ?? webpushModule;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -849,6 +853,432 @@ async function startServer() {
     res.json({ ok: true });
   });
 
+  // Web Push (VAPID) support for PWA Service Worker push notifications
+  const envVapidPublic = process.env.VAPID_PUBLIC_KEY?.trim();
+  const envVapidPrivate = process.env.VAPID_PRIVATE_KEY?.trim();
+  const vapidSubject = process.env.VAPID_SUBJECT?.trim() || 'mailto:notifications@buh.app';
+  const runtimeVapidKeys =
+    envVapidPublic && envVapidPrivate
+      ? { publicKey: envVapidPublic, privateKey: envVapidPrivate, persistent: true }
+      : { ...webpush.generateVAPIDKeys(), persistent: false };
+
+  webpush.setVapidDetails(vapidSubject, runtimeVapidKeys.publicKey, runtimeVapidKeys.privateKey);
+
+  interface ValidatedPushSubscription {
+    endpoint: string;
+    expirationTime: number | null;
+    keys: {
+      p256dh: string;
+      auth: string;
+    };
+  }
+
+  const ALLOWED_PUSH_HOST_SUFFIXES = [
+    'fcm.googleapis.com',
+    'android.googleapis.com',
+    '.push.services.mozilla.com',
+    '.notify.windows.com',
+    'web.push.apple.com',
+    '.push.apple.com',
+    '.push.samsungosp.com',
+    '.push.samsung.com',
+  ];
+
+  const isAllowedPushEndpoint = (rawEndpoint: string): boolean => {
+    if (!rawEndpoint || rawEndpoint.length > 2048) return false;
+    try {
+      const parsed = new URL(rawEndpoint);
+      if (parsed.protocol !== 'https:') return false;
+      const host = parsed.hostname.toLowerCase();
+      if (
+        host === 'localhost' ||
+        host.endsWith('.local') ||
+        /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
+        host.includes(':')
+      ) {
+        return false;
+      }
+      return ALLOWED_PUSH_HOST_SUFFIXES.some((rule) =>
+        rule.startsWith('.') ? host.endsWith(rule) && host.length > rule.length : host === rule
+      );
+    } catch {
+      return false;
+    }
+  };
+
+  const validatePushSubscription = (raw: unknown): ValidatedPushSubscription | null => {
+    if (!raw || typeof raw !== 'object') return null;
+    const obj = raw as {
+      endpoint?: unknown;
+      expirationTime?: unknown;
+      keys?: { p256dh?: unknown; auth?: unknown };
+    };
+    const endpoint = typeof obj.endpoint === 'string' ? obj.endpoint.trim() : '';
+    const p256dh = typeof obj.keys?.p256dh === 'string' ? obj.keys.p256dh.trim() : '';
+    const auth = typeof obj.keys?.auth === 'string' ? obj.keys.auth.trim() : '';
+    if (!isAllowedPushEndpoint(endpoint)) return null;
+    const b64UrlRe = /^[A-Za-z0-9\-_+=]{8,256}$/;
+    if (!b64UrlRe.test(p256dh) || !b64UrlRe.test(auth)) return null;
+    const expirationTime =
+      typeof obj.expirationTime === 'number' && Number.isFinite(obj.expirationTime)
+        ? obj.expirationTime
+        : null;
+    return { endpoint, expirationTime, keys: { p256dh, auth } };
+  };
+
+  const MAX_PUSH_SUBSCRIPTIONS = 200;
+  const MAX_SCHEDULED_PER_SUBSCRIPTION = 100;
+  const pushSubscriptions = new Map<string, ValidatedPushSubscription>();
+
+  interface ScheduledPushReminder {
+    key: string;
+    taskId: string;
+    reminderId: string;
+    triggerAtMs: number;
+    title: string;
+    body: string;
+    category: string;
+    tag: string;
+    silent: boolean;
+  }
+
+  const scheduledPushReminders = new Map<string, ScheduledPushReminder[]>();
+  const deliveredPushKeys = new Map<string, number>();
+
+  const pruneDeliveredPushKeys = (now: number) => {
+    const cutoff = now - 6 * 60 * 60 * 1000;
+    for (const [k, ts] of deliveredPushKeys.entries()) {
+      if (ts < cutoff) deliveredPushKeys.delete(k);
+    }
+  };
+
+  let processingPushQueue = false;
+  const processDuePushReminders = async () => {
+    if (processingPushQueue) return;
+    processingPushQueue = true;
+    try {
+      const now = Date.now();
+      const CATCH_UP_MS = 30 * 60 * 1000;
+      pruneDeliveredPushKeys(now);
+
+      for (const [endpoint, reminders] of Array.from(scheduledPushReminders.entries())) {
+        const sub = pushSubscriptions.get(endpoint);
+        if (!sub) {
+          scheduledPushReminders.delete(endpoint);
+          continue;
+        }
+
+        const remaining: ScheduledPushReminder[] = [];
+        const due: ScheduledPushReminder[] = [];
+
+        for (const rem of reminders) {
+          if (rem.triggerAtMs <= now) {
+            if (now - rem.triggerAtMs <= CATCH_UP_MS) {
+              due.push(rem);
+            }
+          } else {
+            remaining.push(rem);
+          }
+        }
+
+        if (due.length === 0) {
+          if (remaining.length !== reminders.length) {
+            if (remaining.length > 0) scheduledPushReminders.set(endpoint, remaining);
+            else scheduledPushReminders.delete(endpoint);
+          }
+          continue;
+        }
+
+        if (remaining.length > 0) {
+          scheduledPushReminders.set(endpoint, remaining);
+        } else {
+          scheduledPushReminders.delete(endpoint);
+        }
+
+        for (const rem of due) {
+          const dedupeKey = `${endpoint}::${rem.key}`;
+          if (deliveredPushKeys.has(dedupeKey)) continue;
+          deliveredPushKeys.set(dedupeKey, now);
+
+          const payload = JSON.stringify({
+            title: rem.title,
+            body: rem.body,
+            icon: '/pwa-192x192.png',
+            badge: '/badge-96x96.png',
+            tag: rem.tag,
+            silent: rem.silent,
+            url: '/',
+            taskId: rem.taskId,
+            reminderId: rem.reminderId,
+            category: rem.category,
+            actions: [
+              { action: 'snooze', title: 'Snooze 10m' },
+              { action: 'clear', title: 'Clear' },
+            ],
+          });
+
+          try {
+            await webpush.sendNotification(sub, payload, {
+              TTL: 3600,
+              urgency: 'high',
+            });
+          } catch (err: unknown) {
+            const statusCode = (err as { statusCode?: number })?.statusCode;
+            if (statusCode === 404 || statusCode === 410) {
+              pushSubscriptions.delete(endpoint);
+              scheduledPushReminders.delete(endpoint);
+              break;
+            }
+          }
+        }
+      }
+    } finally {
+      processingPushQueue = false;
+    }
+  };
+
+  const pushSchedulerTimer = setInterval(() => {
+    void processDuePushReminders();
+  }, 10_000);
+  if (typeof pushSchedulerTimer.unref === 'function') {
+    pushSchedulerTimer.unref();
+  }
+
+  const upsertSubscription = (validated: ValidatedPushSubscription) => {
+    if (!pushSubscriptions.has(validated.endpoint) && pushSubscriptions.size >= MAX_PUSH_SUBSCRIPTIONS) {
+      const oldestKey = pushSubscriptions.keys().next().value;
+      if (oldestKey) {
+        pushSubscriptions.delete(oldestKey);
+        scheduledPushReminders.delete(oldestKey);
+      }
+    }
+    pushSubscriptions.set(validated.endpoint, validated);
+  };
+
+  app.get('/api/push/public-key', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      publicKey: runtimeVapidKeys.publicKey,
+      persistent: runtimeVapidKeys.persistent,
+    });
+  });
+
+  app.post('/api/push/subscribe', (req, res) => {
+    const body = (req.body ?? {}) as { subscription?: unknown };
+    const validated = validatePushSubscription(body.subscription ?? req.body);
+    if (!validated) {
+      res.status(400).json({ error: 'Invalid or unsupported push subscription endpoint.' });
+      return;
+    }
+    upsertSubscription(validated);
+    res.json({ ok: true });
+  });
+
+  app.post('/api/push/unsubscribe', (req, res) => {
+    const body = (req.body ?? {}) as { endpoint?: unknown };
+    const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+    if (endpoint) {
+      pushSubscriptions.delete(endpoint);
+      scheduledPushReminders.delete(endpoint);
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/push/schedule', (req, res) => {
+    const body = (req.body ?? {}) as {
+      subscription?: unknown;
+      reminders?: unknown;
+    };
+    const validated = validatePushSubscription(body.subscription);
+    if (!validated) {
+      res.status(400).json({ error: 'A valid active push subscription is required.' });
+      return;
+    }
+
+    upsertSubscription(validated);
+
+    const rawList = Array.isArray(body.reminders) ? body.reminders : [];
+    const now = Date.now();
+    const minTriggerMs = now - 5 * 60 * 1000;
+    const maxTriggerMs = now + 365 * 24 * 60 * 60 * 1000;
+    const sanitized: ScheduledPushReminder[] = [];
+    const seenKeys = new Set<string>();
+
+    for (const item of rawList) {
+      if (sanitized.length >= MAX_SCHEDULED_PER_SUBSCRIPTION) break;
+      if (!item || typeof item !== 'object') continue;
+      const r = item as Record<string, unknown>;
+      const taskId = typeof r.taskId === 'string' ? r.taskId.trim().slice(0, 100) : '';
+      const reminderId = typeof r.reminderId === 'string' ? r.reminderId.trim().slice(0, 100) : '';
+      const triggerAtMs = typeof r.triggerAtMs === 'number' && Number.isFinite(r.triggerAtMs) ? r.triggerAtMs : NaN;
+      if (!taskId || !reminderId || Number.isNaN(triggerAtMs)) continue;
+      if (triggerAtMs < minTriggerMs || triggerAtMs > maxTriggerMs) continue;
+
+      const key = `${taskId}:${reminderId}:${Math.round(triggerAtMs / 1000)}`;
+      if (seenKeys.has(key)) continue;
+      seenKeys.add(key);
+
+      const title =
+        typeof r.title === 'string' && r.title.trim()
+          ? r.title.trim().slice(0, 140)
+          : 'Task reminder';
+      const remBody =
+        typeof r.body === 'string' && r.body.trim()
+          ? r.body.trim().slice(0, 280)
+          : 'Scheduled task reminder';
+      const category = typeof r.category === 'string' ? r.category.trim().slice(0, 60) : '';
+      const tag =
+        typeof r.tag === 'string' && r.tag.trim()
+          ? r.tag.trim().slice(0, 140)
+          : `buh-reminder-${taskId}-${reminderId}`;
+
+      sanitized.push({
+        key,
+        taskId,
+        reminderId,
+        triggerAtMs,
+        title,
+        body: remBody,
+        category,
+        tag,
+        silent: Boolean(r.silent),
+      });
+    }
+
+    if (sanitized.length > 0) {
+      scheduledPushReminders.set(validated.endpoint, sanitized);
+      void processDuePushReminders();
+    } else {
+      scheduledPushReminders.delete(validated.endpoint);
+    }
+
+    res.json({
+      ok: true,
+      scheduledCount: sanitized.length,
+      persistentVapid: runtimeVapidKeys.persistent,
+    });
+  });
+
+  app.post('/api/push/snooze', (req, res) => {
+    const body = (req.body ?? {}) as {
+      subscription?: unknown;
+      taskId?: unknown;
+      reminderId?: unknown;
+      taskTitle?: unknown;
+      category?: unknown;
+      snoozeMinutes?: unknown;
+      silent?: unknown;
+    };
+    const validated = validatePushSubscription(body.subscription);
+    if (!validated) {
+      res.status(400).json({ error: 'A valid active push subscription is required.' });
+      return;
+    }
+
+    upsertSubscription(validated);
+
+    const rawMinutes = typeof body.snoozeMinutes === 'number' ? body.snoozeMinutes : 10;
+    const snoozeMinutes = Math.max(1, Math.min(1440, Math.round(rawMinutes)));
+    const taskId = typeof body.taskId === 'string' && body.taskId.trim() ? body.taskId.trim().slice(0, 100) : `snooze-${Date.now()}`;
+    const reminderId = `snooze-${Date.now()}`;
+    const triggerAtMs = Date.now() + snoozeMinutes * 60 * 1000;
+    const title =
+      typeof body.taskTitle === 'string' && body.taskTitle.trim()
+        ? body.taskTitle.trim().slice(0, 140)
+        : 'Snoozed reminder';
+    const category = typeof body.category === 'string' ? body.category.trim().slice(0, 60) : '';
+    const remBody = [`Snoozed ${snoozeMinutes}m`, category].filter(Boolean).join(' · ');
+
+    const existing = scheduledPushReminders.get(validated.endpoint) ?? [];
+    const next: ScheduledPushReminder[] = [
+      ...existing.slice(-(MAX_SCHEDULED_PER_SUBSCRIPTION - 1)),
+      {
+        key: `${taskId}:${reminderId}:${Math.round(triggerAtMs / 1000)}`,
+        taskId,
+        reminderId,
+        triggerAtMs,
+        title,
+        body: remBody,
+        category,
+        tag: `buh-reminder-${taskId}-${reminderId}`,
+        silent: Boolean(body.silent),
+      },
+    ];
+    scheduledPushReminders.set(validated.endpoint, next);
+    res.json({ ok: true, triggerAtMs });
+  });
+
+  app.post('/api/push/clear-schedule', (req, res) => {
+    const body = (req.body ?? {}) as { endpoint?: unknown };
+    const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+    if (endpoint) {
+      scheduledPushReminders.delete(endpoint);
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/push/send-test', async (req, res) => {
+    const body = (req.body ?? {}) as {
+      subscription?: unknown;
+      title?: unknown;
+      body?: unknown;
+      taskId?: unknown;
+      reminderId?: unknown;
+      silent?: unknown;
+    };
+    const validated = validatePushSubscription(body.subscription);
+    if (!validated) {
+      res.status(400).json({ error: 'A valid active push subscription is required.' });
+      return;
+    }
+
+    upsertSubscription(validated);
+
+    const title =
+      typeof body.title === 'string' && body.title.trim()
+        ? body.title.trim().slice(0, 140)
+        : 'buh. push notifications active';
+    const messageBody =
+      typeof body.body === 'string' && body.body.trim()
+        ? body.body.trim().slice(0, 280)
+        : 'Service worker push alerts are enabled with Snooze & Clear actions.';
+
+    const payload = JSON.stringify({
+      title,
+      body: messageBody,
+      icon: '/pwa-192x192.png',
+      badge: '/badge-96x96.png',
+      tag: 'buh-push-test',
+      silent: Boolean(body.silent),
+      url: '/',
+      taskId: typeof body.taskId === 'string' ? body.taskId.slice(0, 100) : undefined,
+      reminderId: typeof body.reminderId === 'string' ? body.reminderId.slice(0, 100) : undefined,
+      actions: [
+        { action: 'snooze', title: 'Snooze 10m' },
+        { action: 'clear', title: 'Clear' },
+      ],
+    });
+
+    try {
+      await webpush.sendNotification(validated, payload, {
+        TTL: 300,
+        urgency: 'high',
+      });
+      res.json({ ok: true, delivered: true });
+    } catch (err: unknown) {
+      const statusCode = (err as { statusCode?: number })?.statusCode;
+      if (statusCode === 404 || statusCode === 410) {
+        pushSubscriptions.delete(validated.endpoint);
+        scheduledPushReminders.delete(validated.endpoint);
+      }
+      res.status(502).json({
+        ok: false,
+        delivered: false,
+        error: 'Push service could not deliver the message right now.',
+      });
+    }
+  });
+
   app.post('/api/agent/check', async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -1210,7 +1640,7 @@ async function startServer() {
         if (!fs.existsSync(dirFull)) return;
         const items = fs.readdirSync(dirFull, { withFileTypes: true });
         for (const item of items) {
-          if (item.name.startsWith('.') || item.isSymbolicLink()) continue;
+          if ((item.name.startsWith('.') && item.name !== '.well-known') || item.isSymbolicLink()) continue;
           const nextFull = path.join(dirFull, item.name);
           const nextRel = `${relPrefix}/${item.name}`;
           if (item.isDirectory()) {
@@ -1233,6 +1663,45 @@ async function startServer() {
       console.error('Source export failed:', err);
       res.status(500).json({ error: 'Failed to export source archive.' });
     }
+  });
+
+  // Serve Android Trusted Web Activity Digital Asset Links before Vite/SPA fallback
+  // so PWABuilder / Google Play packages verify the domain and hide the address bar.
+  app.get('/.well-known/assetlinks.json', (_req, res) => {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+
+    const envPackage = process.env.TWA_PACKAGE_NAME?.trim();
+    const envFingerprints = process.env.TWA_SHA256_FINGERPRINTS?.split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (envPackage && envFingerprints && envFingerprints.length > 0) {
+      res.json([
+        {
+          relation: ['delegate_permission/common.handle_all_urls'],
+          target: {
+            namespace: 'android_app',
+            package_name: envPackage,
+            sha256_cert_fingerprints: envFingerprints,
+          },
+        },
+      ]);
+      return;
+    }
+
+    const candidates = [
+      path.join(__dirname, 'public', '.well-known', 'assetlinks.json'),
+      path.join(__dirname, 'dist', '.well-known', 'assetlinks.json'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(candidate)) {
+        res.sendFile(candidate);
+        return;
+      }
+    }
+
+    res.json([]);
   });
 
   if (isDev) {

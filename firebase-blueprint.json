@@ -1,0 +1,153 @@
+{
+  "entities": {
+    "UserAccount": {
+      "title": "UserAccount",
+      "description": "Private user workspace anchor document without PII used as the relational owner root for buh. cloud sync.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the user sync workspace was first initialized."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the user sync workspace was last updated."
+        }
+      },
+      "required": ["ownerId", "createdAt", "updatedAt"]
+    },
+    "NotePreferences": {
+      "title": "NotePreferences",
+      "description": "Per-user ordered note folders and persisted folder expand/collapse state for buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "folders": {
+          "type": "array",
+          "description": "Ordered list of user note folder names (1 to 50 items, each 1 to 100 chars)."
+        },
+        "collapsedFolders": {
+          "type": "array",
+          "description": "List of collapsed note folder names (0 to 50 items, each 1 to 100 chars)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when preferences were created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when preferences were last updated."
+        }
+      },
+      "required": ["ownerId", "folders", "collapsedFolders", "createdAt", "updatedAt"]
+    },
+    "CloudNote": {
+      "title": "CloudNote",
+      "description": "A user-owned note document synchronized across devices via buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier matching the Firestore document ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the note owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Note title text.",
+          "maxLength": 300
+        },
+        "folder": {
+          "type": "string",
+          "description": "Folder name this note belongs to.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "updatedAtLabel": {
+          "type": "string",
+          "description": "Human-readable relative edit status string.",
+          "maxLength": 60
+        },
+        "pinned": {
+          "type": "boolean",
+          "description": "Whether the note is pinned to Overview."
+        },
+        "markdownEnabled": {
+          "type": "boolean",
+          "description": "Whether live markdown formatting is enabled for this note."
+        },
+        "blocks": {
+          "type": "array",
+          "description": "Ordered list of structured note blocks (up to 250 maps with id, type, text, optional checked)."
+        },
+        "sortOrder": {
+          "type": "number",
+          "description": "Optional numeric sort key used to persist custom shifted note ordering across devices."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was created in cloud sync."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the note was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "folder",
+        "updatedAtLabel",
+        "pinned",
+        "markdownEnabled",
+        "blocks",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserAccount"
+      },
+      "description": "User workspace root document (PII-free) verifying account ownership for subcollections."
+    },
+    "/users/{userId}/preferences/{prefId}": {
+      "schema": {
+        "$ref": "#/entities/NotePreferences"
+      },
+      "description": "User note folder order and collapsed folder preferences (document ID 'notes')."
+    },
+    "/users/{userId}/notes/{noteId}": {
+      "schema": {
+        "$ref": "#/entities/CloudNote"
+      },
+      "description": "User-owned notes synced in real time across devices."
+    }
+  }
+}

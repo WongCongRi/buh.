@@ -1,21 +1,16 @@
-import { getApps, initializeApp } from 'firebase/app';
 import {
-  getAuth,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInWithPopup,
   User,
 } from 'firebase/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
+import { auth } from '../firebase';
 import { CalendarEvent } from '../types/taskflow';
 
 export const SCOPES = [
   'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
 ] as const;
-
-const app = getApps().length > 0 ? getApps()[0] : initializeApp(firebaseConfig);
-const auth = getAuth(app);
 
 const provider = new GoogleAuthProvider();
 for (const scope of SCOPES) {
@@ -120,6 +115,7 @@ function mapGoogleEventToLocal(item: GoogleApiEvent): CalendarEvent | null {
   if (!startRaw) return null;
 
   let dateKey = '';
+  let endDateKey: string | undefined;
   let startTime = '09:00';
   let endTime = '10:00';
   let durationMinutes = 60;
@@ -134,11 +130,24 @@ function mapGoogleEventToLocal(item: GoogleApiEvent): CalendarEvent | null {
       const endDt = new Date(item.end.dateTime);
       if (!Number.isNaN(endDt.getTime())) {
         endTime = toHHMM(endDt);
+        const mappedEndKey = toLocalDateKey(endDt);
+        if (mappedEndKey !== dateKey) {
+          endDateKey = mappedEndKey;
+        }
         durationMinutes = Math.max(15, Math.round((endDt.getTime() - startDt.getTime()) / 60_000));
       }
     }
   } else if (item.start?.date) {
     dateKey = item.start.date.slice(0, 10);
+    if (item.end?.date) {
+      // Google all-day end.date is exclusive; subtract 1 day for inclusive endDateKey
+      const [ey, em, ed] = item.end.date.slice(0, 10).split('-').map((n) => parseInt(n, 10));
+      const inclusiveEnd = new Date(ey, (em || 1) - 1, (ed || 1) - 1);
+      const mappedEndKey = toLocalDateKey(inclusiveEnd);
+      if (mappedEndKey > dateKey) {
+        endDateKey = mappedEndKey;
+      }
+    }
     startTime = 'Full';
     endTime = 'Full';
     durationMinutes = 60;
@@ -149,6 +158,7 @@ function mapGoogleEventToLocal(item: GoogleApiEvent): CalendarEvent | null {
     googleEventId: item.id,
     title: item.summary?.trim() || '(Untitled event)',
     dateKey,
+    endDateKey,
     startTime,
     endTime,
     durationMinutes,
@@ -205,6 +215,7 @@ export async function createGoogleCalendarEvent(
   eventInput: {
     title: string;
     dateKey: string;
+    endDateKey?: string;
     startTime: string;
     endTime: string;
     location?: string;
@@ -218,19 +229,22 @@ export async function createGoogleCalendarEvent(
   }
 
   const [y, m, d] = eventInput.dateKey.split('-').map((n) => parseInt(n, 10));
+  const [ey, em, ed] = (eventInput.endDateKey || eventInput.dateKey)
+    .split('-')
+    .map((n) => parseInt(n, 10));
   const [sh, sm] = eventInput.startTime.split(':').map((n) => parseInt(n, 10));
-  const [eh, em] = eventInput.endTime.split(':').map((n) => parseInt(n, 10));
+  const [eh, emin] = eventInput.endTime.split(':').map((n) => parseInt(n, 10));
 
   const startDt = new Date(y, (m || 1) - 1, d || 1, Number.isNaN(sh) ? 9 : sh, Number.isNaN(sm) ? 0 : sm);
   const endDt = new Date(
-    y,
-    (m || 1) - 1,
-    d || 1,
+    ey || y,
+    ((em || m) || 1) - 1,
+    ed || d || 1,
     Number.isNaN(eh) ? startDt.getHours() + 1 : eh,
-    Number.isNaN(em) ? startDt.getMinutes() : em
+    Number.isNaN(emin) ? startDt.getMinutes() : emin
   );
   if (endDt <= startDt) {
-    endDt.setHours(startDt.getHours() + 1);
+    endDt.setTime(startDt.getTime() + 60 * 60_000);
   }
 
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';

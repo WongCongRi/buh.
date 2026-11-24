@@ -14,7 +14,7 @@ export const INITIAL_DECISIONS: DesignDecisions = {
   visualStyle: VisualStyle.Minimal,
   navMode: NavMode.Five,
   quickCapture: QuickCaptureMode.Fab,
-  defaultHome: DefaultHome.Today,
+  defaultHome: DefaultHome.Dashboard,
   accentColor: '#7BB6E0',
 };
 
@@ -40,16 +40,20 @@ export const TODAY_DATE_KEY = getTodayDateKey();
 export const TOMORROW_DATE_KEY = getTomorrowDateKey();
 
 export const INITIAL_LISTS: string[] = ['Work', 'Projects', 'Personal'];
+export const INITIAL_NOTE_FOLDERS: string[] = ['Work', 'Projects', 'Personal'];
 
 export const INITIAL_SETTINGS: AppSettingsState = {
   hingeAwareSplit: true,
   oneHandedCoverReach: true,
   googleCalendarSync: true,
   googleTasksSync: true,
+  buhCloudSync: true,
   nlpQuickParse: true,
   morningDigestTime: '08:00 AM',
   taskRemindersEnabled: true,
   reminderSound: true,
+  completedTaskHistoryYears: 0,
+  completedTaskHistoryMonths: 0,
 };
 
 export const INITIAL_TASKS: TaskItem[] = [];

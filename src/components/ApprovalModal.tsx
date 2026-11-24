@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Check, Copy, X } from 'lucide-react';
 import { DefaultHome, DesignDecisions, NavMode, QuickCaptureMode, VisualStyle } from '../types/taskflow';
 import { normalizeHex } from '../utils/colorUtils';
+import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
 interface ApprovalModalProps {
   open: boolean;
@@ -19,6 +20,8 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   onConfirmApprove,
 }) => {
   const [copied, setCopied] = useState(false);
+
+  useBackLayer(open, onClose, 20);
 
   if (!open) return null;
 

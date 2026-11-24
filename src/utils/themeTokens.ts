@@ -17,6 +17,18 @@ export interface StyleThemeTokens {
   densityNote: string;
 }
 
+export function getDeviceSurfaceHex(style: VisualStyle, isDark: boolean): string {
+  switch (style) {
+    case VisualStyle.Samsung:
+      return isDark ? '#0D1014' : '#F4F6F9';
+    case VisualStyle.Professional:
+      return isDark ? '#0E1113' : '#F8F9FA';
+    case VisualStyle.Minimal:
+    default:
+      return isDark ? '#111312' : '#FAFAF8';
+  }
+}
+
 export function getDeviceStyleTokens(style: VisualStyle): StyleThemeTokens {
   const dynamicAccent = {
     accentText: 'text-[var(--tf-accent-text)]',
@@ -34,11 +46,11 @@ export function getDeviceStyleTokens(style: VisualStyle): StyleThemeTokens {
         subtleBg: 'bg-[#E9EEF5] dark:bg-[#222831]',
         cardRadius: 'rounded-[20px]',
         buttonRadius: 'rounded-xl',
-        rowPadding: 'px-2.5 py-1.5',
+        rowPadding: 'px-3.5 py-2.5',
         ...dynamicAccent,
         divider: 'border-slate-200/70 dark:border-slate-800/80',
-        headingScale: 'text-[16px] tracking-tight leading-tight',
-        densityNote: 'Squircle surfaces · Soft tonal elevation · Compact touch cushions',
+        headingScale: 'text-[20px] tracking-tight leading-tight',
+        densityNote: 'Squircle surfaces · Soft tonal elevation · TickTick touch cushions',
       };
 
     case VisualStyle.Professional:
@@ -49,11 +61,11 @@ export function getDeviceStyleTokens(style: VisualStyle): StyleThemeTokens {
         subtleBg: 'bg-zinc-100 dark:bg-zinc-800/70',
         cardRadius: 'rounded-lg',
         buttonRadius: 'rounded-md',
-        rowPadding: 'px-2.5 py-1',
+        rowPadding: 'px-3 py-2',
         ...dynamicAccent,
         divider: 'border-zinc-200 dark:border-zinc-800',
-        headingScale: 'text-[15px] tracking-tight leading-tight',
-        densityNote: 'Compact rows · Crisp 8px corners · High information density',
+        headingScale: 'text-[19px] tracking-tight leading-tight',
+        densityNote: 'Crisp rows · 8px corners · Comfortable reading density',
       };
 
     case VisualStyle.Minimal:
@@ -65,11 +77,11 @@ export function getDeviceStyleTokens(style: VisualStyle): StyleThemeTokens {
         subtleBg: 'bg-stone-100/80 dark:bg-stone-800/60',
         cardRadius: 'rounded-2xl',
         buttonRadius: 'rounded-xl',
-        rowPadding: 'px-2.5 py-1.5',
+        rowPadding: 'px-3.5 py-2.5',
         ...dynamicAccent,
         divider: 'border-stone-200/75 dark:border-stone-800/80',
-        headingScale: 'text-[16px] tracking-[-0.02em] leading-tight',
-        densityNote: 'Compact whitespace · Quiet hairlines · Custom calm accent',
+        headingScale: 'text-[20px] tracking-[-0.02em] leading-tight',
+        densityNote: 'Balanced whitespace · Quiet hairlines · TickTick-grade legibility',
       };
   }
 }

@@ -3,14 +3,100 @@ import react from '@vitejs/plugin-react';
 import fs from 'fs';
 import path from 'path';
 import {defineConfig} from 'vite';
-import {VitePWA} from 'vite-plugin-pwa';
+import {VitePWA, type ManifestOptions} from 'vite-plugin-pwa';
+
+type ExtendedManifestOptions = Partial<ManifestOptions> & {
+  note_taking?: {
+    new_note_url: string;
+  };
+};
 
 export default defineConfig(() => {
+  const pwaManifest: ExtendedManifestOptions = {
+    id: '/',
+    name: 'buh.',
+    short_name: 'buh.',
+    description:
+      'Calm, adaptive daily planner, tasks, notes, and live web lookup designed for Samsung Galaxy Z Fold.',
+    theme_color: '#FAFAF8',
+    background_color: '#FAFAF8',
+    display: 'standalone',
+    display_override: ['standalone'],
+    orientation: 'any',
+    start_url: '/',
+    scope: '/',
+    prefer_related_applications: false,
+    launch_handler: {
+      client_mode: ['focus-existing', 'auto'],
+    },
+    categories: ['productivity', 'utilities'],
+    note_taking: {
+      new_note_url: '/?shortcut=new-note',
+    },
+    shortcuts: [
+      {
+        name: 'New Task',
+        short_name: 'New Task',
+        description: 'Quickly create a new task in buh.',
+        url: '/?shortcut=new-task',
+        icons: [
+          {
+            src: '/shortcut-task-192.png',
+            sizes: '192x192',
+            type: 'image/png',
+          },
+        ],
+      },
+      {
+        name: 'New Note',
+        short_name: 'New Note',
+        description: 'Start writing a new blank note in buh.',
+        url: '/?shortcut=new-note',
+        icons: [
+          {
+            src: '/shortcut-note-192.png',
+            sizes: '192x192',
+            type: 'image/png',
+          },
+        ],
+      },
+    ],
+    icons: [
+      {
+        src: '/pwa-192x192.png',
+        sizes: '192x192',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/pwa-512x512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/pwa-maskable-512x512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'maskable',
+      },
+      {
+        src: '/badge-96x96.png',
+        sizes: '96x96',
+        type: 'image/png',
+        purpose: 'monochrome',
+      },
+    ],
+  };
+
   return {
     plugins: [
       react(),
       tailwindcss(),
       VitePWA({
+        strategies: 'injectManifest',
+        srcDir: 'src',
+        filename: 'sw.ts',
         registerType: 'autoUpdate',
         includeAssets: [
           'favicon.ico',
@@ -19,99 +105,15 @@ export default defineConfig(() => {
           'pwa-192x192.png',
           'pwa-512x512.png',
           'pwa-maskable-512x512.png',
+          'badge-96x96.png',
+          'shortcut-task-192.png',
+          'shortcut-note-192.png',
+          '.well-known/assetlinks.json',
         ],
-        manifest: {
-          id: '/',
-          name: 'buh.',
-          short_name: 'buh.',
-          description:
-            'Calm, adaptive daily planner, tasks, notes, and live web lookup designed for Samsung Galaxy Z Fold.',
-          theme_color: '#7BB6E0',
-          background_color: '#F8F9F7',
-          display: 'standalone',
-          display_override: ['standalone', 'minimal-ui'],
-          orientation: 'any',
-          start_url: '/',
-          scope: '/',
-          categories: ['productivity', 'utilities'],
-          icons: [
-            {
-              src: '/pwa-192x192.png',
-              sizes: '192x192',
-              type: 'image/png',
-              purpose: 'any',
-            },
-            {
-              src: '/pwa-512x512.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'any',
-            },
-            {
-              src: '/pwa-maskable-512x512.png',
-              sizes: '512x512',
-              type: 'image/png',
-              purpose: 'maskable',
-            },
-          ],
-        },
-        workbox: {
-          cleanupOutdatedCaches: true,
-          clientsClaim: true,
-          skipWaiting: true,
-          navigateFallback: '/index.html',
+        manifest: pwaManifest as Partial<ManifestOptions>,
+        injectManifest: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2,json}'],
-          navigateFallbackDenylist: [/^\/api\//],
-          runtimeCaching: [
-            {
-              urlPattern: /\/api\/.*/i,
-              handler: 'NetworkOnly',
-            },
-            {
-              urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
-              handler: 'CacheFirst',
-              options: {
-                cacheName: 'google-fonts-cache',
-                expiration: {
-                  maxEntries: 10,
-                  maxAgeSeconds: 60 * 60 * 24 * 365,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
-            {
-              urlPattern: /^https:\/\/fonts\.gstatic\.com\/.*/i,
-              handler: 'CacheFirst',
-              options: {
-                cacheName: 'gstatic-fonts-cache',
-                expiration: {
-                  maxEntries: 10,
-                  maxAgeSeconds: 60 * 60 * 24 * 365,
-                },
-                cacheableResponse: {
-                  statuses: [0, 200],
-                },
-              },
-            },
-            {
-              urlPattern: ({ request, sameOrigin }) =>
-                sameOrigin &&
-                (request.destination === 'image' ||
-                  request.destination === 'font' ||
-                  request.destination === 'style' ||
-                  request.destination === 'script'),
-              handler: 'StaleWhileRevalidate',
-              options: {
-                cacheName: 'buh-static-assets',
-                expiration: {
-                  maxEntries: 80,
-                  maxAgeSeconds: 60 * 60 * 24 * 30,
-                },
-              },
-            },
-          ],
+          maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,
         },
         devOptions: {
           enabled: true,

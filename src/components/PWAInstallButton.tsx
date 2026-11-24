@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { Download, Share, X } from 'lucide-react';
 import { usePWAInstall } from '../hooks/usePWAInstall';
+import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
 interface PWAInstallButtonProps {
   compact?: boolean;
@@ -13,6 +14,8 @@ export const PWAInstallButton: React.FC<PWAInstallButtonProps> = ({
 }) => {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const [showIOSGuide, setShowIOSGuide] = useState(false);
+
+  useBackLayer(showIOSGuide, () => setShowIOSGuide(false), 20);
 
   if (isInstalled) {
     return null;

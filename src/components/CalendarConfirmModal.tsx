@@ -1,12 +1,14 @@
 import React from 'react';
 import { Calendar, Loader2, Trash2, X } from 'lucide-react';
 import { StyleThemeTokens } from '../utils/themeTokens';
+import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
 export type PendingCalendarMutation =
   | {
       action: 'create';
       title: string;
       dateKey: string;
+      endDateKey?: string;
       startTime: string;
       endTime: string;
       calendarName: string;
@@ -37,6 +39,15 @@ export const CalendarConfirmModal: React.FC<CalendarConfirmModalProps> = ({
   onConfirm,
   onSaveLocalOnly,
 }) => {
+  useBackLayer(
+    Boolean(pending),
+    () => {
+      if (busy) return false;
+      onCancel();
+    },
+    30
+  );
+
   if (!pending) return null;
 
   const isDelete = pending.action === 'delete';
@@ -79,8 +90,11 @@ export const CalendarConfirmModal: React.FC<CalendarConfirmModalProps> = ({
             {pending.title}
           </p>
           <p className="text-[11px] font-mono-tabular text-stone-500 dark:text-stone-400">
-            {pending.dateKey} · {pending.startTime}
-            {!isDelete ? ` – ${pending.endTime}` : ''}
+            {isDelete
+              ? `${pending.dateKey} · ${pending.startTime}`
+              : pending.endDateKey && pending.endDateKey !== pending.dateKey
+                ? `${pending.dateKey} ${pending.startTime} – ${pending.endDateKey} ${pending.endTime}`
+                : `${pending.dateKey} · ${pending.startTime} – ${pending.endTime}`}
           </p>
         </div>
 

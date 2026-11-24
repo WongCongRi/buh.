@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from 'motion/react';
 import { TaskItem } from '../../types/taskflow';
 import { StyleThemeTokens } from '../../utils/themeTokens';
 import { TaskDetailPane } from './TaskDetailPane';
+import { useBackLayer } from '../../hooks/useAndroidBackNavigation';
 
 interface TaskDetailSheetProps {
   task: TaskItem | null;
@@ -39,6 +40,8 @@ export const TaskDetailSheet: React.FC<TaskDetailSheetProps> = ({
 }) => {
   const [dragY, setDragY] = useState(0);
   const [isDragging, setIsDragging] = useState(false);
+
+  useBackLayer(Boolean(task), onClose, 0);
 
   const bodyScrollRef = useRef<HTMLDivElement | null>(null);
   const dragStateRef = useRef<{

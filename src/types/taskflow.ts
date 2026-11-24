@@ -61,6 +61,7 @@ export interface TaskItem {
   category: TaskCategory;
   priority: TaskPriority;
   completed: boolean;
+  completedAt?: string;
   isInbox: boolean;
   notes: string;
   subtasks: SubTask[];
@@ -75,6 +76,7 @@ export interface CalendarEvent {
   id: string;
   title: string;
   dateKey: string;
+  endDateKey?: string;
   startTime: string;
   endTime: string;
   durationMinutes: number;
@@ -96,9 +98,11 @@ export interface NoteBlock {
 export interface NoteItem {
   id: string;
   title: string;
-  folder: 'Product' | 'Work' | 'Personal';
+  folder: string;
   updatedAt: string;
   pinned: boolean;
+  markdownEnabled?: boolean;
+  sortOrder?: number;
   blocks: NoteBlock[];
 }
 
@@ -115,10 +119,24 @@ export interface AppSettingsState {
   oneHandedCoverReach: boolean;
   googleCalendarSync: boolean;
   googleTasksSync: boolean;
+  buhCloudSync?: boolean;
   nlpQuickParse: boolean;
   morningDigestTime: string;
   taskRemindersEnabled: boolean;
   reminderSound: boolean;
+  completedTaskHistoryYears?: number;
+  completedTaskHistoryMonths?: number;
+}
+
+export interface CloudNotesSyncState {
+  isSignedIn: boolean;
+  userEmail: string | null;
+  isSyncing: boolean;
+  lastSyncedAt: string | null;
+  syncedNotesCount: number;
+  syncedFoldersCount: number;
+  error: string | null;
+  onSyncNow: () => Promise<void>;
 }
 
 export interface GoogleCalendarSyncState {
@@ -137,6 +155,7 @@ export interface GoogleCalendarSyncState {
   onCreateGoogleEvent: (input: {
     title: string;
     dateKey: string;
+    endDateKey?: string;
     startTime: string;
     endTime: string;
     calendarName: string;
@@ -173,7 +192,7 @@ export interface GoogleTasksSyncState {
     taskListId?: string;
     category?: string;
     reminders?: TaskReminder[];
-  }) => Promise<void>;
+  }) => Promise<string | void>;
   onUpdateGoogleTask: (task: TaskItem) => Promise<void>;
   onToggleGoogleTask: (task: TaskItem) => Promise<void>;
   onDeleteGoogleTask: (task: TaskItem) => Promise<void>;

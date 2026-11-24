@@ -17,8 +17,54 @@
   html {
     font-family: var(--font-sans);
     scroll-behavior: smooth;
+    overscroll-behavior-y: none;
+    overscroll-behavior-x: none;
+    overflow-x: hidden;
+    max-width: 100%;
+    background-color: #FAFAF8;
+    color-scheme: light;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  html.dark {
+    background-color: #111312;
+    color-scheme: dark;
+  }
+
+  html.buh-standalone {
+    font-size: 17px;
+    height: 100%;
+    overflow: hidden;
+  }
+
+  html.buh-standalone body {
+    height: 100%;
+    overflow: hidden;
+  }
+
+  @media (min-width: 560px) {
+    html.buh-standalone {
+      font-size: 16.5px;
+    }
+  }
+
+  body {
+    overscroll-behavior-y: none;
+    overscroll-behavior-x: none;
+    overflow-x: hidden;
+    max-width: 100%;
+    background-color: #FAFAF8;
+  }
+
+  html.dark body {
+    background-color: #111312;
+  }
+
+  button,
+  a {
+    touch-action: manipulation;
   }
 
   h1, h2, h3, .font-display {

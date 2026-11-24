@@ -65,6 +65,7 @@ function mapSingleGoogleTask(
     category: list.title,
     priority: 'Normal',
     completed: item.status === 'completed',
+    completedAt: item.status === 'completed' ? item.completed || undefined : undefined,
     isInbox: !hasDue,
     notes: item.notes?.trim() || '',
     subtasks,

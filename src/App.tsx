@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Columns2,
   Download,
+  Keyboard,
   Loader2,
   Maximize2,
   Moon,
@@ -17,11 +18,13 @@ import { ActiveReminderAlert, FoldDeviceFrame } from './components/FoldDeviceFra
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { PWAInstallButton } from './components/PWAInstallButton';
 import { StudioHeader } from './components/StudioHeader';
+import { useAndroidBackController } from './hooks/useAndroidBackNavigation';
 import {
   DEMO_SEED_IDS,
   INITIAL_DECISIONS,
   INITIAL_EVENTS,
   INITIAL_LISTS,
+  INITIAL_NOTE_FOLDERS,
   INITIAL_NOTES,
   INITIAL_RECENT_COLORS,
   INITIAL_SETTINGS,
@@ -41,9 +44,23 @@ import {
   fetchGoogleTasks,
   updateGoogleTask,
 } from './services/googleTasks';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from './firebase';
+import {
+  deleteCloudNote,
+  ensureUserWorkspace,
+  fetchAllCloudNotesOnce,
+  formatFriendlyCloudSyncError,
+  isNoteNonEmpty,
+  saveCloudNotePreferences,
+  subscribeCloudNotePreferences,
+  subscribeCloudNotes,
+  upsertCloudNote,
+} from './services/cloudNotesSync';
 import {
   AppSettingsState,
   CalendarEvent,
+  CloudNotesSyncState,
   DefaultHome,
   DesignDecisions,
   FoldPosture,
@@ -59,6 +76,10 @@ import {
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { applyAccentCssVars, normalizeHex } from './utils/colorUtils';
 import {
+  getDeviceStyleTokens,
+  getDeviceSurfaceHex,
+} from './utils/themeTokens';
+import {
   clearOfflineGoogleCache,
   enqueueSyncOp,
   isNetworkOrOfflineError,
@@ -70,9 +91,13 @@ import {
 } from './utils/offlineSync';
 import {
   computeReminderTriggerMs,
+  consumePendingSwReminderActions,
+  createSnoozedReminder,
   dispatchSystemTaskNotification,
   formatReminderLabel,
+  getNotificationPermissionState,
   playSoftReminderChime,
+  syncScheduledRemindersToPushServer,
 } from './utils/taskReminders';
 
 const STORAGE_KEY = 'buh_fold8_review_v2';
@@ -87,11 +112,49 @@ interface PersistedReviewState {
   isDark: boolean;
   tasks: TaskItem[];
   taskLists: string[];
+  noteFolders: string[];
+  collapsedNoteFolders: string[];
   events: CalendarEvent[];
   notes: NoteItem[];
   settings: AppSettingsState;
   reviewNote: string;
   approved: boolean;
+}
+
+type PwaShortcutAction = 'new-task' | 'new-note';
+
+interface LaunchParamsLike {
+  targetURL?: string;
+}
+
+interface LaunchQueueLike {
+  setConsumer: (consumer: (launchParams: LaunchParamsLike) => void) => void;
+}
+
+function parsePwaShortcutFromUrl(urlString: string): PwaShortcutAction | null {
+  try {
+    const parsed = new URL(urlString, window.location.origin);
+    const param = parsed.searchParams.get('shortcut')?.trim().toLowerCase();
+    if (param === 'new-task' || param === 'new-note') {
+      return param;
+    }
+  } catch {
+    // Ignore malformed URLs
+  }
+  return null;
+}
+
+function stripShortcutQueryParam(): void {
+  try {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has('shortcut')) return;
+    url.searchParams.delete('shortcut');
+    const cleanSearch = url.searchParams.toString();
+    const nextUrl = `${url.pathname}${cleanSearch ? `?${cleanSearch}` : ''}${url.hash}`;
+    window.history.replaceState(window.history.state, '', nextUrl);
+  } catch {
+    // Ignore history API issues
+  }
 }
 
 function recordRecentColorList(prev: string[], hex: string): string[] {
@@ -148,9 +211,49 @@ function loadInitialState(): PersistedReviewState {
       const migratedNotes = isLegacyMigration
         ? rawNotes.filter((n) => !DEMO_SEED_IDS.notes.has(n.id))
         : rawNotes;
+
+      const parsedNoteFolders = Array.isArray(parsed.noteFolders)
+        ? Array.from(
+            new Set(
+              parsed.noteFolders
+                .map((s) => (typeof s === 'string' ? s.trim() : ''))
+                .filter((s) => s.length > 0)
+            )
+          )
+        : Array.from(
+            new Set([
+              ...INITIAL_NOTE_FOLDERS,
+              ...migratedNotes
+                .map((n) => (typeof n.folder === 'string' ? n.folder.trim() : ''))
+                .filter((s) => s.length > 0),
+            ])
+          );
+      const noteFolders =
+        parsedNoteFolders.length > 0 ? parsedNoteFolders : INITIAL_NOTE_FOLDERS;
+
+      const collapsedNoteFolders = Array.isArray(parsed.collapsedNoteFolders)
+        ? Array.from(
+            new Set(
+              parsed.collapsedNoteFolders
+                .map((s) => (typeof s === 'string' ? s.trim() : ''))
+                .filter((s) => noteFolders.includes(s))
+            )
+          )
+        : [];
+
       const notes = migratedNotes
         .filter((n) => n.title.trim().length > 0 || n.blocks.some((b) => b.text.trim().length > 0))
-        .map((n) => (n.title.trim().length > 0 ? n : { ...n, title: 'Untitled Note' }));
+        .map((n) => {
+          const matchedFolder =
+            noteFolders.find((f) => f.toLowerCase() === (n.folder || '').toLowerCase()) ||
+            noteFolders[0] ||
+            'Work';
+          return {
+            ...n,
+            title: n.title.trim().length > 0 ? n.title : 'Untitled Note',
+            folder: matchedFolder,
+          };
+        });
 
       if (isLegacyMigration) {
         try {
@@ -167,12 +270,18 @@ function loadInitialState(): PersistedReviewState {
         decisions: {
           ...INITIAL_DECISIONS,
           ...(parsed.decisions ?? {}),
+          defaultHome:
+            parsed.decisions?.defaultHome === DefaultHome.Inbox
+              ? DefaultHome.Inbox
+              : DefaultHome.Dashboard,
           accentColor: accent,
         },
         recentColors,
         isDark: parsed.isDark ?? false,
         tasks,
         taskLists,
+        noteFolders,
+        collapsedNoteFolders,
         events,
         notes,
         settings: { ...INITIAL_SETTINGS, ...(parsed.settings ?? {}) },
@@ -191,6 +300,8 @@ function loadInitialState(): PersistedReviewState {
     isDark: false,
     tasks: INITIAL_TASKS,
     taskLists: INITIAL_LISTS,
+    noteFolders: INITIAL_NOTE_FOLDERS,
+    collapsedNoteFolders: [],
     events: INITIAL_EVENTS,
     notes: INITIAL_NOTES,
     settings: INITIAL_SETTINGS,
@@ -208,9 +319,14 @@ export default function App() {
   const [recentColors, setRecentColors] = useState<string[]>(initial.recentColors);
   const [isDark, setIsDark] = useState<boolean>(initial.isDark);
   const [showHingeGuide, setShowHingeGuide] = useState<boolean>(false);
+  const [simulatedKeyboardOpen, setSimulatedKeyboardOpen] = useState<boolean>(false);
 
   const [tasks, setTasks] = useState<TaskItem[]>(initial.tasks);
   const [taskLists, setTaskLists] = useState<string[]>(initial.taskLists);
+  const [noteFolders, setNoteFolders] = useState<string[]>(initial.noteFolders);
+  const [collapsedNoteFolders, setCollapsedNoteFolders] = useState<string[]>(
+    initial.collapsedNoteFolders
+  );
   const [events, setEvents] = useState<CalendarEvent[]>(initial.events);
   const [notes, setNotes] = useState<NoteItem[]>(initial.notes);
   const [settings, setSettings] = useState<AppSettingsState>(initial.settings);
@@ -220,6 +336,11 @@ export default function App() {
   const [approved, setApproved] = useState<boolean>(initial.approved);
   const [exportingSource, setExportingSource] = useState<boolean>(false);
   const [activeReminderAlerts, setActiveReminderAlerts] = useState<ActiveReminderAlert[]>([]);
+  const [externalOpenTask, setExternalOpenTask] = useState<{ taskId: string; nonce: number } | null>(null);
+  const [externalShortcut, setExternalShortcut] = useState<{
+    action: PwaShortcutAction;
+    nonce: number;
+  } | null>(null);
   const dispatchedReminderKeysRef = useRef<Set<string>>(new Set());
   const [isInstalledPwa, setIsInstalledPwa] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
@@ -232,33 +353,301 @@ export default function App() {
     if (typeof window === 'undefined') return false;
     return new URLSearchParams(window.location.search).get('mode') === 'app';
   });
-  const [viewportWidth, setViewportWidth] = useState<number>(() =>
-    typeof window !== 'undefined' ? window.innerWidth : 1280
-  );
+  const [viewportWidth, setViewportWidth] = useState<number>(() => {
+    if (typeof window === 'undefined') return 1280;
+    const docWidth = document.documentElement.clientWidth;
+    const winWidth = window.innerWidth;
+    const rawWidth = docWidth > 0 && winWidth > 0 ? Math.min(docWidth, winWidth) : docWidth || winWidth;
+    const isMobile =
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.matchMedia('(pointer: coarse)').matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+    const screenWidth = isMobile ? Math.round(window.screen?.width || 0) : 0;
+    const vv = window.visualViewport;
+    const vvScaledWidth =
+      isMobile && vv?.width && vv?.scale ? Math.round(vv.width * vv.scale) : 0;
+    const candidates = [rawWidth];
+    if (vvScaledWidth > 0) candidates.push(vvScaledWidth);
+    if (screenWidth > 0 && screenWidth < rawWidth) candidates.push(screenWidth);
+    return Math.round(Math.min(...candidates));
+  });
   const [isCoarseTouch, setIsCoarseTouch] = useState<boolean>(() =>
     typeof window !== 'undefined' ? window.matchMedia('(pointer: coarse)').matches : false
   );
+  const [isVirtualKeyboardOpen, setIsVirtualKeyboardOpen] = useState<boolean>(false);
+  const maxViewportHeightRef = useRef<Record<string, number>>({});
+  const lastSyncedWidthRef = useRef<number>(viewportWidth);
 
   useEffect(() => {
+    const INNER_POSTURE_BREAKPOINT = 560;
+    const BASE_VIEWPORT_CONTENT =
+      'width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content';
+    const RESET_VIEWPORT_CONTENT =
+      'width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content';
+
     const standaloneMedia = window.matchMedia('(display-mode: standalone)');
     const coarseMedia = window.matchMedia('(pointer: coarse)');
+    const innerPostureMedia = window.matchMedia(`(min-width: ${INNER_POSTURE_BREAKPOINT}px)`);
+    const vv = window.visualViewport;
+    const devicePosture = (
+      navigator as Navigator & { devicePosture?: EventTarget }
+    ).devicePosture;
+    const screenOrientation = window.screen?.orientation;
+    const settleTimers = new Set<number>();
+    let rafId: number | null = null;
+    let viewportResetRafId: number | null = null;
+    let lastViewportResetAt = 0;
+
+    const clearPendingSettles = () => {
+      if (rafId !== null) {
+        window.cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      settleTimers.forEach((id) => window.clearTimeout(id));
+      settleTimers.clear();
+    };
+
+    const isMobileContext = () =>
+      standaloneMedia.matches ||
+      coarseMedia.matches ||
+      (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+
+    const readRawLayoutWidth = () => {
+      const docWidth = document.documentElement.clientWidth;
+      const winWidth = window.innerWidth;
+      if (docWidth > 0 && winWidth > 0) {
+        return Math.round(Math.min(docWidth, winWidth));
+      }
+      return Math.round(docWidth || winWidth);
+    };
+
+    const resetMobileViewportScale = () => {
+      const now = Date.now();
+      if (now - lastViewportResetAt < 500) return;
+      const viewportMeta = document.querySelector('meta[name="viewport"]');
+      if (!viewportMeta) return;
+      lastViewportResetAt = now;
+      viewportMeta.setAttribute('content', RESET_VIEWPORT_CONTENT);
+      if (viewportResetRafId !== null) {
+        window.cancelAnimationFrame(viewportResetRafId);
+      }
+      viewportResetRafId = window.requestAnimationFrame(() => {
+        viewportResetRafId = null;
+        viewportMeta.setAttribute('content', BASE_VIEWPORT_CONTENT);
+      });
+    };
+
+    const readEffectiveWidth = () => {
+      const rawLayoutWidth = readRawLayoutWidth();
+      const mobile = isMobileContext();
+      if (!mobile) {
+        return { effectiveWidth: rawLayoutWidth, rawLayoutWidth, screenWidth: 0, vvScaledWidth: 0, vvScale: 1 };
+      }
+
+      const screenWidth = Math.round(window.screen?.width || 0);
+      const vvScale = vv?.scale || 1;
+      const vvScaledWidth = vv?.width ? Math.round(vv.width * vvScale) : 0;
+
+      // On Galaxy Z Fold, launching unfolded (Inner) then closing to Cover can leave
+      // Chrome's layout viewport (innerWidth/clientWidth) stuck at ~717px while
+      // screen.width and visualViewport.width * scale drop to the ~344-412px Cover width.
+      let effectiveWidth = rawLayoutWidth;
+      if (vvScaledWidth > 0 && vvScaledWidth < effectiveWidth) {
+        effectiveWidth = vvScaledWidth;
+      }
+      if (screenWidth > 0 && screenWidth < effectiveWidth) {
+        effectiveWidth = screenWidth;
+      }
+      // Reverse case: launched on Cover then unfolded to Inner while Chrome stayed zoomed in
+      if (vvScaledWidth >= INNER_POSTURE_BREAKPOINT && vvScale > 1.25 && rawLayoutWidth < INNER_POSTURE_BREAKPOINT) {
+        effectiveWidth = vvScaledWidth;
+      }
+
+      return { effectiveWidth, rawLayoutWidth, screenWidth, vvScaledWidth, vvScale };
+    };
+
     const syncViewport = () => {
-      setViewportWidth(window.innerWidth);
+      const { effectiveWidth, rawLayoutWidth, screenWidth, vvScaledWidth, vvScale } =
+        readEffectiveWidth();
+      const mobile = isMobileContext();
+      const activeEl = document.activeElement;
+      const inputFocused =
+        activeEl instanceof HTMLElement &&
+        (activeEl.tagName === 'INPUT' ||
+          activeEl.tagName === 'TEXTAREA' ||
+          activeEl.isContentEditable);
+
+      // If Chrome kept a stale layout viewport width across an Inner <-> Cover display switch,
+      // nudge <meta name="viewport"> so Chrome recalculates device-width and snaps scale to 1.0.
+      if (mobile && !inputFocused) {
+        const stuckInnerOnCover =
+          rawLayoutWidth >= INNER_POSTURE_BREAKPOINT &&
+          effectiveWidth < INNER_POSTURE_BREAKPOINT;
+        const stuckCoverOnInner =
+          rawLayoutWidth < INNER_POSTURE_BREAKPOINT &&
+          vvScale > 1.25 &&
+          vvScaledWidth >= INNER_POSTURE_BREAKPOINT;
+        const stuckZoomedOutOnCover =
+          screenWidth > 0 &&
+          screenWidth < INNER_POSTURE_BREAKPOINT &&
+          vvScale < 0.92 &&
+          rawLayoutWidth > screenWidth + 24;
+        if (stuckInnerOnCover || stuckCoverOnInner || stuckZoomedOutOnCover) {
+          resetMobileViewportScale();
+        }
+      }
+
+      const vvHeight = vv?.height ? Math.round(vv.height) : 0;
+      const winHeight = Math.round(window.innerHeight);
+      // Avoid stale visualViewport.height after an inner<->cover display switch while unfocused
+      const visibleHeight =
+        inputFocused && vvHeight > 0
+          ? vvHeight
+          : vvHeight > 0 && Math.abs(vvHeight - winHeight) <= 80
+            ? vvHeight
+            : winHeight;
+      const offsetTop = inputFocused ? Math.max(0, Math.round(vv?.offsetTop ?? 0)) : 0;
+
+      document.documentElement.style.setProperty('--buh-vh', `${visibleHeight}px`);
+      document.documentElement.style.setProperty('--buh-vv-top', `${offsetTop}px`);
+
+      const widthBucket = String(Math.round(effectiveWidth / 40));
+      const prevMax = maxViewportHeightRef.current[widthBucket] ?? 0;
+      if (visibleHeight > prevMax || (!inputFocused && visibleHeight >= winHeight - 24)) {
+        maxViewportHeightRef.current[widthBucket] = Math.max(visibleHeight, winHeight);
+      }
+      const baseline = maxViewportHeightRef.current[widthBucket] ?? visibleHeight;
+      const keyboardVisible = inputFocused && baseline - visibleHeight > 130;
+
+      lastSyncedWidthRef.current = effectiveWidth;
+      setIsVirtualKeyboardOpen(keyboardVisible);
+      setViewportWidth(effectiveWidth);
       setIsCoarseTouch(coarseMedia.matches);
       setIsInstalledPwa(
         standaloneMedia.matches ||
           (window.navigator as unknown as { standalone?: boolean }).standalone === true
       );
+
+      if (
+        document.documentElement.classList.contains('buh-standalone') &&
+        (window.scrollY !== 0 || offsetTop !== 0)
+      ) {
+        window.scrollTo(0, 0);
+      }
     };
+
+    const scheduleSync = (delays: number[] = [80]) => {
+      syncViewport();
+      clearPendingSettles();
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        syncViewport();
+      });
+      for (const delay of delays) {
+        const id = window.setTimeout(() => {
+          settleTimers.delete(id);
+          syncViewport();
+        }, delay);
+        settleTimers.add(id);
+      }
+    };
+
+    // Always process resize/orientation/posture events even if fired while screen is briefly hidden/locked.
+    const handleDisplayChange = () => {
+      scheduleSync([50, 180, 400, 800, 1400]);
+    };
+
+    // Folding/unfolding across a lock screen on Galaxy Z Fold can finish switching
+    // displays 100-1000ms after visibility/focus resumes, so re-check across settle windows.
+    const handleVisibilityResume = () => {
+      if (document.visibilityState === 'hidden') return;
+      scheduleSync([50, 180, 400, 800, 1400]);
+    };
+
+    const handleFocusToggle = () => scheduleSync([80, 200]);
+
+    const handlePointerDriftCheck = () => {
+      const { effectiveWidth } = readEffectiveWidth();
+      if (Math.abs(effectiveWidth - lastSyncedWidthRef.current) > 4) {
+        scheduleSync([60, 220, 500]);
+      }
+    };
+
+    const resizeObserver =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(() => {
+            syncViewport();
+          })
+        : null;
+    resizeObserver?.observe(document.documentElement);
+
     syncViewport();
-    window.addEventListener('resize', syncViewport);
+    window.addEventListener('resize', handleDisplayChange);
+    window.addEventListener('orientationchange', handleDisplayChange);
+    window.addEventListener('focus', handleDisplayChange);
+    window.addEventListener('pageshow', handleDisplayChange);
+    document.addEventListener('visibilitychange', handleVisibilityResume);
+    window.addEventListener('focusin', handleFocusToggle);
+    window.addEventListener('focusout', handleFocusToggle);
+    window.addEventListener('pointerdown', handlePointerDriftCheck, { passive: true });
+    window.addEventListener('touchstart', handlePointerDriftCheck, { passive: true });
+    vv?.addEventListener('resize', handleDisplayChange);
+    vv?.addEventListener('scroll', syncViewport);
+    screenOrientation?.addEventListener?.('change', handleDisplayChange);
+    devicePosture?.addEventListener?.('change', handleDisplayChange);
+    innerPostureMedia.addEventListener?.('change', handleDisplayChange);
     standaloneMedia.addEventListener?.('change', syncViewport);
     coarseMedia.addEventListener?.('change', syncViewport);
+
     return () => {
-      window.removeEventListener('resize', syncViewport);
+      clearPendingSettles();
+      if (viewportResetRafId !== null) {
+        window.cancelAnimationFrame(viewportResetRafId);
+      }
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', handleDisplayChange);
+      window.removeEventListener('orientationchange', handleDisplayChange);
+      window.removeEventListener('focus', handleDisplayChange);
+      window.removeEventListener('pageshow', handleDisplayChange);
+      document.removeEventListener('visibilitychange', handleVisibilityResume);
+      window.removeEventListener('focusin', handleFocusToggle);
+      window.removeEventListener('focusout', handleFocusToggle);
+      window.removeEventListener('pointerdown', handlePointerDriftCheck);
+      window.removeEventListener('touchstart', handlePointerDriftCheck);
+      vv?.removeEventListener('resize', handleDisplayChange);
+      vv?.removeEventListener('scroll', syncViewport);
+      screenOrientation?.removeEventListener?.('change', handleDisplayChange);
+      devicePosture?.removeEventListener?.('change', handleDisplayChange);
+      innerPostureMedia.removeEventListener?.('change', handleDisplayChange);
       standaloneMedia.removeEventListener?.('change', syncViewport);
       coarseMedia.removeEventListener?.('change', syncViewport);
     };
+  }, []);
+
+  // Handle PWA launcher shortcuts & OS note_taking triggers (cold URL launch + warm launchQueue)
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const triggerShortcut = (action: PwaShortcutAction) => {
+      setExternalShortcut({ action, nonce: Date.now() + Math.random() });
+    };
+
+    const initialAction = parsePwaShortcutFromUrl(window.location.href);
+    if (initialAction) {
+      triggerShortcut(initialAction);
+      stripShortcutQueryParam();
+    }
+
+    const launchQueue = (window as unknown as { launchQueue?: LaunchQueueLike }).launchQueue;
+    if (launchQueue && typeof launchQueue.setConsumer === 'function') {
+      launchQueue.setConsumer((launchParams) => {
+        if (!launchParams?.targetURL) return;
+        const warmAction = parsePwaShortcutFromUrl(launchParams.targetURL);
+        if (warmAction) {
+          triggerShortcut(warmAction);
+          stripShortcutQueryParam();
+        }
+      });
+    }
   }, []);
 
   const isOnline = useOnlineStatus();
@@ -560,6 +949,278 @@ export default function App() {
     return () => unsubscribe();
   }, [flushPendingSyncQueue, syncGoogleCalendarEvents, syncGoogleTasksList]);
 
+  // --- buh. Cloud Sync (Firestore real-time sync for notes, folders & collapse state) ---
+  const [firebaseUid, setFirebaseUid] = useState<string | null>(null);
+  const [firebaseEmail, setFirebaseEmail] = useState<string | null>(null);
+  const [firebaseEmailVerified, setFirebaseEmailVerified] = useState<boolean>(false);
+  const [cloudNotesSyncing, setCloudNotesSyncing] = useState<boolean>(false);
+  const [cloudNotesLastSyncedAt, setCloudNotesLastSyncedAt] = useState<string | null>(null);
+  const [cloudNotesSyncedCount, setCloudNotesSyncedCount] = useState<number>(0);
+  const [cloudNotesError, setCloudNotesError] = useState<string | null>(null);
+
+  const notesRef = useRef<NoteItem[]>(notes);
+  const noteFoldersRef = useRef<string[]>(noteFolders);
+  const collapsedNoteFoldersRef = useRef<string[]>(collapsedNoteFolders);
+  useEffect(() => {
+    notesRef.current = notes;
+  }, [notes]);
+  useEffect(() => {
+    noteFoldersRef.current = noteFolders;
+  }, [noteFolders]);
+  useEffect(() => {
+    collapsedNoteFoldersRef.current = collapsedNoteFolders;
+  }, [collapsedNoteFolders]);
+
+  const pendingNoteSaveTimersRef = useRef<Map<string, number>>(new Map());
+  const cloudSyncReadyRef = useRef<{ uid: string | null; enabled: boolean }>({
+    uid: null,
+    enabled: false,
+  });
+
+  useEffect(() => {
+    cloudSyncReadyRef.current = {
+      uid: firebaseUid && firebaseEmailVerified ? firebaseUid : null,
+      enabled: settings.buhCloudSync !== false,
+    };
+  }, [firebaseUid, firebaseEmailVerified, settings.buhCloudSync]);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (user) => {
+      if (user) {
+        setFirebaseUid(user.uid);
+        setFirebaseEmail(user.email || user.displayName || 'Google Account');
+        setFirebaseEmailVerified(Boolean(user.emailVerified));
+      } else {
+        setFirebaseUid(null);
+        setFirebaseEmail(null);
+        setFirebaseEmailVerified(false);
+        setCloudNotesSyncedCount(0);
+        setCloudNotesLastSyncedAt(null);
+        setCloudNotesError(null);
+      }
+    });
+    return () => unsubscribe();
+  }, []);
+
+  const markCloudNotesSyncedNow = useCallback(() => {
+    setCloudNotesLastSyncedAt(
+      new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    );
+  }, []);
+
+  const scheduleCloudNoteUpsert = useCallback(
+    (note: NoteItem, immediate = false) => {
+      const { uid, enabled } = cloudSyncReadyRef.current;
+      if (!uid || !enabled || !isNoteNonEmpty(note)) return;
+
+      const existingTimer = pendingNoteSaveTimersRef.current.get(note.id);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+        pendingNoteSaveTimersRef.current.delete(note.id);
+      }
+
+      const run = () => {
+        const latest = cloudSyncReadyRef.current;
+        if (!latest.uid || !latest.enabled) return;
+        void upsertCloudNote(latest.uid, note, noteFoldersRef.current[0] || 'Work')
+          .then(() => {
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          })
+          .finally(() => {
+            pendingNoteSaveTimersRef.current.delete(note.id);
+          });
+      };
+
+      if (immediate) {
+        run();
+      } else {
+        const timerId = window.setTimeout(run, 450);
+        pendingNoteSaveTimersRef.current.set(note.id, timerId);
+      }
+    },
+    [markCloudNotesSyncedNow]
+  );
+
+  const pushCloudNoteDelete = useCallback(
+    (noteId: string) => {
+      const existingTimer = pendingNoteSaveTimersRef.current.get(noteId);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+        pendingNoteSaveTimersRef.current.delete(noteId);
+      }
+      const { uid, enabled } = cloudSyncReadyRef.current;
+      if (!uid || !enabled) return;
+      void deleteCloudNote(uid, noteId)
+        .then(() => {
+          setCloudNotesError(null);
+          markCloudNotesSyncedNow();
+        })
+        .catch((err) => {
+          setCloudNotesError(formatFriendlyCloudSyncError(err));
+        });
+    },
+    [markCloudNotesSyncedNow]
+  );
+
+  const pushCloudNotePreferences = useCallback(
+    (nextFolders: string[], nextCollapsed: string[]) => {
+      const { uid, enabled } = cloudSyncReadyRef.current;
+      if (!uid || !enabled) return;
+      void saveCloudNotePreferences(uid, nextFolders, nextCollapsed)
+        .then(() => {
+          setCloudNotesError(null);
+          markCloudNotesSyncedNow();
+        })
+        .catch((err) => {
+          setCloudNotesError(formatFriendlyCloudSyncError(err));
+        });
+    },
+    [markCloudNotesSyncedNow]
+  );
+
+  // Real-time Firestore subscriptions for notes & note folder preferences
+  useEffect(() => {
+    if (!firebaseUid || !firebaseEmailVerified || settings.buhCloudSync === false) {
+      return;
+    }
+
+    let cancelled = false;
+    let unsubPrefs: (() => void) | null = null;
+    let unsubNotes: (() => void) | null = null;
+    let hydratedNotes = false;
+
+    setCloudNotesSyncing(true);
+    setCloudNotesError(null);
+
+    void (async () => {
+      try {
+        await ensureUserWorkspace(firebaseUid);
+        if (cancelled) return;
+
+        unsubPrefs = subscribeCloudNotePreferences(
+          firebaseUid,
+          (prefs) => {
+            if (cancelled) return;
+            if (!prefs) {
+              // Seed cloud with local folders and collapse state on first sync
+              void saveCloudNotePreferences(
+                firebaseUid,
+                noteFoldersRef.current,
+                collapsedNoteFoldersRef.current
+              ).catch((err) => {
+                if (!cancelled) setCloudNotesError(formatFriendlyCloudSyncError(err));
+              });
+              return;
+            }
+            setNoteFolders(prefs.folders);
+            setCollapsedNoteFolders(prefs.collapsedFolders);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
+
+        unsubNotes = subscribeCloudNotes(
+          firebaseUid,
+          (cloudNotes) => {
+            if (cancelled) return;
+            setCloudNotesSyncedCount(cloudNotes.length);
+            setCloudNotesSyncing(false);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+
+            const cloudIds = new Set(cloudNotes.map((n) => n.id));
+
+            if (!hydratedNotes) {
+              hydratedNotes = true;
+              const localOnlyToUpload = notesRef.current.filter(
+                (n) => !cloudIds.has(n.id) && isNoteNonEmpty(n)
+              );
+              if (localOnlyToUpload.length > 0) {
+                const fallbackFolder = noteFoldersRef.current[0] || 'Work';
+                void Promise.allSettled(
+                  localOnlyToUpload.map((n) => upsertCloudNote(firebaseUid, n, fallbackFolder))
+                );
+              }
+            }
+
+            setNotes((prev) => {
+              const pendingIds = pendingNoteSaveTimersRef.current;
+              const prevById = new Map(prev.map((n) => [n.id, n]));
+              const mergedCloud = cloudNotes.map((cn) =>
+                pendingIds.has(cn.id) && prevById.has(cn.id) ? prevById.get(cn.id)! : cn
+              );
+              // Keep any local unsaved drafts or pending local creations not yet acknowledged by cloud
+              const localExtra = prev.filter(
+                (ln) =>
+                  !cloudIds.has(ln.id) &&
+                  (pendingIds.has(ln.id) || !isNoteNonEmpty(ln))
+              );
+              return [...localExtra, ...mergedCloud];
+            });
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
+      } catch (err) {
+        if (!cancelled) {
+          setCloudNotesError(formatFriendlyCloudSyncError(err));
+          setCloudNotesSyncing(false);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      unsubPrefs?.();
+      unsubNotes?.();
+      pendingNoteSaveTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pendingNoteSaveTimersRef.current.clear();
+    };
+  }, [firebaseUid, firebaseEmailVerified, settings.buhCloudSync, markCloudNotesSyncedNow]);
+
+  const handleSyncCloudNotesNow = useCallback(async () => {
+    if (!firebaseUid || !firebaseEmailVerified) return;
+    if (settings.buhCloudSync === false) return;
+    setCloudNotesSyncing(true);
+    setCloudNotesError(null);
+    try {
+      await ensureUserWorkspace(firebaseUid);
+      await saveCloudNotePreferences(
+        firebaseUid,
+        noteFoldersRef.current,
+        collapsedNoteFoldersRef.current
+      );
+      const fallbackFolder = noteFoldersRef.current[0] || 'Work';
+      const localToPush = notesRef.current.filter(isNoteNonEmpty);
+      if (localToPush.length > 0) {
+        await Promise.all(
+          localToPush.map((n) => upsertCloudNote(firebaseUid, n, fallbackFolder))
+        );
+      }
+      const remoteNotes = await fetchAllCloudNotesOnce(firebaseUid);
+      setCloudNotesSyncedCount(remoteNotes.length);
+      markCloudNotesSyncedNow();
+    } catch (err) {
+      setCloudNotesError(formatFriendlyCloudSyncError(err));
+    } finally {
+      setCloudNotesSyncing(false);
+    }
+  }, [firebaseUid, firebaseEmailVerified, settings.buhCloudSync, markCloudNotesSyncedNow]);
+
   // Automatically flush queued offline changes & refresh when returning online
   useEffect(() => {
     if (!isOnline || !googleConnected) return;
@@ -646,11 +1307,25 @@ export default function App() {
     async (input: {
       title: string;
       dateKey: string;
+      endDateKey?: string;
       startTime: string;
       endTime: string;
       calendarName: string;
     }) => {
       setGoogleError(null);
+      const computeMins = () => {
+        const [sy, sm, sd] = input.dateKey.split('-').map((n) => parseInt(n, 10));
+        const [ey, em, ed] = (input.endDateKey || input.dateKey)
+          .split('-')
+          .map((n) => parseInt(n, 10));
+        const [sh, smin] = input.startTime.split(':').map((n) => parseInt(n, 10));
+        const [eh, emin] = input.endTime.split(':').map((n) => parseInt(n, 10));
+        const startDt = new Date(sy, (sm || 1) - 1, sd || 1, sh || 0, smin || 0);
+        const endDt = new Date(ey || sy, ((em || sm) || 1) - 1, ed || sd || 1, eh || 0, emin || 0);
+        const diff = Math.round((endDt.getTime() - startDt.getTime()) / 60_000);
+        return diff > 0 ? diff : 60;
+      };
+
       const queueOfflineEvent = () => {
         const tempId = `gcal-offline-${Date.now()}`;
         const optimistic: CalendarEvent = {
@@ -658,9 +1333,10 @@ export default function App() {
           googleEventId: `offline-${Date.now()}`,
           title: input.title,
           dateKey: input.dateKey,
+          endDateKey: input.endDateKey && input.endDateKey !== input.dateKey ? input.endDateKey : undefined,
           startTime: input.startTime,
           endTime: input.endTime,
-          durationMinutes: 60,
+          durationMinutes: computeMins(),
           calendarName: input.calendarName || 'Google Calendar',
           source: 'google',
         };
@@ -805,11 +1481,11 @@ export default function App() {
             createdAt: stamp,
           })
         );
+        return tempId;
       };
 
       if ((typeof navigator !== 'undefined' && !navigator.onLine) || !googleConnectedRef.current) {
-        queueOfflineTask();
-        return;
+        return queueOfflineTask();
       }
 
       try {
@@ -832,16 +1508,15 @@ export default function App() {
         setGoogleTasksLastSyncedAt(
           new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         );
+        return withReminders.id;
       } catch (err: unknown) {
         if (isNetworkOrOfflineError(err)) {
-          queueOfflineTask();
-          return;
+          return queueOfflineTask();
         }
         const msg = err instanceof Error ? err.message : 'Failed to create Google Task.';
         if (msg === 'NOT_AUTHENTICATED' || msg === 'AUTH_EXPIRED') {
           setGoogleConnected(false);
-          queueOfflineTask();
-          return;
+          return queueOfflineTask();
         }
         setGoogleTasksError(msg);
         throw err;
@@ -902,7 +1577,12 @@ export default function App() {
 
   const handleToggleGoogleTask = useCallback(async (task: TaskItem) => {
     setGoogleTasksError(null);
-    const toggled: TaskItem = { ...task, completed: !task.completed };
+    const nextCompleted = !task.completed;
+    const toggled: TaskItem = {
+      ...task,
+      completed: nextCompleted,
+      completedAt: nextCompleted ? new Date().toISOString() : undefined,
+    };
     const queueOfflineToggle = () => {
       setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? toggled : t)));
       setDirtyGoogleTaskIds((prev) => (prev.includes(task.id) ? prev : [...prev, task.id]));
@@ -1019,13 +1699,58 @@ export default function App() {
     });
   }, [events, googleEvents, settings.googleCalendarSync]);
 
-  // Show cached Google Tasks even while offline or awaiting reconnect
-  const visibleTasks = useMemo(() => {
-    if (settings.googleTasksSync && googleTasks.length > 0) {
-      return [...tasks, ...googleTasks];
+  // Show cached Google Tasks even while offline or awaiting reconnect,
+  // and filter older completed tasks by the configured years/months history window.
+  const { visibleTasks, hiddenCompletedTasksCount } = useMemo(() => {
+    const merged =
+      settings.googleTasksSync && googleTasks.length > 0 ? [...tasks, ...googleTasks] : tasks;
+
+    const years = Math.max(0, Math.floor(settings.completedTaskHistoryYears ?? 0));
+    const months = Math.max(0, Math.floor(settings.completedTaskHistoryMonths ?? 0));
+    if (years === 0 && months === 0) {
+      return { visibleTasks: merged, hiddenCompletedTasksCount: 0 };
     }
-    return tasks;
-  }, [tasks, googleTasks, settings.googleTasksSync]);
+
+    const now = new Date();
+    const cutoffMs = new Date(
+      now.getFullYear() - years,
+      now.getMonth() - months,
+      now.getDate(),
+      0,
+      0,
+      0,
+      0
+    ).getTime();
+
+    let hiddenCount = 0;
+    const filtered = merged.filter((t) => {
+      if (!t.completed) return true;
+      let taskTimeMs: number | null = null;
+      if (t.completedAt) {
+        const parsed = Date.parse(t.completedAt);
+        if (!Number.isNaN(parsed)) taskTimeMs = parsed;
+      }
+      if (taskTimeMs === null && t.dateKey) {
+        const m = t.dateKey.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+        if (m) {
+          taskTimeMs = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), 23, 59, 59).getTime();
+        }
+      }
+      if (taskTimeMs !== null && taskTimeMs < cutoffMs) {
+        hiddenCount += 1;
+        return false;
+      }
+      return true;
+    });
+
+    return { visibleTasks: filtered, hiddenCompletedTasksCount: hiddenCount };
+  }, [
+    tasks,
+    googleTasks,
+    settings.googleTasksSync,
+    settings.completedTaskHistoryYears,
+    settings.completedTaskHistoryMonths,
+  ]);
 
   const googleCalendarState: GoogleCalendarSyncState = useMemo(
     () => ({
@@ -1107,11 +1832,38 @@ export default function App() {
     ]
   );
 
+  const cloudNotesSyncState: CloudNotesSyncState = useMemo(
+    () => ({
+      isSignedIn: Boolean(firebaseUid && firebaseEmailVerified),
+      userEmail: firebaseEmail || googleUserEmail,
+      isSyncing: cloudNotesSyncing,
+      lastSyncedAt: cloudNotesLastSyncedAt,
+      syncedNotesCount: cloudNotesSyncedCount,
+      syncedFoldersCount: noteFolders.length,
+      error: cloudNotesError,
+      onSyncNow: handleSyncCloudNotesNow,
+    }),
+    [
+      firebaseUid,
+      firebaseEmailVerified,
+      firebaseEmail,
+      googleUserEmail,
+      cloudNotesSyncing,
+      cloudNotesLastSyncedAt,
+      cloudNotesSyncedCount,
+      noteFolders.length,
+      cloudNotesError,
+      handleSyncCloudNotesNow,
+    ]
+  );
+
   const isStandaloneAppMode =
     isInstalledPwa || manualFullScreen || (isCoarseTouch && viewportWidth < 1024);
 
+  const { showExitToast } = useAndroidBackController(isStandaloneAppMode || isCoarseTouch);
+
   const adaptiveNativePosture =
-    viewportWidth >= 640 ? FoldPosture.Inner : FoldPosture.Cover;
+    viewportWidth >= 560 ? FoldPosture.Inner : FoldPosture.Cover;
 
   const handleDownloadSource = async () => {
     if (exportingSource) return;
@@ -1142,12 +1894,24 @@ export default function App() {
     } else {
       root.classList.remove('dark');
     }
-    applyAccentCssVars(decisions.accentColor, isDark);
-    const themeMeta = document.querySelector('meta[name="theme-color"]');
-    if (themeMeta) {
-      themeMeta.setAttribute('content', isDark ? '#121513' : '#F8F9F7');
+    if (isStandaloneAppMode) {
+      root.classList.add('buh-standalone');
+    } else {
+      root.classList.remove('buh-standalone');
     }
-  }, [isDark, decisions.accentColor]);
+    applyAccentCssVars(decisions.accentColor, isDark);
+    const surfaceHex = getDeviceSurfaceHex(decisions.visualStyle, isDark);
+    root.style.backgroundColor = surfaceHex;
+    root.style.colorScheme = isDark ? 'dark' : 'light';
+    document.body.style.backgroundColor = surfaceHex;
+    let themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (!themeMeta) {
+      themeMeta = document.createElement('meta');
+      themeMeta.setAttribute('name', 'theme-color');
+      document.head.appendChild(themeMeta);
+    }
+    themeMeta.setAttribute('content', surfaceHex);
+  }, [isDark, decisions.accentColor, decisions.visualStyle, isStandaloneAppMode]);
 
   useEffect(() => {
     try {
@@ -1159,6 +1923,8 @@ export default function App() {
         isDark,
         tasks,
         taskLists,
+        noteFolders,
+        collapsedNoteFolders,
         events,
         notes,
         settings,
@@ -1169,7 +1935,22 @@ export default function App() {
     } catch {
       // Ignore storage quota issues
     }
-  }, [posture, activeScreen, decisions, recentColors, isDark, tasks, taskLists, events, notes, settings, reviewNote, approved]);
+  }, [
+    posture,
+    activeScreen,
+    decisions,
+    recentColors,
+    isDark,
+    tasks,
+    taskLists,
+    noteFolders,
+    collapsedNoteFolders,
+    events,
+    notes,
+    settings,
+    reviewNote,
+    approved,
+  ]);
 
   const handlePreviewAccentColor = (hex: string) => {
     const normalized = normalizeHex(hex);
@@ -1314,12 +2095,194 @@ export default function App() {
     setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId));
   }, []);
 
+  const handleClearReminder = useCallback((taskId?: string, reminderId?: string) => {
+    setActiveReminderAlerts((prev) =>
+      prev.filter((a) => {
+        if (taskId && reminderId) {
+          return !(a.taskId === taskId && a.reminderId === reminderId);
+        }
+        if (taskId) return a.taskId !== taskId;
+        return true;
+      })
+    );
+    if (!taskId || !reminderId) return;
+    const now = Date.now();
+    const markFired = (list: TaskItem[]) =>
+      list.map((t) =>
+        t.id === taskId && t.reminders
+          ? {
+              ...t,
+              reminders: t.reminders.map((r) =>
+                r.id === reminderId ? { ...r, firedAt: r.firedAt ?? now } : r
+              ),
+            }
+          : t
+      );
+    setTasks(markFired);
+    setGoogleTasks(markFired);
+  }, []);
+
+  const handleSnoozeReminder = useCallback(
+    (taskId: string, reminderId?: string, snoozeMinutes = 10) => {
+      const now = Date.now();
+      const snoozed = createSnoozedReminder(snoozeMinutes);
+
+      setActiveReminderAlerts((prev) =>
+        prev.filter((a) =>
+          reminderId
+            ? !(a.taskId === taskId && a.reminderId === reminderId)
+            : a.taskId !== taskId
+        )
+      );
+
+      let matchedTitle: string | null = null;
+      const localMatch = tasksRef.current.find((t) => t.id === taskId);
+      if (localMatch) {
+        matchedTitle = localMatch.title;
+        setTasks((prev) =>
+          prev.map((t) => {
+            if (t.id !== taskId) return t;
+            const existing = (t.reminders ?? []).map((r) =>
+              reminderId && r.id === reminderId ? { ...r, firedAt: r.firedAt ?? now } : r
+            );
+            return { ...t, reminders: [...existing, snoozed] };
+          })
+        );
+      } else {
+        const googleMatch = googleTasksRef.current.find((t) => t.id === taskId);
+        if (googleMatch) {
+          matchedTitle = googleMatch.title;
+          setGoogleTasks((prev) =>
+            prev.map((t) => {
+              if (t.id !== taskId) return t;
+              const existing = (t.reminders ?? []).map((r) =>
+                reminderId && r.id === reminderId ? { ...r, firedAt: r.firedAt ?? now } : r
+              );
+              return { ...t, reminders: [...existing, snoozed] };
+            })
+          );
+        }
+      }
+
+      if (matchedTitle) {
+        showOfflineSyncNotice(`Snoozed "${matchedTitle}" for ${snoozeMinutes}m`);
+      }
+    },
+    [showOfflineSyncNotice]
+  );
+
+  const handleSnoozeReminderAlert = useCallback(
+    (alertId: string, taskId: string, reminderId: string, minutes = 10) => {
+      setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId));
+      handleSnoozeReminder(taskId, reminderId, minutes);
+    },
+    [handleSnoozeReminder]
+  );
+
+  // Handle Snooze, Clear, and Tap-to-Open events coming from Android Service Worker notifications
+  useEffect(() => {
+    const processPendingActions = async () => {
+      const pending = await consumePendingSwReminderActions();
+      for (const item of pending) {
+        if (item.action === 'snooze' && item.taskId) {
+          handleSnoozeReminder(item.taskId, item.reminderId, item.snoozeMinutes ?? 10);
+        } else if (item.action === 'clear') {
+          handleClearReminder(item.taskId, item.reminderId);
+        }
+      }
+    };
+
+    void processPendingActions();
+
+    const handleSwMessage = (event: MessageEvent) => {
+      const data = event.data as
+        | {
+            type?: string;
+            action?: 'snooze' | 'clear';
+            taskId?: string;
+            reminderId?: string;
+            snoozeMinutes?: number;
+          }
+        | null;
+      if (!data || typeof data !== 'object') return;
+      if (data.type === 'REMINDER_ACTION') {
+        if (data.action === 'snooze' && data.taskId) {
+          handleSnoozeReminder(data.taskId, data.reminderId, data.snoozeMinutes ?? 10);
+        } else if (data.action === 'clear') {
+          handleClearReminder(data.taskId, data.reminderId);
+        }
+      } else if (data.type === 'REMINDER_OPEN' && data.taskId) {
+        setActiveScreen(ScreenId.Tasks);
+        setExternalOpenTask({ taskId: data.taskId, nonce: Date.now() });
+      } else if (data.type === 'REMINDER_PUSH_DELIVERED' && data.taskId && data.reminderId) {
+        handleClearReminder(data.taskId, data.reminderId);
+      } else if (data.type === 'PUSH_SUBSCRIPTION_CHANGED') {
+        window.dispatchEvent(new CustomEvent('buh:push-ready'));
+      }
+    };
+
+    const handleWake = () => {
+      if (document.visibilityState !== 'hidden') {
+        void processPendingActions();
+      }
+    };
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', handleSwMessage);
+    }
+    window.addEventListener('focus', handleWake);
+    document.addEventListener('visibilitychange', handleWake);
+
+    return () => {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('message', handleSwMessage);
+      }
+      window.removeEventListener('focus', handleWake);
+      document.removeEventListener('visibilitychange', handleWake);
+    };
+  }, [handleSnoozeReminder, handleClearReminder]);
+
+  const [pushReadyNonce, setPushReadyNonce] = useState(0);
+
+  useEffect(() => {
+    const onPushReady = () => setPushReadyNonce((n) => n + 1);
+    window.addEventListener('buh:push-ready', onPushReady);
+    return () => window.removeEventListener('buh:push-ready', onPushReady);
+  }, []);
+
+  // Sync upcoming task reminders to the server Web Push scheduler so alerts fire even when the app is completely closed
+  useEffect(() => {
+    if (!isOnline) return;
+    if (getNotificationPermissionState() !== 'granted') return;
+
+    const timer = window.setTimeout(() => {
+      void syncScheduledRemindersToPushServer(visibleTasks, {
+        enabled: settings.taskRemindersEnabled !== false,
+        silent: settings.reminderSound === false,
+      });
+    }, 350);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    visibleTasks,
+    settings.taskRemindersEnabled,
+    settings.reminderSound,
+    isOnline,
+    pushReadyNonce,
+  ]);
+
   const handleCompleteFromReminderAlert = useCallback(
     (alertId: string, taskId: string) => {
       setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId && a.taskId !== taskId));
       const localMatch = tasksRef.current.find((t) => t.id === taskId);
       if (localMatch && !localMatch.completed) {
-        setTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, completed: true } : t)));
+        setTasks((prev) =>
+          prev.map((t) =>
+            t.id === taskId
+              ? { ...t, completed: true, completedAt: new Date().toISOString() }
+              : t
+          )
+        );
         return;
       }
       const googleMatch = googleTasksRef.current.find((t) => t.id === taskId);
@@ -1356,7 +2319,15 @@ export default function App() {
 
   const handleToggleTask = (taskId: string) => {
     setTasks((prev) =>
-      prev.map((t) => (t.id === taskId ? { ...t, completed: !t.completed } : t))
+      prev.map((t) => {
+        if (t.id !== taskId) return t;
+        const nextCompleted = !t.completed;
+        return {
+          ...t,
+          completed: nextCompleted,
+          completedAt: nextCompleted ? new Date().toISOString() : undefined,
+        };
+      })
     );
     setActiveReminderAlerts((prev) => prev.filter((a) => a.taskId !== taskId));
   };
@@ -1398,6 +2369,17 @@ export default function App() {
   const handleDeleteTask = (taskId: string) => {
     setTasks((prev) => prev.filter((t) => t.id !== taskId));
     setActiveReminderAlerts((prev) => prev.filter((a) => a.taskId !== taskId));
+  };
+
+  const handleRestoreTask = (task: TaskItem, index?: number) => {
+    setTasks((prev) => {
+      if (prev.some((t) => t.id === task.id)) return prev;
+      const next = [...prev];
+      const targetIdx =
+        typeof index === 'number' && index >= 0 && index <= next.length ? index : 0;
+      next.splice(targetIdx, 0, task);
+      return next;
+    });
   };
 
   const handleAddList = (name: string) => {
@@ -1455,11 +2437,119 @@ export default function App() {
     });
   };
 
+  const handleAddNoteFolder = (name: string) => {
+    const clean = name.trim();
+    if (!clean) return;
+    if (noteFoldersRef.current.some((f) => f.toLowerCase() === clean.toLowerCase())) return;
+    const nextFolders = [...noteFoldersRef.current, clean];
+    setNoteFolders(nextFolders);
+    pushCloudNotePreferences(nextFolders, collapsedNoteFoldersRef.current);
+  };
+
+  const handleRenameNoteFolder = (oldName: string, newName: string) => {
+    const clean = newName.trim();
+    if (!clean) return;
+    if (
+      noteFoldersRef.current.some(
+        (f) => f.toLowerCase() === clean.toLowerCase() && f !== oldName
+      )
+    ) {
+      return;
+    }
+    const nextFolders = noteFoldersRef.current.map((f) => (f === oldName ? clean : f));
+    const nextCollapsed = collapsedNoteFoldersRef.current.map((f) =>
+      f === oldName ? clean : f
+    );
+    const affectedNotes = notesRef.current
+      .filter((n) => n.folder === oldName)
+      .map((n) => ({ ...n, folder: clean }));
+
+    setNoteFolders(nextFolders);
+    setNotes((prev) =>
+      prev.map((n) => (n.folder === oldName ? { ...n, folder: clean } : n))
+    );
+    setCollapsedNoteFolders(nextCollapsed);
+    pushCloudNotePreferences(nextFolders, nextCollapsed);
+    for (const updatedNote of affectedNotes) {
+      scheduleCloudNoteUpsert(updatedNote, true);
+    }
+  };
+
+  const handleDeleteNoteFolder = (name: string) => {
+    const remaining = noteFoldersRef.current.filter((f) => f !== name);
+    if (remaining.length === 0) return;
+    const nextCollapsed = collapsedNoteFoldersRef.current.filter((f) => f !== name);
+    const affectedNotes = notesRef.current
+      .filter((n) => n.folder === name)
+      .map((n) => ({ ...n, folder: remaining[0] }));
+
+    setNoteFolders(remaining);
+    setNotes((prev) =>
+      prev.map((n) => (n.folder === name ? { ...n, folder: remaining[0] } : n))
+    );
+    setCollapsedNoteFolders(nextCollapsed);
+    pushCloudNotePreferences(remaining, nextCollapsed);
+    for (const updatedNote of affectedNotes) {
+      scheduleCloudNoteUpsert(updatedNote, true);
+    }
+  };
+
+  const handleReorderNoteFolder = (fromIndex: number, toIndex: number) => {
+    const prev = noteFoldersRef.current;
+    if (
+      fromIndex === toIndex ||
+      fromIndex < 0 ||
+      toIndex < 0 ||
+      fromIndex >= prev.length ||
+      toIndex >= prev.length
+    ) {
+      return;
+    }
+    const nextFolders = [...prev];
+    const [moved] = nextFolders.splice(fromIndex, 1);
+    nextFolders.splice(toIndex, 0, moved);
+    setNoteFolders(nextFolders);
+    pushCloudNotePreferences(nextFolders, collapsedNoteFoldersRef.current);
+  };
+
+  const handleToggleNoteFolderCollapsed = (folderName: string) => {
+    const prev = collapsedNoteFoldersRef.current;
+    const nextCollapsed = prev.includes(folderName)
+      ? prev.filter((f) => f !== folderName)
+      : [...prev, folderName];
+    setCollapsedNoteFolders(nextCollapsed);
+    pushCloudNotePreferences(noteFoldersRef.current, nextCollapsed);
+  };
+
+  const handleExpandNoteFolder = (folderName: string) => {
+    const prev = collapsedNoteFoldersRef.current;
+    if (!prev.includes(folderName)) return;
+    const nextCollapsed = prev.filter((f) => f !== folderName);
+    setCollapsedNoteFolders(nextCollapsed);
+    pushCloudNotePreferences(noteFoldersRef.current, nextCollapsed);
+  };
+
   const handleAddEvent = (ev: CalendarEvent) => {
     setEvents((prev) => [...prev, ev]);
   };
 
-  const handleConvertEventToTask = (ev: CalendarEvent) => {
+  const handleDeleteEvent = (eventId: string) => {
+    setEvents((prev) => prev.filter((e) => e.id !== eventId));
+  };
+
+  const handleRestoreEvent = (ev: CalendarEvent, index?: number) => {
+    setEvents((prev) => {
+      if (prev.some((e) => e.id === ev.id)) return prev;
+      if (typeof index === 'number' && index >= 0 && index <= prev.length) {
+        const next = [...prev];
+        next.splice(index, 0, ev);
+        return next;
+      }
+      return [...prev, ev];
+    });
+  };
+
+  const handleConvertEventToTask = (ev: CalendarEvent): string => {
     let formattedTime = 'No time set';
     if (ev.startTime === 'Full') {
       formattedTime = 'Full';
@@ -1484,35 +2574,208 @@ export default function App() {
       subtasks: [],
     };
     setTasks((prev) => [created, ...prev]);
+    return created.id;
   };
 
   const handleUpdateNote = (updated: NoteItem) => {
+    const previous = notesRef.current.find((n) => n.id === updated.id);
+    const immediate =
+      Boolean(previous) &&
+      (previous!.folder !== updated.folder ||
+        previous!.pinned !== updated.pinned ||
+        previous!.markdownEnabled !== updated.markdownEnabled);
     setNotes((prev) => prev.map((n) => (n.id === updated.id ? updated : n)));
+    scheduleCloudNoteUpsert(updated, immediate);
   };
 
   const handleDeleteNote = (noteId: string) => {
     setNotes((prev) => prev.filter((n) => n.id !== noteId));
+    pushCloudNoteDelete(noteId);
   };
 
-  const handleCreateNote = (customTitle?: string, customBody?: string): string => {
+  const handleRestoreNote = (note: NoteItem, index?: number) => {
+    setNotes((prev) => {
+      if (prev.some((n) => n.id === note.id)) return prev;
+      const next = [...prev];
+      const targetIdx =
+        typeof index === 'number' && index >= 0 && index <= next.length ? index : 0;
+      next.splice(targetIdx, 0, note);
+      return next;
+    });
+    if (isNoteNonEmpty(note)) {
+      scheduleCloudNoteUpsert(note, true);
+    }
+  };
+
+  const handleCreateNote = (
+    customTitle?: string,
+    customBody?: string,
+    folder?: string
+  ): string => {
     const id = `n-${Date.now()}`;
     const trimmedBody = customBody?.trim() || '';
     const trimmedTitle = customTitle?.trim() || (trimmedBody ? 'Untitled Note' : '');
+    const targetFolder =
+      folder && noteFolders.includes(folder) ? folder : noteFolders[0] || 'Work';
+    let minExistingSortOrder: number | null = null;
+    for (const existing of notesRef.current) {
+      if (typeof existing.sortOrder === 'number' && Number.isFinite(existing.sortOrder)) {
+        minExistingSortOrder =
+          minExistingSortOrder === null
+            ? existing.sortOrder
+            : Math.min(minExistingSortOrder, existing.sortOrder);
+      }
+    }
     const created: NoteItem = {
       id,
       title: trimmedTitle,
-      folder: 'Product',
+      folder: targetFolder,
       updatedAt: 'Created just now',
       pinned: false,
+      sortOrder: minExistingSortOrder !== null ? minExistingSortOrder - 1000 : 1000,
       blocks: [{ id: `b-${Date.now()}-1`, type: 'paragraph', text: trimmedBody }],
     };
-    setNotes((prev) => [created, ...prev]);
+    const nextNotes = [created, ...notesRef.current];
+    notesRef.current = nextNotes;
+    setNotes(nextNotes);
+    if (isNoteNonEmpty(created)) {
+      scheduleCloudNoteUpsert(created, true);
+    }
     return id;
+  };
+
+  const handleReorderNote = (
+    draggedNoteId: string,
+    targetFolder: string,
+    targetIndexInFolder: number
+  ) => {
+    const prev = notesRef.current;
+    const draggedIndex = prev.findIndex((n) => n.id === draggedNoteId);
+    if (draggedIndex === -1) return;
+
+    const folders = noteFoldersRef.current.length > 0 ? noteFoldersRef.current : ['Work'];
+    const fallbackFolder = folders[0];
+    const resolveFolder = (n: NoteItem) =>
+      folders.includes(n.folder) ? n.folder : fallbackFolder;
+    const resolvedTargetFolder = folders.includes(targetFolder)
+      ? targetFolder
+      : fallbackFolder;
+
+    const draggedNote = prev[draggedIndex];
+    const currentFolder = resolveFolder(draggedNote);
+
+    if (currentFolder === resolvedTargetFolder) {
+      const folderNotes = prev.filter((n) => resolveFolder(n) === resolvedTargetFolder);
+      const currentIdxInFolder = folderNotes.findIndex((n) => n.id === draggedNoteId);
+      const clampedCurrentTarget = Math.max(
+        0,
+        Math.min(targetIndexInFolder, folderNotes.length - 1)
+      );
+      if (currentIdxInFolder === clampedCurrentTarget) return;
+    }
+
+    const remaining = prev.filter((n) => n.id !== draggedNoteId);
+    const targetFolderIndices: number[] = [];
+    for (let i = 0; i < remaining.length; i += 1) {
+      if (resolveFolder(remaining[i]) === resolvedTargetFolder) {
+        targetFolderIndices.push(i);
+      }
+    }
+
+    const clampedInsertIdx = Math.max(
+      0,
+      Math.min(targetIndexInFolder, targetFolderIndices.length)
+    );
+    let insertPos: number;
+    if (targetFolderIndices.length === 0) {
+      insertPos = 0;
+    } else if (clampedInsertIdx < targetFolderIndices.length) {
+      insertPos = targetFolderIndices[clampedInsertIdx];
+    } else {
+      insertPos = targetFolderIndices[targetFolderIndices.length - 1] + 1;
+    }
+
+    const movedBase: NoteItem = {
+      ...draggedNote,
+      folder: resolvedTargetFolder,
+    };
+
+    const next = [...remaining];
+    next.splice(insertPos, 0, movedBase);
+
+    const allOthersOrdered = remaining.every(
+      (n, idx) =>
+        typeof n.sortOrder === 'number' &&
+        Number.isFinite(n.sortOrder) &&
+        (idx === 0 || n.sortOrder > (remaining[idx - 1].sortOrder as number))
+    );
+
+    let finalNext: NoteItem[] = next;
+    const changedToSync: NoteItem[] = [];
+
+    if (allOthersOrdered) {
+      const prevOrder =
+        insertPos > 0 ? (next[insertPos - 1].sortOrder as number) : undefined;
+      const nextOrder =
+        insertPos < next.length - 1 ? (next[insertPos + 1].sortOrder as number) : undefined;
+
+      let candidate: number | null = null;
+      if (prevOrder === undefined && nextOrder === undefined) {
+        candidate = 1000;
+      } else if (prevOrder === undefined) {
+        candidate = nextOrder! - 1000;
+      } else if (nextOrder === undefined) {
+        candidate = prevOrder + 1000;
+      } else if (nextOrder - prevOrder > 1) {
+        candidate = (prevOrder + nextOrder) / 2;
+      }
+
+      if (candidate !== null) {
+        const updatedMoved: NoteItem = { ...movedBase, sortOrder: candidate };
+        finalNext = [...next];
+        finalNext[insertPos] = updatedMoved;
+        if (isNoteNonEmpty(updatedMoved)) {
+          changedToSync.push(updatedMoved);
+        }
+      } else {
+        const prevById = new Map(prev.map((n) => [n.id, n]));
+        finalNext = next.map((n, idx) => ({ ...n, sortOrder: (idx + 1) * 1000 }));
+        for (const n of finalNext) {
+          const before = prevById.get(n.id);
+          if (
+            isNoteNonEmpty(n) &&
+            (!before || before.sortOrder !== n.sortOrder || before.folder !== n.folder)
+          ) {
+            changedToSync.push(n);
+          }
+        }
+      }
+    } else {
+      const prevById = new Map(prev.map((n) => [n.id, n]));
+      finalNext = next.map((n, idx) => ({ ...n, sortOrder: (idx + 1) * 1000 }));
+      for (const n of finalNext) {
+        const before = prevById.get(n.id);
+        if (
+          isNoteNonEmpty(n) &&
+          (!before || before.sortOrder !== n.sortOrder || before.folder !== n.folder)
+        ) {
+          changedToSync.push(n);
+        }
+      }
+    }
+
+    notesRef.current = finalNext;
+    setNotes(finalNext);
+    for (const noteToSync of changedToSync) {
+      scheduleCloudNoteUpsert(noteToSync, false);
+    }
   };
 
   const handleResetDemo = () => {
     setTasks(INITIAL_TASKS);
     setTaskLists(INITIAL_LISTS);
+    setNoteFolders(INITIAL_NOTE_FOLDERS);
+    setCollapsedNoteFolders([]);
     setEvents(INITIAL_EVENTS);
     setNotes(INITIAL_NOTES);
     setSettings(INITIAL_SETTINGS);
@@ -1531,11 +2794,7 @@ export default function App() {
   };
 
   const homeTabTitle =
-    decisions.defaultHome === DefaultHome.Inbox
-      ? 'Inbox'
-      : decisions.defaultHome === DefaultHome.Dashboard
-        ? 'Overview'
-        : 'Today';
+    decisions.defaultHome === DefaultHome.Inbox ? 'Inbox' : 'Overview';
 
   const screenTabs: { id: ScreenId; label: string }[] = [
     { id: ScreenId.Home, label: homeTabTitle },
@@ -1546,10 +2805,14 @@ export default function App() {
   ];
 
   if (isStandaloneAppMode) {
+    const standaloneTokens = getDeviceStyleTokens(decisions.visualStyle);
     return (
-      <div className="min-h-[100dvh] w-full bg-[#F8F9F7] dark:bg-[#121513] text-stone-900 dark:text-stone-100 overflow-hidden">
+      <div
+        className={`fixed inset-x-0 top-[var(--buh-vv-top,0px)] h-[var(--buh-vh,100dvh)] w-full ${standaloneTokens.surfaceBg} text-stone-900 dark:text-stone-100 overflow-hidden`}
+      >
         <FoldDeviceFrame
           standalone
+          keyboardOpen={isVirtualKeyboardOpen}
           onExitStandalone={
             manualFullScreen && !isInstalledPwa ? () => setManualFullScreen(false) : undefined
           }
@@ -1562,6 +2825,8 @@ export default function App() {
           showHingeGuide={false}
           tasks={visibleTasks}
           taskLists={taskLists}
+          noteFolders={noteFolders}
+          collapsedNoteFolders={collapsedNoteFolders}
           events={visibleEvents}
           notes={notes}
           settings={settings}
@@ -1569,24 +2834,42 @@ export default function App() {
           onToggleTask={handleToggleTask}
           onUpdateTask={handleUpdateTask}
           onDeleteTask={handleDeleteTask}
+          onRestoreTask={handleRestoreTask}
           onAddEvent={handleAddEvent}
+          onDeleteEvent={handleDeleteEvent}
+          onRestoreEvent={handleRestoreEvent}
           onConvertEventToTask={handleConvertEventToTask}
           onUpdateNote={handleUpdateNote}
           onDeleteNote={handleDeleteNote}
+          onRestoreNote={handleRestoreNote}
           onCreateNote={handleCreateNote}
+          onReorderNote={handleReorderNote}
           onUpdateSettings={(patch) => setSettings((s) => ({ ...s, ...patch }))}
           onAddList={handleAddList}
           onRenameList={handleRenameList}
           onDeleteList={handleDeleteList}
           onReorderList={handleReorderList}
+          onAddNoteFolder={handleAddNoteFolder}
+          onRenameNoteFolder={handleRenameNoteFolder}
+          onDeleteNoteFolder={handleDeleteNoteFolder}
+          onReorderNoteFolder={handleReorderNoteFolder}
+          onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
+          onExpandNoteFolder={handleExpandNoteFolder}
           recentColors={recentColors}
           onPreviewAccentColor={handlePreviewAccentColor}
           onSelectAccentColor={handleSelectAccentColor}
           googleCalendar={googleCalendarState}
           googleTasks={googleTasksState}
+          cloudNotesSync={cloudNotesSyncState}
           activeReminderAlerts={activeReminderAlerts}
           onDismissReminderAlert={handleDismissReminderAlert}
+          onSnoozeReminderAlert={handleSnoozeReminderAlert}
           onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
+          externalOpenTask={externalOpenTask}
+          onConsumeExternalOpenTask={() => setExternalOpenTask(null)}
+          externalShortcut={externalShortcut}
+          onConsumeExternalShortcut={() => setExternalShortcut(null)}
+          hiddenCompletedTasksCount={hiddenCompletedTasksCount}
         />
         <OfflineIndicator
           pendingSyncCount={pendingSyncQueue.length}
@@ -1595,6 +2878,15 @@ export default function App() {
           needsReconnectToSync={!googleConnected}
           onSyncPending={handleTriggerPendingSync}
         />
+        {showExitToast && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-none fixed bottom-20 left-1/2 -translate-x-1/2 z-[60] rounded-xl bg-stone-900/95 dark:bg-stone-100/95 px-4 py-2.5 text-[13px] font-medium text-white dark:text-stone-900 shadow-xl border border-stone-700/60 dark:border-stone-300/60 whitespace-nowrap"
+          >
+            Press back again to exit
+          </div>
+        )}
       </div>
     );
   }
@@ -1723,6 +3015,21 @@ export default function App() {
                   </button>
                 )}
 
+                <button
+                  type="button"
+                  onClick={() => setSimulatedKeyboardOpen((v) => !v)}
+                  aria-pressed={simulatedKeyboardOpen}
+                  title="Toggle simulated Android on-screen keyboard inside the device preview"
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
+                    simulatedKeyboardOpen
+                      ? 'bg-[var(--tf-accent-soft)] border-[var(--tf-accent-border)] text-[var(--tf-accent-text)]'
+                      : 'border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-50 dark:hover:bg-stone-800'
+                  }`}
+                >
+                  <Keyboard className="w-3.5 h-3.5" />
+                  Android KB
+                </button>
+
                 <div className="flex items-center gap-0.5 p-0.5 bg-stone-100 dark:bg-stone-800/80 rounded-xl">
                   {screenTabs.map((tab) => {
                     const active = activeScreen === tab.id;
@@ -1749,6 +3056,8 @@ export default function App() {
             <div className="bg-[#ECEEE9] dark:bg-[#131614] border border-stone-200/80 dark:border-stone-800 rounded-3xl p-4 sm:p-5 flex items-center justify-center">
               <FoldDeviceFrame
                 posture={posture}
+                keyboardOpen={simulatedKeyboardOpen}
+                onDismissKeyboard={() => setSimulatedKeyboardOpen(false)}
                 decisions={decisions}
                 activeScreen={activeScreen}
                 onChangeScreen={setActiveScreen}
@@ -1757,6 +3066,8 @@ export default function App() {
                 showHingeGuide={showHingeGuide}
                 tasks={visibleTasks}
                 taskLists={taskLists}
+                noteFolders={noteFolders}
+                collapsedNoteFolders={collapsedNoteFolders}
                 events={visibleEvents}
                 notes={notes}
                 settings={settings}
@@ -1764,24 +3075,42 @@ export default function App() {
                 onToggleTask={handleToggleTask}
                 onUpdateTask={handleUpdateTask}
                 onDeleteTask={handleDeleteTask}
+                onRestoreTask={handleRestoreTask}
                 onAddEvent={handleAddEvent}
+                onDeleteEvent={handleDeleteEvent}
+                onRestoreEvent={handleRestoreEvent}
                 onConvertEventToTask={handleConvertEventToTask}
                 onUpdateNote={handleUpdateNote}
                 onDeleteNote={handleDeleteNote}
+                onRestoreNote={handleRestoreNote}
                 onCreateNote={handleCreateNote}
+                onReorderNote={handleReorderNote}
                 onUpdateSettings={(patch) => setSettings((s) => ({ ...s, ...patch }))}
                 onAddList={handleAddList}
                 onRenameList={handleRenameList}
                 onDeleteList={handleDeleteList}
                 onReorderList={handleReorderList}
+                onAddNoteFolder={handleAddNoteFolder}
+                onRenameNoteFolder={handleRenameNoteFolder}
+                onDeleteNoteFolder={handleDeleteNoteFolder}
+                onReorderNoteFolder={handleReorderNoteFolder}
+                onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
+                onExpandNoteFolder={handleExpandNoteFolder}
                 recentColors={recentColors}
                 onPreviewAccentColor={handlePreviewAccentColor}
                 onSelectAccentColor={handleSelectAccentColor}
                 googleCalendar={googleCalendarState}
                 googleTasks={googleTasksState}
+                cloudNotesSync={cloudNotesSyncState}
                 activeReminderAlerts={activeReminderAlerts}
                 onDismissReminderAlert={handleDismissReminderAlert}
+                onSnoozeReminderAlert={handleSnoozeReminderAlert}
                 onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
+                externalOpenTask={externalOpenTask}
+                onConsumeExternalOpenTask={() => setExternalOpenTask(null)}
+                externalShortcut={externalShortcut}
+                onConsumeExternalShortcut={() => setExternalShortcut(null)}
+                hiddenCompletedTasksCount={hiddenCompletedTasksCount}
               />
             </div>
           </div>
@@ -1819,6 +3148,15 @@ export default function App() {
         needsReconnectToSync={!googleConnected}
         onSyncPending={handleTriggerPendingSync}
       />
+      {showExitToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="pointer-events-none fixed bottom-6 left-1/2 -translate-x-1/2 z-[60] rounded-xl bg-stone-900/95 dark:bg-stone-100/95 px-4 py-2.5 text-[13px] font-medium text-white dark:text-stone-900 shadow-xl border border-stone-700/60 dark:border-stone-300/60 whitespace-nowrap"
+        >
+          Press back again to exit
+        </div>
+      )}
     </div>
   );
 }

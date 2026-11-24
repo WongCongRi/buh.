@@ -1,0 +1,260 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net: Default-deny catch-all
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Hardened Global Primitives ---
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Master Gate: Verify parent user workspace anchor exists and is owned by caller
+    function ownsWorkspace(userId) {
+      return exists(/databases/$(database)/documents/users/$(userId)) &&
+        get(/databases/$(database)/documents/users/$(userId)).data.ownerId == request.auth.uid;
+    }
+
+    // --- Entity Validation Blueprints (Anti-Update-Gap) ---
+    function isValidUserAccount(data, userId) {
+      return data.keys().hasAll(['ownerId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidFolderList(listVal, requireNonEmpty) {
+      return listVal is list &&
+        listVal.size() <= 50 &&
+        (!requireNonEmpty || listVal.size() >= 1) &&
+        (listVal.size() == 0 || (
+          listVal[0] is string &&
+          listVal[0].size() >= 1 &&
+          listVal[0].size() <= 100
+        ));
+    }
+
+    function isValidNotePreferences(data, userId) {
+      return data.keys().hasAll(['ownerId', 'folders', 'collapsedFolders', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'folders', 'collapsedFolders', 'createdAt', 'updatedAt']) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        isValidFolderList(data.folders, true) &&
+        isValidFolderList(data.collapsedFolders, false) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBlockItem(block) {
+      return block is map &&
+        block.keys().hasAll(['id', 'type', 'text']) &&
+        block.keys().hasOnly(['id', 'type', 'text', 'checked']) &&
+        isValidId(block.id) &&
+        block.type is string &&
+        block.type in ['paragraph', 'heading', 'checklist', 'bullet', 'code'] &&
+        block.text is string &&
+        block.text.size() <= 20000 &&
+        (!('checked' in block) || block.checked is bool);
+    }
+
+    function isValidNote(data, userId, noteId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'title',
+          'folder',
+          'updatedAtLabel',
+          'pinned',
+          'markdownEnabled',
+          'blocks',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'title',
+          'folder',
+          'updatedAtLabel',
+          'pinned',
+          'markdownEnabled',
+          'blocks',
+          'sortOrder',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == noteId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.title is string &&
+        data.title.size() <= 300 &&
+        data.folder is string &&
+        data.folder.size() >= 1 &&
+        data.folder.size() <= 100 &&
+        data.updatedAtLabel is string &&
+        data.updatedAtLabel.size() <= 60 &&
+        data.pinned is bool &&
+        data.markdownEnabled is bool &&
+        data.blocks is list &&
+        data.blocks.size() <= 250 &&
+        (data.blocks.size() == 0 || isValidBlockItem(data.blocks[0])) &&
+        (!('sortOrder' in data) || data.sortOrder is number) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // --- Collection: /users/{userId} ---
+    match /users/{userId} {
+      allow get: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        (resource == null || existing().ownerId == request.auth.uid);
+
+      allow list: if false;
+
+      allow create: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidUserAccount(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidUserAccount(incoming(), userId) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['updatedAt']);
+
+      allow delete: if false;
+
+      // --- Subcollection: /users/{userId}/preferences/{prefId} ---
+      match /preferences/{prefId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(prefId) &&
+          prefId == 'notes' &&
+          userId == request.auth.uid &&
+          (resource == null || existing().ownerId == request.auth.uid) &&
+          ownsWorkspace(userId);
+
+        allow list: if false;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(prefId) &&
+          prefId == 'notes' &&
+          userId == request.auth.uid &&
+          isValidNotePreferences(incoming(), userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          ownsWorkspace(userId);
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(prefId) &&
+          prefId == 'notes' &&
+          userId == request.auth.uid &&
+          isValidNotePreferences(incoming(), userId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            // Action: Update folders and/or collapsedFolders
+            incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'collapsedFolders', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'updatedAt']) ||
+            incoming().diff(existing()).affectedKeys().hasOnly(['collapsedFolders', 'updatedAt'])
+          ) &&
+          ownsWorkspace(userId);
+
+        allow delete: if false;
+      }
+
+      // --- Subcollection: /users/{userId}/notes/{noteId} ---
+      match /notes/{noteId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          userId == request.auth.uid &&
+          (resource == null || existing().ownerId == request.auth.uid) &&
+          ownsWorkspace(userId);
+
+        // Secure List Query: explicitly checks resource.data.ownerId without get()/exists()
+        allow list: if isVerifiedUser() &&
+          isValidId(userId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          userId == request.auth.uid &&
+          isValidNote(incoming(), userId, noteId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          ownsWorkspace(userId);
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          userId == request.auth.uid &&
+          isValidNote(incoming(), userId, noteId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          (
+            // Action: Edit note content, metadata, pin, markdown, sort order, or move folder
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'title',
+              'folder',
+              'updatedAtLabel',
+              'pinned',
+              'markdownEnabled',
+              'blocks',
+              'sortOrder',
+              'updatedAt'
+            ])
+          ) &&
+          ownsWorkspace(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(noteId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid &&
+          ownsWorkspace(userId);
+      }
+    }
+  }
+}

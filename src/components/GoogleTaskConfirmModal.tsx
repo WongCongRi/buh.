@@ -2,6 +2,7 @@ import React from 'react';
 import { CheckSquare, Loader2, RefreshCw, Trash2, X } from 'lucide-react';
 import { TaskItem } from '../types/taskflow';
 import { StyleThemeTokens } from '../utils/themeTokens';
+import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
 export type PendingGoogleTaskMutation =
   | {
@@ -41,6 +42,15 @@ export const GoogleTaskConfirmModal: React.FC<GoogleTaskConfirmModalProps> = ({
   onConfirm,
   onSaveLocalOnly,
 }) => {
+  useBackLayer(
+    Boolean(pending),
+    () => {
+      if (busy) return false;
+      onCancel();
+    },
+    30
+  );
+
   if (!pending) return null;
 
   const isDelete = pending.action === 'delete';

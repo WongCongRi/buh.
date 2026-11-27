@@ -53,6 +53,15 @@ export interface TaskReminder {
   firedAt?: number;
 }
 
+export type RecurrenceFrequency = 'daily' | 'weekly' | 'monthly' | 'yearly';
+
+export interface RecurrenceRule {
+  frequency: RecurrenceFrequency;
+  interval: number; // >= 1
+  daysOfWeek?: number[]; // 0=Sun..6=Sat (for weekly)
+  endDateKey?: string; // optional inclusive 'YYYY-MM-DD'
+}
+
 export interface TaskItem {
   id: string;
   title: string;
@@ -66,6 +75,8 @@ export interface TaskItem {
   notes: string;
   subtasks: SubTask[];
   reminders?: TaskReminder[];
+  recurrence?: RecurrenceRule;
+  recurrenceSeriesId?: string;
   source?: 'local' | 'google';
   googleTaskId?: string;
   googleTaskListId?: string;
@@ -83,6 +94,8 @@ export interface CalendarEvent {
   calendarName: string;
   location?: string;
   linkedTaskId?: string;
+  recurrence?: RecurrenceRule;
+  recurringEventId?: string;
   source?: 'local' | 'google';
   googleEventId?: string;
   htmlLink?: string;
@@ -114,6 +127,8 @@ export interface DesignDecisions {
   accentColor: string;
 }
 
+export type TimeFormat = '24h' | '12h';
+
 export interface AppSettingsState {
   hingeAwareSplit: boolean;
   oneHandedCoverReach: boolean;
@@ -126,6 +141,7 @@ export interface AppSettingsState {
   reminderSound: boolean;
   completedTaskHistoryYears?: number;
   completedTaskHistoryMonths?: number;
+  timeFormat?: TimeFormat;
 }
 
 export interface CloudNotesSyncState {
@@ -135,6 +151,9 @@ export interface CloudNotesSyncState {
   lastSyncedAt: string | null;
   syncedNotesCount: number;
   syncedFoldersCount: number;
+  syncedTasksCount?: number;
+  syncedEventsCount?: number;
+  syncedLookupCount?: number;
   error: string | null;
   onSyncNow: () => Promise<void>;
 }
@@ -159,6 +178,7 @@ export interface GoogleCalendarSyncState {
     startTime: string;
     endTime: string;
     calendarName: string;
+    recurrence?: RecurrenceRule;
   }) => Promise<void>;
   onDeleteGoogleEvent: (eventId: string, googleEventId: string) => Promise<void>;
 }
@@ -192,6 +212,8 @@ export interface GoogleTasksSyncState {
     taskListId?: string;
     category?: string;
     reminders?: TaskReminder[];
+    recurrence?: RecurrenceRule;
+    recurrenceSeriesId?: string;
   }) => Promise<string | void>;
   onUpdateGoogleTask: (task: TaskItem) => Promise<void>;
   onToggleGoogleTask: (task: TaskItem) => Promise<void>;

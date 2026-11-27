@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertCircle,
+  ArrowDown,
   Check,
   CheckSquare,
   ExternalLink,
@@ -15,11 +16,19 @@ import {
   WifiOff,
   X,
 } from 'lucide-react';
-import { TODAY_DATE_KEY } from '../../data/initialData';
 import { useOnlineStatus } from '../../hooks/useOnlineStatus';
+import { useTodayDateKey } from '../../hooks/useTodayDateKey';
 import { useBackLayer } from '../../hooks/useAndroidBackNavigation';
-import { CalendarEvent, FoldPosture, NoteItem, TaskItem } from '../../types/taskflow';
+import { CalendarEvent, FoldPosture, NoteItem, TaskItem, TimeFormat } from '../../types/taskflow';
+import { formatDDMMM } from '../../utils/dateLabels';
+import {
+  formatClockDate,
+  formatTimeDisplay,
+  parseTimeTo24hParts,
+  useTimeFormat,
+} from '../../utils/timeFormat';
 import { StyleThemeTokens } from '../../utils/themeTokens';
+import { LookupMarkdown } from '../LookupMarkdown';
 
 export interface QuickCheckSource {
   title: string;
@@ -77,41 +86,21 @@ interface SuggestedCheck {
 }
 
 function parseTimeToMinutes(timeStr: string): number | null {
-  const trimmed = timeStr.trim();
-  if (!trimmed || /no time/i.test(trimmed)) return null;
-
-  const ampm = trimmed.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
-  if (ampm) {
-    let h = parseInt(ampm[1], 10);
-    const m = parseInt(ampm[2], 10);
-    const mer = ampm[3].toUpperCase();
-    if (mer === 'PM' && h !== 12) h += 12;
-    if (mer === 'AM' && h === 12) h = 0;
-    return h * 60 + m;
-  }
-
-  const h24 = trimmed.match(/^(\d{1,2}):(\d{2})$/);
-  if (h24) {
-    return parseInt(h24[1], 10) * 60 + parseInt(h24[2], 10);
-  }
-  return null;
+  const parts = parseTimeTo24hParts(timeStr);
+  return parts ? parts.hours * 60 + parts.minutes : null;
 }
 
-function dateKeyToDayOffset(dateKey: string): number {
-  const base = Date.parse(`${TODAY_DATE_KEY}T00:00:00Z`);
+function dateKeyToDayOffset(dateKey: string, todayDateKey: string): number {
+  const base = Date.parse(`${todayDateKey}T00:00:00Z`);
   const target = Date.parse(`${dateKey}T00:00:00Z`);
   if (Number.isNaN(base) || Number.isNaN(target)) return 999;
   return Math.round((target - base) / 86_400_000);
 }
 
-function formatCompactTime(timeStr: string): string {
+function formatCompactTime(timeStr: string, timeFormat: TimeFormat): string {
   const mins = parseTimeToMinutes(timeStr);
   if (mins === null) return '';
-  const h24 = Math.floor(mins / 60);
-  const m = mins % 60;
-  const suffix = h24 >= 12 ? 'PM' : 'AM';
-  const h12 = h24 % 12 === 0 ? 12 : h24 % 12;
-  return `${h12}:${String(m).padStart(2, '0')} ${suffix}`;
+  return formatTimeDisplay(timeStr, timeFormat);
 }
 
 function buildSuggestionFromTask(task: TaskItem): string {
@@ -168,7 +157,9 @@ function buildSuggestionFromNote(note: NoteItem): string {
 function buildRelevantSuggestions(
   tasks: TaskItem[],
   events: CalendarEvent[],
-  notes: NoteItem[]
+  notes: NoteItem[],
+  timeFormat: TimeFormat,
+  todayDateKey: string
 ): SuggestedCheck[] {
   const now = new Date();
   const nowMinutes = now.getHours() * 60 + now.getMinutes();
@@ -186,18 +177,27 @@ function buildRelevantSuggestions(
   // Score scheduled incomplete tasks by closeness to current time (upcoming preferred over just-passed)
   for (const task of tasks) {
     if (task.completed) continue;
-    const dayOffset = dateKeyToDayOffset(task.dateKey);
+    const hasScheduledDate = !task.isInbox && Boolean(task.dateKey);
+    const dayOffset = hasScheduledDate ? dateKeyToDayOffset(task.dateKey, todayDateKey) : 2;
     const mins = parseTimeToMinutes(task.timeLabel);
-    const deltaMins =
-      mins !== null
+    const deltaMins = hasScheduledDate
+      ? mins !== null
         ? dayOffset * 1440 + (mins - nowMinutes)
-        : dayOffset * 1440 + 720; // unscheduled tasks on today rank after timed ones
+        : dayOffset * 1440 + 720 // unscheduled-time tasks on today rank after timed ones
+      : 2880;
 
     // Upcoming items score directly by minutes away; already-elapsed items get a mild penalty so upcoming wins,
     // while still staying close if all today's times have already passed.
     const score = deltaMins >= -15 ? Math.abs(deltaMins) : Math.abs(deltaMins) + 360;
-    const dayTag =
-      dayOffset === 0 ? (mins !== null ? formatCompactTime(task.timeLabel) : 'Today') : dayOffset === 1 ? 'Tomorrow' : task.dateKey.slice(5);
+    const dayTag = !hasScheduledDate
+      ? task.category || 'Inbox'
+      : dayOffset === 0
+        ? mins !== null
+          ? formatCompactTime(task.timeLabel, timeFormat)
+          : 'Today'
+        : dayOffset === 1
+          ? 'Tmrw'
+          : formatDDMMM(task.dateKey);
 
     candidates.push({
       id: `task-${task.id}`,
@@ -215,12 +215,16 @@ function buildRelevantSuggestions(
   const linkedTaskIds = new Set(tasks.filter((t) => !t.completed).map((t) => t.id));
   for (const ev of events) {
     if (ev.linkedTaskId && linkedTaskIds.has(ev.linkedTaskId)) continue;
-    const dayOffset = dateKeyToDayOffset(ev.dateKey);
+    const dayOffset = dateKeyToDayOffset(ev.dateKey, todayDateKey);
     const mins = parseTimeToMinutes(ev.startTime);
     const deltaMins = mins !== null ? dayOffset * 1440 + (mins - nowMinutes) : dayOffset * 1440 + 720;
     const score = deltaMins >= -15 ? Math.abs(deltaMins) : Math.abs(deltaMins) + 360;
     const dayTag =
-      dayOffset === 0 ? formatCompactTime(ev.startTime) : dayOffset === 1 ? 'Tomorrow' : ev.dateKey.slice(5);
+      dayOffset === 0
+        ? formatCompactTime(ev.startTime, timeFormat)
+        : dayOffset === 1
+          ? 'Tmrw'
+          : formatDDMMM(ev.dateKey);
 
     candidates.push({
       id: `ev-${ev.id}`,
@@ -294,50 +298,66 @@ function formatDomain(uri: string): string {
   }
 }
 
-function renderInlineFormatting(text: string): React.ReactNode {
-  const parts = text.split(/(\*\*[^*]+\*\*)/g);
-  return parts.map((part, idx) => {
-    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
-      return (
-        <strong key={idx} className="font-semibold text-stone-900 dark:text-stone-100">
-          {part.slice(2, -2)}
-        </strong>
-      );
-    }
-    return <React.Fragment key={idx}>{part}</React.Fragment>;
-  });
+const LOOKUP_AGENDA_STORAGE_KEY = 'buh.lookup.includeAgenda.v1';
+const LOOKUP_SCROLL_STORAGE_KEY = 'buh.lookup.scrollState.v1';
+const AT_BOTTOM_THRESHOLD_PX = 100;
+const SHOW_SCROLL_BTN_THRESHOLD_PX = 120;
+
+interface StoredLookupScrollState {
+  atBottom: boolean;
+  scrollTop: number;
 }
 
-function renderStructuredAnswer(answer: string): React.ReactNode {
-  const cleanedAnswer = answer.replace(/!\[[^\]]*\]\(https?:\/\/[^\s)]+\)/gi, '').trim();
-  const lines = cleanedAnswer
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
+function loadLookupAgendaPref(): boolean {
+  if (typeof window === 'undefined') return true;
+  try {
+    const raw = window.localStorage.getItem(LOOKUP_AGENDA_STORAGE_KEY);
+    if (raw === 'false') return false;
+    if (raw === 'true') return true;
+  } catch {
+    // ignore storage errors
+  }
+  return true;
+}
 
-  return (
-    <div className="space-y-2 text-[14.5px] leading-relaxed text-stone-700 dark:text-stone-200 min-w-0 max-w-full break-words [overflow-wrap:anywhere]">
-      {lines.map((line, idx) => {
-        const isBullet = /^[-*•]\s+/.test(line);
-        if (isBullet) {
-          const clean = line.replace(/^[-*•]\s+/, '');
-          return (
-            <div key={idx} className="flex items-start gap-2.5 pl-0.5 min-w-0">
-              <span className="mt-2.5 w-1.5 h-1.5 rounded-full bg-[var(--tf-accent)] shrink-0" />
-              <span className="flex-1 min-w-0 break-words [overflow-wrap:anywhere]">
-                {renderInlineFormatting(clean)}
-              </span>
-            </div>
-          );
-        }
-        return (
-          <p key={idx} className="min-w-0 break-words [overflow-wrap:anywhere]">
-            {renderInlineFormatting(line)}
-          </p>
-        );
-      })}
-    </div>
-  );
+function saveLookupAgendaPref(enabled: boolean): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(LOOKUP_AGENDA_STORAGE_KEY, String(enabled));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function loadLookupScrollState(): StoredLookupScrollState | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(LOOKUP_SCROLL_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<StoredLookupScrollState>;
+    if (
+      typeof parsed.atBottom === 'boolean' &&
+      typeof parsed.scrollTop === 'number' &&
+      Number.isFinite(parsed.scrollTop)
+    ) {
+      return {
+        atBottom: parsed.atBottom,
+        scrollTop: Math.max(0, parsed.scrollTop),
+      };
+    }
+  } catch {
+    // ignore storage errors
+  }
+  return null;
+}
+
+function saveLookupScrollState(state: StoredLookupScrollState): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(LOOKUP_SCROLL_STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
@@ -356,9 +376,11 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   onSaveAsNote,
   onRemoveSavedNote,
 }) => {
+  const timeFormat = useTimeFormat();
   const isOnline = useOnlineStatus();
+  const { todayDateKey } = useTodayDateKey();
   const [promptInput, setPromptInput] = useState('');
-  const [includeAgenda, setIncludeAgenda] = useState(true);
+  const [includeAgenda, setIncludeAgenda] = useState<boolean>(() => loadLookupAgendaPref());
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [selectedEntryId, setSelectedEntryId] = useState<string | null>(null);
@@ -366,35 +388,247 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   const [playingVideoKey, setPlayingVideoKey] = useState<string | null>(null);
   const [lightboxImage, setLightboxImage] = useState<QuickCheckMedia | null>(null);
   const [failedMediaIds, setFailedMediaIds] = useState<Record<string, boolean>>({});
-  const feedEndRef = useRef<HTMLDivElement | null>(null);
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const feedScrollRef = useRef<HTMLDivElement | null>(null);
+  const entryCardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const isAtBottomRef = useRef(true);
+  const lastScrollStateRef = useRef<StoredLookupScrollState>(
+    loadLookupScrollState() ?? { atBottom: true, scrollTop: 0 }
+  );
+  const scrollPersistTimerRef = useRef<number | null>(null);
+  const isRestoringScrollRef = useRef(false);
+  const scrollToLoadingRef = useRef(false);
+  const pendingSnapEntryIdRef = useRef<string | null>(null);
+  const promptInputRef = useRef<HTMLInputElement | null>(null);
 
   useBackLayer(Boolean(lightboxImage), () => setLightboxImage(null), 25);
   useBackLayer(Boolean(playingVideoKey), () => setPlayingVideoKey(null), 15);
+
+  useEffect(() => {
+    saveLookupAgendaPref(includeAgenda);
+  }, [includeAgenda]);
 
   const activeEntry =
     entries.find((e) => e.id === selectedEntryId) || entries[entries.length - 1] || null;
 
   const relevantChecks = useMemo(
-    () => buildRelevantSuggestions(tasks, events, notes),
-    [tasks, events, notes]
+    () => buildRelevantSuggestions(tasks, events, notes, timeFormat, todayDateKey),
+    [tasks, events, notes, timeFormat, todayDateKey]
   );
 
   const markMediaFailed = (key: string) => {
     setFailedMediaIds((prev) => (prev[key] ? prev : { ...prev, [key]: true }));
   };
 
-  useEffect(() => {
-    if (entries.length > 0 && feedEndRef.current) {
-      feedEndRef.current.scrollIntoView({ behavior: 'smooth', block: 'end' });
+  const getDistanceFromBottom = (container: HTMLDivElement | null): number => {
+    if (!container) return 0;
+    return Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight);
+  };
+
+  const isFeedAtBottom = () => {
+    const container = feedScrollRef.current;
+    if (!container) return true;
+    return getDistanceFromBottom(container) <= AT_BOTTOM_THRESHOLD_PX;
+  };
+
+  const getScrollBehavior = (): ScrollBehavior =>
+    typeof window !== 'undefined' &&
+    window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
+      ? 'auto'
+      : 'smooth';
+
+  const flushScrollStateNow = () => {
+    if (scrollPersistTimerRef.current !== null) {
+      window.clearTimeout(scrollPersistTimerRef.current);
+      scrollPersistTimerRef.current = null;
     }
+    const container = feedScrollRef.current;
+    if (container && entries.length > 0 && !isRestoringScrollRef.current) {
+      const distance = getDistanceFromBottom(container);
+      const nextState: StoredLookupScrollState = {
+        atBottom: distance <= AT_BOTTOM_THRESHOLD_PX,
+        scrollTop: container.scrollTop,
+      };
+      lastScrollStateRef.current = nextState;
+    }
+    saveLookupScrollState(lastScrollStateRef.current);
+  };
+
+  const handleFeedScroll = () => {
+    const container = feedScrollRef.current;
+    if (!container) return;
+    const distance = getDistanceFromBottom(container);
+    const atBottom = distance <= AT_BOTTOM_THRESHOLD_PX;
+    isAtBottomRef.current = atBottom;
+    setShowScrollToBottom(entries.length > 0 && distance > SHOW_SCROLL_BTN_THRESHOLD_PX);
+
+    if (isRestoringScrollRef.current) return;
+
+    lastScrollStateRef.current = {
+      atBottom,
+      scrollTop: container.scrollTop,
+    };
+    if (scrollPersistTimerRef.current !== null) {
+      window.clearTimeout(scrollPersistTimerRef.current);
+    }
+    scrollPersistTimerRef.current = window.setTimeout(() => {
+      scrollPersistTimerRef.current = null;
+      saveLookupScrollState(lastScrollStateRef.current);
+    }, 120);
+  };
+
+  const scrollToBottom = () => {
+    const container = feedScrollRef.current;
+    if (!container) return;
+    container.scrollTo({
+      top: container.scrollHeight,
+      behavior: getScrollBehavior(),
+    });
+    isAtBottomRef.current = true;
+    setShowScrollToBottom(false);
+    lastScrollStateRef.current = {
+      atBottom: true,
+      scrollTop: container.scrollHeight,
+    };
+    saveLookupScrollState(lastScrollStateRef.current);
+  };
+
+  // Restore last scroll position when opening the Lookup tab (or start at bottom if none/was at bottom)
+  useLayoutEffect(() => {
+    const container = feedScrollRef.current;
+    if (!container || entries.length === 0) {
+      setShowScrollToBottom(false);
+      isAtBottomRef.current = true;
+      return;
+    }
+
+    const saved = loadLookupScrollState();
+    isRestoringScrollRef.current = true;
+
+    const applySavedPosition = () => {
+      const el = feedScrollRef.current;
+      if (!el) return;
+      if (!saved || saved.atBottom) {
+        el.scrollTop = el.scrollHeight;
+      } else {
+        const maxTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.min(saved.scrollTop, maxTop);
+      }
+      const distance = getDistanceFromBottom(el);
+      isAtBottomRef.current = distance <= AT_BOTTOM_THRESHOLD_PX;
+      setShowScrollToBottom(distance > SHOW_SCROLL_BTN_THRESHOLD_PX);
+      lastScrollStateRef.current = {
+        atBottom: isAtBottomRef.current,
+        scrollTop: el.scrollTop,
+      };
+    };
+
+    applySavedPosition();
+    const frameId = window.requestAnimationFrame(() => {
+      if (!pendingSnapEntryIdRef.current) {
+        applySavedPosition();
+      }
+      isRestoringScrollRef.current = false;
+    });
+
+    return () => {
+      window.cancelAnimationFrame(frameId);
+      isRestoringScrollRef.current = false;
+      flushScrollStateNow();
+    };
+    // Re-run only on mount or posture switch (which remounts the feed scroll container)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posture]);
+
+  // Persist scroll position when backgrounding or closing the app
+  useEffect(() => {
+    const onVisibilityOrHide = () => {
+      if (document.visibilityState === 'hidden') {
+        flushScrollStateNow();
+      }
+    };
+    const onPageHide = () => {
+      flushScrollStateNow();
+    };
+    document.addEventListener('visibilitychange', onVisibilityOrHide);
+    window.addEventListener('pagehide', onPageHide);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityOrHide);
+      window.removeEventListener('pagehide', onPageHide);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [entries.length]);
+
+  // Keep the loading card visible at the bottom when submitting while already at the bottom
+  useEffect(() => {
+    if (!isLoading || !scrollToLoadingRef.current) return;
+    scrollToLoadingRef.current = false;
+    const frameId = window.requestAnimationFrame(() => {
+      const container = feedScrollRef.current;
+      if (!container) return;
+      container.scrollTo({
+        top: container.scrollHeight,
+        behavior: getScrollBehavior(),
+      });
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [isLoading]);
+
+  // Snap to the top of a newly arrived reply if the user was at the bottom, and refresh floating button visibility
+  useEffect(() => {
+    const pendingId = pendingSnapEntryIdRef.current;
+    if (pendingId && entries.some((entry) => entry.id === pendingId)) {
+      pendingSnapEntryIdRef.current = null;
+      const frameId = window.requestAnimationFrame(() => {
+        const container = feedScrollRef.current;
+        const cardEl = entryCardRefs.current.get(pendingId);
+        if (!container || !cardEl) return;
+        const containerRect = container.getBoundingClientRect();
+        const cardRect = cardEl.getBoundingClientRect();
+        const targetTop = Math.max(0, container.scrollTop + (cardRect.top - containerRect.top));
+        container.scrollTo({
+          top: targetTop,
+          behavior: getScrollBehavior(),
+        });
+        const maxTop = Math.max(0, container.scrollHeight - container.clientHeight);
+        const clampedTop = Math.min(targetTop, maxTop);
+        const distanceAfterSnap = Math.max(0, maxTop - clampedTop);
+        isAtBottomRef.current = distanceAfterSnap <= AT_BOTTOM_THRESHOLD_PX;
+        setShowScrollToBottom(distanceAfterSnap > SHOW_SCROLL_BTN_THRESHOLD_PX);
+        lastScrollStateRef.current = {
+          atBottom: isAtBottomRef.current,
+          scrollTop: clampedTop,
+        };
+        saveLookupScrollState(lastScrollStateRef.current);
+      });
+      return () => window.cancelAnimationFrame(frameId);
+    }
+
+    const frameId = window.requestAnimationFrame(() => {
+      const container = feedScrollRef.current;
+      if (!container || entries.length === 0) {
+        setShowScrollToBottom(false);
+        return;
+      }
+      const distance = getDistanceFromBottom(container);
+      isAtBottomRef.current = distance <= AT_BOTTOM_THRESHOLD_PX;
+      setShowScrollToBottom(distance > SHOW_SCROLL_BTN_THRESHOLD_PX);
+    });
+    return () => window.cancelAnimationFrame(frameId);
+  }, [entries]);
 
   useEffect(() => {
     const vv = typeof window !== 'undefined' ? window.visualViewport : null;
     if (!vv) return;
     const onResize = () => {
-      if (entries.length > 0 && feedEndRef.current) {
-        feedEndRef.current.scrollIntoView({ block: 'end' });
+      if (
+        entries.length > 0 &&
+        isAtBottomRef.current &&
+        !pendingSnapEntryIdRef.current &&
+        document.activeElement === promptInputRef.current &&
+        feedScrollRef.current
+      ) {
+        feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight;
       }
     };
     vv.addEventListener('resize', onResize);
@@ -407,12 +641,12 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       .slice(0, 6)
       .map((t) => `- ${t.title} (${t.timeLabel}, ${t.category}, ${t.priority})`);
     const todayEvents = events
-      .filter((e) => e.dateKey === TODAY_DATE_KEY)
+      .filter((e) => e.dateKey === todayDateKey)
       .map((e) => `- ${e.startTime}-${e.endTime}: ${e.title}${e.location ? ` (${e.location})` : ''}`);
 
     return [
       activeTasks.length > 0 ? `Tasks:\n${activeTasks.join('\n')}` : '',
-      todayEvents.length > 0 ? `Schedule (Today, ${TODAY_DATE_KEY}):\n${todayEvents.join('\n')}` : '',
+      todayEvents.length > 0 ? `Schedule (Today, ${todayDateKey}):\n${todayEvents.join('\n')}` : '',
     ]
       .filter(Boolean)
       .join('\n\n');
@@ -429,13 +663,13 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     };
 
     const matchedTasks = tasks.filter((t) =>
-      matchesText(`${t.title} ${t.notes} ${t.category} ${t.subtasks.map((s) => s.title).join(' ')}`)
+      matchesText(`${t.title} ${t.notes} ${t.subtasks.map((s) => s.title).join(' ')}`)
     );
     const matchedEvents = events.filter((e) =>
-      matchesText(`${e.title} ${e.location || ''} ${e.calendarName}`)
+      matchesText(`${e.title} ${e.location || ''}`)
     );
     const matchedNotes = notes.filter((n) =>
-      matchesText(`${n.title} ${n.folder} ${n.blocks.map((b) => b.text).join(' ')}`)
+      matchesText(`${n.title} ${n.blocks.map((b) => b.text).join(' ')}`)
     );
 
     const lines: string[] = [];
@@ -465,7 +699,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         : `Offline workspace lookup found no saved tasks, schedule items, or notes matching "${query}". Live web search will resume automatically when you reconnect.`;
 
     const now = new Date();
-    const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const timeStr = formatClockDate(now, timeFormat);
     const created: QuickCheckEntry = {
       id: `qc-offline-${Date.now()}`,
       prompt: query,
@@ -476,6 +710,9 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       timestamp: `${timeStr} · Offline`,
       usedAgenda: true,
     };
+    if (isFeedAtBottom()) {
+      pendingSnapEntryIdRef.current = created.id;
+    }
     onAddEntry(created);
     setSelectedEntryId(created.id);
     setPlayingVideoKey(null);
@@ -492,6 +729,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       return;
     }
 
+    scrollToLoadingRef.current = isFeedAtBottom();
     setIsLoading(true);
     setPromptInput('');
 
@@ -524,7 +762,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       }
 
       const now = new Date();
-      const timeStr = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const timeStr = formatClockDate(now, timeFormat);
       const created: QuickCheckEntry = {
         id: `qc-${Date.now()}`,
         prompt: query,
@@ -535,6 +773,9 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
         timestamp: timeStr,
         usedAgenda: includeAgenda,
       };
+      if (isFeedAtBottom()) {
+        pendingSnapEntryIdRef.current = created.id;
+      }
       onAddEntry(created);
       setSelectedEntryId(created.id);
       setPlayingVideoKey(null);
@@ -583,6 +824,10 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
               setPlayingVideoKey(null);
               setLightboxImage(null);
               setErrorMsg(null);
+              setShowScrollToBottom(false);
+              isAtBottomRef.current = true;
+              lastScrollStateRef.current = { atBottom: true, scrollTop: 0 };
+              saveLookupScrollState(lastScrollStateRef.current);
             }}
             aria-label="Clear quick checks"
             title="Clear history"
@@ -599,18 +844,30 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     <form
       onSubmit={(e) => {
         e.preventDefault();
+        if (!promptInput.trim() || isLoading) return;
         runQuickCheck(promptInput);
+        promptInputRef.current?.blur();
       }}
       className={`flex items-center gap-2 pt-2 border-t ${tokens.divider} shrink-0 w-full min-w-0`}
     >
       <input
+        ref={promptInputRef}
         type="text"
+        enterKeyHint="send"
         value={promptInput}
         onChange={(e) => setPromptInput(e.target.value)}
         onFocus={() => {
+          const wasAtBottom = isFeedAtBottom();
+          isAtBottomRef.current = wasAtBottom;
+          if (!wasAtBottom) return;
           window.setTimeout(() => {
-            if (entries.length > 0 && feedEndRef.current) {
-              feedEndRef.current.scrollIntoView({ block: 'end' });
+            if (
+              entries.length > 0 &&
+              isAtBottomRef.current &&
+              !pendingSnapEntryIdRef.current &&
+              feedScrollRef.current
+            ) {
+              feedScrollRef.current.scrollTop = feedScrollRef.current.scrollHeight;
             }
           }, 180);
         }}
@@ -625,6 +882,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
       />
       <button
         type="submit"
+        onMouseDown={(e) => e.preventDefault()}
         disabled={isLoading || !promptInput.trim()}
         aria-label="Run lookup"
         className={`inline-flex items-center justify-center px-3.5 py-2.5 text-[14px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} disabled:opacity-45 shrink-0 transition-opacity`}
@@ -828,7 +1086,18 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
     return (
       <div
         key={entry.id}
-        onClick={() => setSelectedEntryId(entry.id)}
+        ref={(el) => {
+          if (el) {
+            entryCardRefs.current.set(entry.id, el);
+          } else {
+            entryCardRefs.current.delete(entry.id);
+          }
+        }}
+        onClick={() => {
+          const selected = window.getSelection?.()?.toString();
+          if (selected && selected.length > 0) return;
+          setSelectedEntryId(entry.id);
+        }}
         className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 space-y-2.5 min-w-0 max-w-full overflow-hidden transition-colors ${
           posture === FoldPosture.Inner && isActive ? 'ring-1 ring-[var(--tf-accent-border)]' : ''
         }`}
@@ -842,7 +1111,7 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
           </span>
         </div>
 
-        {renderStructuredAnswer(entry.answer)}
+        <LookupMarkdown content={entry.answer} />
 
         {compactSources && renderMediaSection(entry, 'inline')}
 
@@ -1095,48 +1364,69 @@ export const QuickCheckScreen: React.FC<QuickCheckScreenProps> = ({
   };
 
   const renderFeedBody = (compactSources: boolean) => (
-    <div className="flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden device-scroll space-y-3 pr-0.5">
-      {savedFeedback && (
-        <div
-          className={`flex items-center gap-2 px-3 py-2 text-[13px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius}`}
-        >
-          <Check className="w-4 h-4 shrink-0" />
-          <span className="min-w-0 break-words">{savedFeedback}</span>
-        </div>
-      )}
+    <div className="relative flex-1 min-h-0 min-w-0 max-w-full flex flex-col overflow-hidden">
+      <div
+        ref={feedScrollRef}
+        onScroll={handleFeedScroll}
+        className="flex-1 min-h-0 min-w-0 max-w-full overflow-y-auto overflow-x-hidden device-scroll space-y-3 pr-0.5"
+      >
+        {savedFeedback && (
+          <div
+            className={`flex items-center gap-2 px-3 py-2 text-[13px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius}`}
+          >
+            <Check className="w-4 h-4 shrink-0" />
+            <span className="min-w-0 break-words">{savedFeedback}</span>
+          </div>
+        )}
 
-      {!isOnline && (
-        <div
-          className={`flex items-start gap-2.5 px-3 py-2.5 ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-600 dark:text-stone-300 text-[13px] min-w-0`}
-        >
-          <WifiOff className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
-          <span className="leading-snug min-w-0 break-words">
-            Offline — live web search resumes when connected. You can search saved tasks, notes, and schedule below or review past lookups.
-          </span>
-        </div>
-      )}
+        {!isOnline && (
+          <div
+            className={`flex items-start gap-2.5 px-3 py-2.5 ${tokens.subtleBg} ${tokens.buttonRadius} text-stone-600 dark:text-stone-300 text-[13px] min-w-0`}
+          >
+            <WifiOff className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+            <span className="leading-snug min-w-0 break-words">
+              Offline — live web search resumes when connected. You can search saved tasks, notes, and schedule below or review past lookups.
+            </span>
+          </div>
+        )}
 
-      {errorMsg && (
-        <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-[13.5px] min-w-0">
-          <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-          <span className="leading-snug min-w-0 break-words [overflow-wrap:anywhere]">{errorMsg}</span>
-        </div>
-      )}
+        {errorMsg && (
+          <div className="flex items-start gap-2.5 px-3.5 py-3 rounded-xl bg-rose-500/10 border border-rose-500/30 text-rose-700 dark:text-rose-300 text-[13.5px] min-w-0">
+            <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+            <span className="leading-snug min-w-0 break-words [overflow-wrap:anywhere]">{errorMsg}</span>
+          </div>
+        )}
 
-      {entries.length === 0 && !isLoading ? (
-        <div className="pt-0.5 min-w-0 max-w-full">{renderStarterChips()}</div>
-      ) : (
-        <div className="space-y-3 min-w-0 max-w-full">
-          {entries.map((entry) => renderEntryCard(entry, compactSources))}
-          {isLoading && (
-            <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 flex items-center gap-2.5 text-[14px] text-stone-500 dark:text-stone-400`}>
-              <Loader2 className={`w-4 h-4 animate-spin ${tokens.accentText}`} />
-              <span>Checking live web results...</span>
-            </div>
-          )}
-          <div ref={feedEndRef} />
-        </div>
-      )}
+        {entries.length === 0 && !isLoading ? (
+          <div className="pt-0.5 min-w-0 max-w-full">{renderStarterChips()}</div>
+        ) : (
+          <div className="space-y-3 min-w-0 max-w-full">
+            {entries.map((entry) => renderEntryCard(entry, compactSources))}
+            {isLoading && (
+              <div className={`${tokens.cardBg} ${tokens.cardRadius} p-3.5 flex items-center gap-2.5 text-[14px] text-stone-500 dark:text-stone-400`}>
+                <Loader2 className={`w-4 h-4 animate-spin ${tokens.accentText}`} />
+                <span>Checking live web results...</span>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <button
+        type="button"
+        onClick={scrollToBottom}
+        tabIndex={showScrollToBottom ? 0 : -1}
+        aria-hidden={!showScrollToBottom}
+        aria-label="Scroll to bottom"
+        title="Scroll to bottom"
+        className={`absolute bottom-2.5 right-2.5 z-20 w-8 h-8 rounded-full flex items-center justify-center ${tokens.cardBg} border ${tokens.divider} shadow-md text-stone-700 dark:text-stone-200 hover:text-[var(--tf-accent-text)] active:scale-95 transition-all duration-150 ${
+          showScrollToBottom
+            ? 'opacity-100 translate-y-0 pointer-events-auto'
+            : 'opacity-0 translate-y-1.5 pointer-events-none'
+        }`}
+      >
+        <ArrowDown className="w-4 h-4" />
+      </button>
     </div>
   );
 

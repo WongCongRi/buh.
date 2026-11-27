@@ -15,10 +15,10 @@ export const INITIAL_DECISIONS: DesignDecisions = {
   navMode: NavMode.Five,
   quickCapture: QuickCaptureMode.Fab,
   defaultHome: DefaultHome.Dashboard,
-  accentColor: '#7BB6E0',
+  accentColor: '#C7DFF1',
 };
 
-export const INITIAL_RECENT_COLORS: string[] = ['#7BB6E0'];
+export const INITIAL_RECENT_COLORS: string[] = ['#C7DFF1'];
 
 function formatLocalDateKey(date: Date): string {
   const y = date.getFullYear();
@@ -36,9 +36,6 @@ export function getTomorrowDateKey(): string {
   return formatLocalDateKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1));
 }
 
-export const TODAY_DATE_KEY = getTodayDateKey();
-export const TOMORROW_DATE_KEY = getTomorrowDateKey();
-
 export const INITIAL_LISTS: string[] = ['Work', 'Projects', 'Personal'];
 export const INITIAL_NOTE_FOLDERS: string[] = ['Work', 'Projects', 'Personal'];
 
@@ -54,6 +51,7 @@ export const INITIAL_SETTINGS: AppSettingsState = {
   reminderSound: true,
   completedTaskHistoryYears: 0,
   completedTaskHistoryMonths: 0,
+  timeFormat: '24h',
 };
 
 export const INITIAL_TASKS: TaskItem[] = [];

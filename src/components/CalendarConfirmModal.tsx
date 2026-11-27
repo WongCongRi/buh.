@@ -1,5 +1,9 @@
 import React from 'react';
-import { Calendar, Loader2, Trash2, X } from 'lucide-react';
+import { Calendar, Loader2, Repeat, Trash2, X } from 'lucide-react';
+import { RecurrenceRule } from '../types/taskflow';
+import { formatDDMMYYYY } from '../utils/dateLabels';
+import { formatRecurrenceLabel } from '../utils/recurrence';
+import { formatTimeDisplay, useTimeFormat } from '../utils/timeFormat';
 import { StyleThemeTokens } from '../utils/themeTokens';
 import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
@@ -12,6 +16,7 @@ export type PendingCalendarMutation =
       startTime: string;
       endTime: string;
       calendarName: string;
+      recurrence?: RecurrenceRule;
     }
   | {
       action: 'delete';
@@ -39,6 +44,7 @@ export const CalendarConfirmModal: React.FC<CalendarConfirmModalProps> = ({
   onConfirm,
   onSaveLocalOnly,
 }) => {
+  const timeFormat = useTimeFormat();
   useBackLayer(
     Boolean(pending),
     () => {
@@ -89,13 +95,19 @@ export const CalendarConfirmModal: React.FC<CalendarConfirmModalProps> = ({
           <p className="text-xs font-semibold text-stone-900 dark:text-stone-100 break-words">
             {pending.title}
           </p>
-          <p className="text-[11px] font-mono-tabular text-stone-500 dark:text-stone-400">
+          <p className="text-[12px] tabular-nums text-stone-500 dark:text-stone-400">
             {isDelete
-              ? `${pending.dateKey} · ${pending.startTime}`
+              ? `${formatDDMMYYYY(pending.dateKey)} · ${formatTimeDisplay(pending.startTime, timeFormat)}`
               : pending.endDateKey && pending.endDateKey !== pending.dateKey
-                ? `${pending.dateKey} ${pending.startTime} – ${pending.endDateKey} ${pending.endTime}`
-                : `${pending.dateKey} · ${pending.startTime} – ${pending.endTime}`}
+                ? `${formatDDMMYYYY(pending.dateKey)} ${formatTimeDisplay(pending.startTime, timeFormat)} – ${formatDDMMYYYY(pending.endDateKey)} ${formatTimeDisplay(pending.endTime, timeFormat)}`
+                : `${formatDDMMYYYY(pending.dateKey)} · ${formatTimeDisplay(pending.startTime, timeFormat)} – ${formatTimeDisplay(pending.endTime, timeFormat)}`}
           </p>
+          {!isDelete && pending.recurrence && (
+            <p className={`inline-flex items-center gap-1 text-[11px] font-medium ${tokens.accentText} pt-0.5`}>
+              <Repeat className="w-3 h-3 shrink-0" />
+              {formatRecurrenceLabel(pending.recurrence)}
+            </p>
+          )}
         </div>
 
         <p className="text-[11px] text-stone-600 dark:text-stone-300 leading-relaxed">

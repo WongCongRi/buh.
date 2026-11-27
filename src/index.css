@@ -6,12 +6,12 @@
     --font-display: "Plus Jakarta Sans", system-ui, -apple-system, sans-serif;
     --font-sans: "DM Sans", system-ui, -apple-system, sans-serif;
     --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
-    --tf-accent: #7BB6E0;
-    --tf-accent-hover: #6AA5CF;
+    --tf-accent: #C7DFF1;
+    --tf-accent-hover: #B5CBDD;
     --tf-accent-fg: #0F172A;
-    --tf-accent-text: #2A648F;
-    --tf-accent-soft: rgba(123, 182, 224, 0.15);
-    --tf-accent-border: rgba(123, 182, 224, 0.48);
+    --tf-accent-text: #5E6D7C;
+    --tf-accent-soft: rgba(199, 223, 241, 0.15);
+    --tf-accent-border: rgba(199, 223, 241, 0.48);
   }
 
   html {
@@ -37,6 +37,7 @@
     font-size: 17px;
     height: 100%;
     overflow: hidden;
+    scroll-behavior: auto;
   }
 
   html.buh-standalone body {
@@ -56,6 +57,18 @@
     overflow-x: hidden;
     max-width: 100%;
     background-color: #FAFAF8;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+  }
+
+  input,
+  textarea,
+  [contenteditable]:not([contenteditable="false"]),
+  [contenteditable]:not([contenteditable="false"]) * {
+    user-select: text;
+    -webkit-user-select: text;
+    -webkit-touch-callout: default;
   }
 
   html.dark body {
@@ -65,6 +78,7 @@
   button,
   a {
     touch-action: manipulation;
+    -webkit-tap-highlight-color: transparent;
   }
 
   h1, h2, h3, .font-display {
@@ -79,6 +93,13 @@
 
 .tabular-nums {
   font-variant-numeric: tabular-nums;
+}
+
+.select-text-callout,
+.select-text-callout * {
+  user-select: text;
+  -webkit-user-select: text;
+  -webkit-touch-callout: default;
 }
 
 /* Subtle internal device scrollbar */
@@ -98,6 +119,140 @@
 
 .dark .device-scroll::-webkit-scrollbar-thumb {
   background: rgba(180, 185, 180, 0.22);
+}
+
+@keyframes calFadeIn {
+  from {
+    opacity: 0;
+    transform: translate3d(0, -4px, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes calSlideFromRight {
+  from {
+    opacity: 0;
+    transform: translate3d(20px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+@keyframes calSlideFromLeft {
+  from {
+    opacity: 0;
+    transform: translate3d(-20px, 0, 0);
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.cal-fade-in {
+  animation: calFadeIn 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.cal-slide-next {
+  animation: calSlideFromRight 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.cal-slide-prev {
+  animation: calSlideFromLeft 180ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes taskCheckPop {
+  0% {
+    transform: scale(0.82);
+  }
+  55% {
+    transform: scale(1.16);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+@keyframes taskCheckDraw {
+  0% {
+    stroke-dashoffset: 1;
+    opacity: 0.4;
+  }
+  100% {
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+@keyframes taskCheckRipple {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.72;
+  }
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+@keyframes taskStrikeSweep {
+  0% {
+    transform: scaleX(0);
+  }
+  100% {
+    transform: scaleX(1);
+  }
+}
+
+@keyframes taskRowSettle {
+  0% {
+    opacity: 0.55;
+    transform: translate3d(0, -5px, 0);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0);
+  }
+}
+
+.task-check-pop {
+  animation: taskCheckPop 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.task-check-draw {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 0;
+  animation: taskCheckDraw 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.task-check-ripple {
+  animation: taskCheckRipple 380ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.task-strike-sweep {
+  position: relative;
+}
+
+.task-strike-sweep::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 52%;
+  height: 1.5px;
+  border-radius: 9999px;
+  background-color: currentColor;
+  transform-origin: left center;
+  animation: taskStrikeSweep 280ms cubic-bezier(0.16, 1, 0.3, 1) 45ms both;
+}
+
+.task-row-settle {
+  animation: taskRowSettle 230ms cubic-bezier(0.16, 1, 0.3, 1) both;
 }
 
 @media (prefers-reduced-motion: reduce) {

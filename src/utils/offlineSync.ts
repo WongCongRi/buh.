@@ -1,4 +1,11 @@
-import { CalendarEvent, GoogleTaskListInfo, TaskItem, TaskPriority, TaskReminder } from '../types/taskflow';
+import {
+  CalendarEvent,
+  GoogleTaskListInfo,
+  RecurrenceRule,
+  TaskItem,
+  TaskPriority,
+  TaskReminder,
+} from '../types/taskflow';
 import type { QuickCheckEntry } from '../components/screens/QuickCheckScreen';
 
 const GOOGLE_CACHE_STORAGE_KEY = 'buh_offline_google_cache_v1';
@@ -18,6 +25,8 @@ export type OfflineSyncOp =
         taskListId?: string;
         category?: string;
         reminders?: TaskReminder[];
+        recurrence?: RecurrenceRule;
+        recurrenceSeriesId?: string;
       };
       createdAt: number;
     }
@@ -26,6 +35,7 @@ export type OfflineSyncOp =
       type: 'gtask-update';
       taskId: string;
       task: TaskItem;
+      baseTask?: TaskItem;
       createdAt: number;
     }
   | {
@@ -47,6 +57,7 @@ export type OfflineSyncOp =
         startTime: string;
         endTime: string;
         calendarName: string;
+        recurrence?: RecurrenceRule;
       };
       createdAt: number;
     }
@@ -162,6 +173,8 @@ export function enqueueSyncOp(queue: OfflineSyncOp[], op: OfflineSyncOp): Offlin
             priority: op.task.priority,
             category: op.task.category,
             reminders: op.task.reminders,
+            recurrence: op.task.recurrence,
+            recurrenceSeriesId: op.task.recurrenceSeriesId,
           },
         };
         // Also keep a follow-up update if the user completed an offline-created task before syncing
@@ -175,11 +188,18 @@ export function enqueueSyncOp(queue: OfflineSyncOp[], op: OfflineSyncOp): Offlin
       }
     }
 
-    // Replace any earlier pending update for the same task
+    // Replace any earlier pending update for the same task, preserving its original pre-edit baseTask
+    const earlierUpdate = queue.find(
+      (item): item is Extract<OfflineSyncOp, { type: 'gtask-update' }> =>
+        item.type === 'gtask-update' && item.taskId === op.taskId
+    );
+    const mergedOp: OfflineSyncOp = earlierUpdate?.baseTask
+      ? { ...op, baseTask: earlierUpdate.baseTask }
+      : op;
     const filtered = queue.filter(
       (item) => !(item.type === 'gtask-update' && item.taskId === op.taskId)
     );
-    return [...filtered, op];
+    return [...filtered, mergedOp];
   }
 
   if (op.type === 'gtask-delete') {

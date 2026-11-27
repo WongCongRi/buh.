@@ -1,6 +1,9 @@
 import React from 'react';
-import { CheckSquare, Loader2, RefreshCw, Trash2, X } from 'lucide-react';
+import { CheckSquare, Loader2, RefreshCw, Repeat, Trash2, X } from 'lucide-react';
 import { TaskItem } from '../types/taskflow';
+import { formatDDMMYYYY } from '../utils/dateLabels';
+import { formatRecurrenceLabel } from '../utils/recurrence';
+import { formatTimeDisplay, useTimeFormat } from '../utils/timeFormat';
 import { StyleThemeTokens } from '../utils/themeTokens';
 import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 
@@ -42,6 +45,7 @@ export const GoogleTaskConfirmModal: React.FC<GoogleTaskConfirmModalProps> = ({
   onConfirm,
   onSaveLocalOnly,
 }) => {
+  const timeFormat = useTimeFormat();
   useBackLayer(
     Boolean(pending),
     () => {
@@ -132,8 +136,19 @@ export const GoogleTaskConfirmModal: React.FC<GoogleTaskConfirmModalProps> = ({
           </p>
           <p className="text-[11px] font-mono-tabular text-stone-500 dark:text-stone-400">
             {listLabel}
-            {!pending.task.isInbox && pending.task.dateKey ? ` · ${pending.task.dateKey}` : ''}
+            {!pending.task.isInbox && pending.task.dateKey
+              ? ` · ${formatDDMMYYYY(pending.task.dateKey)}`
+              : ''}
+            {pending.task.timeLabel && pending.task.timeLabel !== 'No time set'
+              ? ` · ${formatTimeDisplay(pending.task.timeLabel, timeFormat)}`
+              : ''}
           </p>
+          {pending.task.recurrence && (
+            <p className={`inline-flex items-center gap-1 text-[11px] font-medium ${tokens.accentText} pt-0.5`}>
+              <Repeat className="w-3 h-3 shrink-0" />
+              {formatRecurrenceLabel(pending.task.recurrence)}
+            </p>
+          )}
         </div>
 
         <p className="text-[11px] text-stone-600 dark:text-stone-300 leading-relaxed">

@@ -39,6 +39,7 @@ export const HighlightedText: React.FC<HighlightedTextProps> = ({
         return (
           <mark
             key={i}
+            data-search-match="true"
             className="bg-[var(--tf-accent-soft)] text-[var(--tf-accent-text)] rounded-xs px-0.5 font-semibold ring-1 ring-[var(--tf-accent-border)]"
           >
             {part}

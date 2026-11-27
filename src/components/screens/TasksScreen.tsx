@@ -1,10 +1,14 @@
-import React, { useEffect, useState } from 'react';
-import { Bell, Check, ChevronRight, RefreshCw } from 'lucide-react';
-import { TODAY_DATE_KEY } from '../../data/initialData';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ChevronRight, RefreshCw } from 'lucide-react';
+import { useTaskCompletionAnimation } from '../../hooks/useTaskCompletionAnimation';
+import { useTodayDateKey } from '../../hooks/useTodayDateKey';
 import { FoldPosture, GoogleTasksSyncState, TaskItem } from '../../types/taskflow';
+import { scrollElementIntoContainer } from '../../utils/scrollToMatch';
 import { StyleThemeTokens } from '../../utils/themeTokens';
 import { GoogleSignInButton } from '../GoogleSignInButton';
 import { HighlightedText } from '../HighlightedText';
+import { TaskCheckbox } from '../TaskCheckbox';
+import { TaskMetaRow } from '../TaskMetaRow';
 import { TaskDetailPane } from './TaskDetailPane';
 import { TaskDetailSheet } from './TaskDetailSheet';
 
@@ -19,6 +23,7 @@ interface TasksScreenProps {
   googleTasks: GoogleTasksSyncState;
   highlightedTaskId?: string | null;
   highlightQuery?: string;
+  highlightTrigger?: number;
   onDismissHighlight?: () => void;
   onSelectTask: (id: string | null) => void;
   onToggleTask: (id: string) => void;
@@ -41,6 +46,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   googleTasks,
   highlightedTaskId = null,
   highlightQuery = '',
+  highlightTrigger,
   onDismissHighlight,
   onSelectTask,
   onToggleTask,
@@ -49,8 +55,10 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
   onSyncGoogleTask,
   onPushLocalTaskToGoogle,
 }) => {
+  const { todayDateKey } = useTodayDateKey();
   const [filter, setFilter] = useState<TaskFilter>('all');
   const [listFilter, setListFilter] = useState<string>('ALL');
+  const taskListScrollRef = useRef<HTMLDivElement | null>(null);
 
   // Ensure a global-search target is visible in the current status/list filter
   useEffect(() => {
@@ -65,30 +73,52 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [highlightedTaskId, highlightQuery]);
+  }, [highlightedTaskId, highlightQuery, highlightTrigger]);
 
-  // Keep checked-off tasks visible and shifted to the bottom of the list
-  const filteredTasks = tasks
-    .filter((t) => {
-      if (listFilter !== 'ALL' && t.category !== listFilter) {
-        return false;
-      }
+  useEffect(() => {
+    if (!highlightedTaskId || !highlightQuery.trim()) return;
+    const raf = window.requestAnimationFrame(() => {
+      const container = taskListScrollRef.current;
+      if (!container) return;
+      const escapedId =
+        typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+          ? CSS.escape(highlightedTaskId)
+          : highlightedTaskId.replace(/["\\]/g, '\\$&');
+      const row = container.querySelector<HTMLElement>(`[data-task-id="${escapedId}"]`);
+      scrollElementIntoContainer(container, row, 'smooth');
+    });
+    return () => window.cancelAnimationFrame(raf);
+  }, [highlightedTaskId, highlightQuery, highlightTrigger, filter, listFilter]);
 
-      switch (filter) {
-        case 'today':
-          return !t.isInbox && t.dateKey === TODAY_DATE_KEY;
-        case 'inbox':
-          return t.isInbox;
-        case 'high':
-          return t.priority === 'High';
-        case 'done':
-          return t.completed;
-        case 'all':
-        default:
-          return true;
-      }
-    })
-    .sort((a, b) => Number(a.completed) - Number(b.completed));
+  const { celebratingIds, justSettledIds, compareWithCompletionHold } =
+    useTaskCompletionAnimation(tasks);
+
+  // Keep checked-off tasks visible and settle them to the bottom after their brief completion animation
+  const filteredTasks = useMemo(
+    () =>
+      tasks
+        .filter((t) => {
+          if (listFilter !== 'ALL' && t.category !== listFilter) {
+            return false;
+          }
+
+          switch (filter) {
+            case 'today':
+              return !t.isInbox && t.dateKey === todayDateKey;
+            case 'inbox':
+              return t.isInbox;
+            case 'high':
+              return t.priority === 'High';
+            case 'done':
+              return t.completed;
+            case 'all':
+            default:
+              return true;
+          }
+        })
+        .sort(compareWithCompletionHold),
+    [tasks, listFilter, filter, todayDateKey, compareWithCompletionHold]
+  );
 
   const selectedTask =
     tasks.find((t) => t.id === selectedTaskId) ||
@@ -102,14 +132,18 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
     { id: 'done', label: 'Done' },
   ];
 
-  const allListOptions = Array.from(
-    new Set([
-      ...taskLists,
-      ...(googleTasksSync && googleTasks.isConnected
-        ? googleTasks.taskLists.map((l) => l.title)
-        : []),
-      'Inbox',
-    ])
+  const allListOptions = useMemo(
+    () =>
+      Array.from(
+        new Set([
+          ...taskLists,
+          ...(googleTasksSync && (googleTasks.isConnected || Boolean(googleTasks.userEmail))
+            ? googleTasks.taskLists.map((l) => l.title)
+            : []),
+          'Inbox',
+        ])
+      ),
+    [taskLists, googleTasksSync, googleTasks.isConnected, googleTasks.userEmail, googleTasks.taskLists]
   );
 
   const renderList = () => (
@@ -119,31 +153,38 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
           <h2 className={`font-display font-semibold text-stone-900 dark:text-stone-100 ${tokens.headingScale}`}>
             Tasks
           </h2>
-          {googleTasksSync && googleTasks.isConnected && (
+          {googleTasksSync && (googleTasks.isConnected || googleTasks.userEmail) && (
             <>
               <span className="text-[12px] text-stone-400 dark:text-stone-500 truncate">
                 · Google
               </span>
               <button
                 type="button"
-                disabled={googleTasks.isSyncing}
-                onClick={() => googleTasks.onSyncNow()}
-                title="Sync Google Tasks"
-                aria-label="Sync Google Tasks"
-                className="p-1 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
+                disabled={googleTasks.isSyncing || googleTasks.isSigningIn}
+                onClick={() => void googleTasks.onSyncNow()}
+                title={googleTasks.isConnected ? 'Sync Google Tasks' : 'Refresh Google Tasks'}
+                aria-label={googleTasks.isConnected ? 'Sync Google Tasks' : 'Refresh Google Tasks'}
+                className="relative p-1 text-stone-400 hover:text-[var(--tf-accent-text)] transition-colors disabled:opacity-50"
               >
-                <RefreshCw className={`w-4 h-4 ${googleTasks.isSyncing ? 'animate-spin' : ''}`} />
+                <RefreshCw
+                  className={`w-4 h-4 ${
+                    googleTasks.isSyncing || googleTasks.isSigningIn ? 'animate-spin' : ''
+                  }`}
+                />
+                {!googleTasks.isConnected && (googleTasks.pendingSyncCount ?? 0) > 0 && (
+                  <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-amber-500" />
+                )}
               </button>
             </>
           )}
         </div>
         <div className="flex items-center gap-2 shrink-0">
-          {googleTasksSync && !googleTasks.isConnected && (
+          {googleTasksSync && !googleTasks.isConnected && !googleTasks.userEmail && (
             <GoogleSignInButton
               compact
               onClick={() => googleTasks.onSignIn()}
               loading={googleTasks.isSigningIn}
-              label={googleTasks.userEmail ? 'Reconnect' : 'Connect'}
+              label="Connect"
             />
           )}
           <select
@@ -211,78 +252,52 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
           filteredTasks.map((task) => {
             const isSelected = selectedTask?.id === task.id;
             const isHighlighted = highlightedTaskId === task.id && Boolean(highlightQuery.trim());
+            const isCelebrating = celebratingIds.has(task.id);
+            const isSettling = justSettledIds.has(task.id);
             return (
               <div
                 key={task.id}
+                data-task-id={task.id}
                 className={`flex items-center gap-3 ${tokens.rowPadding} border-b last:border-b-0 ${tokens.divider} transition-colors ${
                   isSelected ? tokens.accentSoftBg : ''
-                }`}
+                } ${isSettling ? 'task-row-settle' : ''}`}
               >
-                <button
-                  type="button"
+                <TaskCheckbox
+                  checked={task.completed}
+                  celebrating={isCelebrating}
+                  tokens={tokens}
+                  ariaLabel={
+                    task.completed ? `Mark ${task.title} incomplete` : `Complete ${task.title}`
+                  }
                   onClick={() => onToggleTask(task.id)}
-                  className={`w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 transition-colors ${
-                    task.completed
-                      ? `${tokens.accentBg} border-transparent`
-                      : 'border-stone-300 dark:border-stone-600'
-                  }`}
-                  aria-label={`Toggle ${task.title}`}
-                >
-                  {task.completed && <Check className="w-3 h-3" />}
-                </button>
+                />
                 <button
                   type="button"
                   onClick={() => onSelectTask(task.id)}
                   className="flex-1 min-w-0 text-left"
                 >
                   <p
-                    className={`text-[15px] font-medium truncate leading-snug ${
-                      task.completed ? 'line-through text-stone-400' : 'text-stone-900 dark:text-stone-100'
+                    className={`text-[15px] font-medium truncate leading-snug transition-colors duration-250 ${
+                      task.completed ? 'text-stone-400' : 'text-stone-900 dark:text-stone-100'
                     }`}
                   >
-                    <HighlightedText text={task.title} query={highlightQuery} active={isHighlighted} />
-                  </p>
-                  <div className="flex items-center gap-1.5 mt-0.5 text-[12.5px] text-stone-500 dark:text-stone-400 tabular-nums flex-wrap">
-                    <span>{task.timeLabel}</span>
-                    <span aria-hidden="true">·</span>
-                    <span>
-                      <HighlightedText text={task.category} query={highlightQuery} active={isHighlighted} />
+                    <span
+                      className={`inline-block max-w-full truncate align-bottom ${
+                        isCelebrating
+                          ? 'task-strike-sweep'
+                          : task.completed
+                            ? 'line-through'
+                            : ''
+                      }`}
+                    >
+                      <HighlightedText text={task.title} query={highlightQuery} active={isHighlighted} />
                     </span>
-                    {task.subtasks.length > 0 && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span>
-                          {task.subtasks.filter((s) => s.done).length}/{task.subtasks.length} steps
-                        </span>
-                      </>
-                    )}
-                    {task.priority === 'High' && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span className={`font-medium ${tokens.accentText}`}>High</span>
-                      </>
-                    )}
-                    {(task.reminders?.length ?? 0) > 0 && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span
-                          className={`inline-flex items-center gap-0.5 ${tokens.accentText}`}
-                          title={`${task.reminders!.length} notification${task.reminders!.length > 1 ? 's' : ''}`}
-                        >
-                          <Bell className="w-3.5 h-3.5" />
-                          {task.reminders!.length > 1 && <span>{task.reminders!.length}</span>}
-                        </span>
-                      </>
-                    )}
-                    {task.source === 'google' && (
-                      <>
-                        <span aria-hidden="true">·</span>
-                        <span className={`font-medium ${tokens.accentText}`}>
-                          {googleTasks.dirtyTaskIds.includes(task.id) ? 'Google · Unsynced' : 'Google'}
-                        </span>
-                      </>
-                    )}
-                  </div>
+                  </p>
+                  <TaskMetaRow
+                    task={task}
+                    tokens={tokens}
+                    isDirtyGoogle={googleTasks.dirtyTaskIds.includes(task.id)}
+                  />
                 </button>
                 <button
                   type="button"
@@ -302,18 +317,20 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
 
   const detailHighlight = selectedTask && highlightedTaskId === selectedTask.id ? highlightQuery : '';
   const selectedIsDirty = Boolean(selectedTask && googleTasks.dirtyTaskIds.includes(selectedTask.id));
-  const canPushToGoogle = googleTasksSync && googleTasks.isConnected;
+  const canPushToGoogle =
+    googleTasksSync && (googleTasks.isConnected || Boolean(googleTasks.userEmail));
 
   if (posture === FoldPosture.Inner) {
     return (
       <div className={`h-full grid grid-cols-2 ${hingeAwareSplit ? 'gap-5' : 'gap-3'} px-3.5 py-2 overflow-hidden`}>
-        <div className="h-full overflow-y-auto device-scroll pr-0.5">{renderList()}</div>
+        <div ref={taskListScrollRef} className="h-full overflow-y-auto device-scroll pr-0.5">{renderList()}</div>
         <div className="h-full overflow-hidden pl-0.5">
           <TaskDetailPane
             task={selectedTask}
             tokens={tokens}
             taskLists={taskLists}
             highlightQuery={detailHighlight}
+            highlightTrigger={detailHighlight ? highlightTrigger : undefined}
             onDismissHighlight={onDismissHighlight}
             onToggleTask={onToggleTask}
             onUpdateTask={onUpdateTask}
@@ -333,7 +350,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
     const flexIsDirty = Boolean(flexTask && googleTasks.dirtyTaskIds.includes(flexTask.id));
     return (
       <div className="h-full flex flex-col">
-        <div className="h-[46%] overflow-y-auto device-scroll px-3.5 py-2">{renderList()}</div>
+        <div ref={taskListScrollRef} className="h-[46%] overflow-y-auto device-scroll px-3.5 py-2">{renderList()}</div>
         <div className="h-3.5 flex items-center justify-center bg-stone-200/60 dark:bg-black/40 border-y border-stone-300/60 dark:border-stone-800 shrink-0">
           <span className="text-[9px] font-mono-tabular text-stone-500 dark:text-stone-400">
             Flex hinge · Detail editor
@@ -345,6 +362,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
             tokens={tokens}
             taskLists={taskLists}
             highlightQuery={detailHighlight}
+            highlightTrigger={detailHighlight ? highlightTrigger : undefined}
             onDismissHighlight={onDismissHighlight}
             onToggleTask={onToggleTask}
             onUpdateTask={onUpdateTask}
@@ -362,7 +380,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
 
   return (
     <div className="relative h-full overflow-hidden">
-      <div className="h-full overflow-y-auto device-scroll px-3.5 pt-2.5 pb-24">
+      <div ref={taskListScrollRef} className="h-full overflow-y-auto device-scroll px-3.5 pt-2.5 pb-24">
         {renderList()}
       </div>
       <TaskDetailSheet
@@ -371,6 +389,7 @@ export const TasksScreen: React.FC<TasksScreenProps> = ({
         taskLists={taskLists}
         heightClass="h-[94%]"
         highlightQuery={detailHighlight}
+        highlightTrigger={detailHighlight ? highlightTrigger : undefined}
         onDismissHighlight={onDismissHighlight}
         onClose={() => onSelectTask(null)}
         onToggleTask={onToggleTask}

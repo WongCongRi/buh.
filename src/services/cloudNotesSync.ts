@@ -386,7 +386,7 @@ export function formatFriendlyCloudSyncError(err: unknown): string {
     return 'Cloud sync permission denied. Please verify your Google account email and sign in again.';
   }
   if (raw.includes('offline') || raw.includes('unavailable')) {
-    return 'Offline — notes are saved locally and will sync automatically when online.';
+    return 'Offline — changes are saved locally and will sync automatically when online.';
   }
-  return 'Could not sync notes right now. Your notes remain saved locally.';
+  return 'Could not sync right now. Your changes remain saved locally.';
 }

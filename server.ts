@@ -2,11 +2,28 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'fs';
 import http from 'http';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { promisify } from 'util';
 import zlib from 'zlib';
 import * as webpushModule from 'web-push';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
+
+const deflateRawAsync = promisify(zlib.deflateRaw);
+
+let cachedGenAiClient: { apiKey: string; client: GoogleGenAI } | null = null;
+function getGenAiClient(apiKey: string): GoogleGenAI {
+  if (cachedGenAiClient && cachedGenAiClient.apiKey === apiKey) {
+    return cachedGenAiClient.client;
+  }
+  const client = new GoogleGenAI({
+    apiKey,
+    httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+  });
+  cachedGenAiClient = { apiKey, client };
+  return client;
+}
 
 const webpush =
   (webpushModule as unknown as { default?: typeof webpushModule }).default ?? webpushModule;
@@ -93,7 +110,11 @@ async function fetchJsonWithTimeout<T>(url: string, ms = 4500): Promise<T | null
   }
 }
 
-async function fetchTextWithTimeout(url: string, ms = 4500): Promise<string | null> {
+async function fetchTextWithTimeout(
+  url: string,
+  ms = 4500,
+  maxBytes = 1_500_000
+): Promise<string | null> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
   try {
@@ -107,7 +128,36 @@ async function fetchTextWithTimeout(url: string, ms = 4500): Promise<string | nu
       },
     });
     if (!resp.ok) return null;
-    return await resp.text();
+    if (!resp.body) {
+      const full = await resp.text();
+      return full.length > maxBytes ? full.slice(0, maxBytes) : full;
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let result = '';
+    let totalBytes = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          totalBytes += value.byteLength;
+          if (totalBytes >= maxBytes) {
+            const remaining = Math.max(0, maxBytes - (totalBytes - value.byteLength));
+            if (remaining > 0) {
+              result += decoder.decode(value.subarray(0, remaining), { stream: false });
+            }
+            void reader.cancel().catch(() => {});
+            break;
+          }
+          result += decoder.decode(value, { stream: true });
+        }
+      }
+      result += decoder.decode();
+    } finally {
+      reader.releaseLock();
+    }
+    return result;
   } catch {
     return null;
   } finally {
@@ -236,6 +286,56 @@ function extractMediaFromText(text: string): EmbeddedMediaItem[] {
 const FOLLOW_UP_ANAPHORA_REGEX =
   /\b(it|its|they|them|their|that|this|there|those|these|same|above|earlier|previous|before|one|ones)\b/i;
 
+const MEDIA_DIRECTIVE_REGEX = /`?\[\[\s*MEDIA\s*:\s*([^\]]*?)\s*\]\]`?/gi;
+
+interface ParsedMediaDirective {
+  cleanAnswer: string;
+  explicitNone: boolean;
+  imageQueries: string[];
+  videoQuery: string;
+}
+
+function parseMediaDirectiveFromAnswer(rawAnswer: string): ParsedMediaDirective {
+  let explicitNone = false;
+  let imageQueries: string[] = [];
+  let videoQuery = '';
+
+  const matches = Array.from(rawAnswer.matchAll(MEDIA_DIRECTIVE_REGEX));
+  if (matches.length > 0) {
+    const payload = (matches[matches.length - 1][1] ?? '').trim();
+    if (/^none$/i.test(payload) || payload.length === 0) {
+      explicitNone = true;
+    } else {
+      const [rawImgPart, rawVidPart] = payload.split('|').map((s) => s.trim());
+      if (rawImgPart && !/^none$/i.test(rawImgPart)) {
+        imageQueries = rawImgPart
+          .split(/[,;]+/)
+          .map((q) => q.replace(/^["'`]+|["'`]+$/g, '').trim())
+          .filter((q) => q.length >= 2 && !/^none$/i.test(q))
+          .slice(0, 3);
+      }
+      if (rawVidPart && !/^none$/i.test(rawVidPart)) {
+        videoQuery = rawVidPart.replace(/^["'`]+|["'`]+$/g, '').trim().slice(0, 100);
+      }
+      if (imageQueries.length === 0 && !videoQuery) {
+        explicitNone = true;
+      }
+    }
+  }
+
+  const cleanAnswer = rawAnswer
+    .replace(MEDIA_DIRECTIVE_REGEX, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  return {
+    cleanAnswer,
+    explicitNone,
+    imageQueries,
+    videoQuery,
+  };
+}
+
 function stripVisualFiller(text: string): string {
   return text
     .replace(/https?:\/\/\S+/gi, ' ')
@@ -243,15 +343,81 @@ function stripVisualFiller(text: string): string {
       /\b(show|me|find|get|search|look up|lookup|give|send|display|embed|embedded|some|an?|the|and|or|of|for|about|please|can|could|would|you|i|see|want|need|what|is|are|was|were|today'?s?|today|right now|current|currently|any|more|another|also|here|images?|photos?|pictures?|pics?|videos?|clips?|watch|youtube|vimeo|trailer|review|hands[- ]?on|tutorial|how to|demo|vlog|walking|tour|weather|forecast|temperature|temp|exchange rate|rate|time|clock|specs?|specifications?|it|its|they|them|their|that|this|there|those|these|same|above|earlier|previous|before|one|ones)\b/gi,
       ' '
     )
-    .replace(/[?.,!()"'`]/g, ' ')
+    .replace(/[?.,!()"'`*#[\]:]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
+function extractAnswerMediaTopics(answer: string): string[] {
+  if (!answer.trim()) return [];
+  const topics: string[] = [];
+  const seen = new Set<string>();
+
+  const pushTopic = (raw: string) => {
+    const cleaned = raw
+      .replace(/https?:\/\/\S+/gi, ' ')
+      .replace(/[*_`#[\]()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^[:\-–—.,;]+|[:\-–—.,;]+$/g, '')
+      .trim();
+    if (cleaned.length < 2 || cleaned.length > 65) return;
+    if (/^(note|tip|summary|overview|key points?|here are|here is|yes|no|today|tomorrow|yesterday|source|sources)$/i.test(cleaned)) {
+      return;
+    }
+    if (/^\d+(?:[.,:/-]\d+)*\s*(?:%|°[cf]?|am|pm|usd|eur|gbp|sgd|jpy|km|mi|m|cm|kg|lb|min|mins|hr|hrs)?$/i.test(cleaned)) {
+      return;
+    }
+    const key = cleaned.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    topics.push(cleaned);
+  };
+
+  // 1. Bolded phrases in the AI answer (often the exact named places, dishes, people, products, or answers)
+  for (const m of answer.matchAll(/\*\*([^*\n]{2,60})\*\*/g)) {
+    const candidate = m[1].trim();
+    if (candidate.split(/\s+/).length <= 7) {
+      pushTopic(candidate);
+    }
+    if (topics.length >= 3) break;
+  }
+
+  // 2. Proper-noun multi-word or capitalized entities in the lead sentences if bold phrases weren't enough
+  if (topics.length < 3) {
+    const leadText = answer
+      .replace(/\[[^\]]+\]\([^)]+\)/g, ' ')
+      .split(/\n/)
+      .slice(0, 5)
+      .join(' ');
+    for (const m of leadText.matchAll(/\b([A-Z][a-zA-Z0-9'’-]*(?:\s+(?:of|the|de|da|la|del|in|on|and)?\s*[A-Z][a-zA-Z0-9'’-]*){1,4})\b/g)) {
+      pushTopic(m[1]);
+      if (topics.length >= 3) break;
+    }
+  }
+
+  // 3. Fallback to cleaned lead sentence from the AI answer
+  if (topics.length === 0) {
+    const firstSentence = answer.split(/(?<=[.!?])\s+|\n/)[0] ?? '';
+    const stripped = stripVisualFiller(firstSentence);
+    if (stripped.length >= 3) {
+      pushTopic(stripped.split(/\s+/).slice(0, 6).join(' '));
+    }
+  }
+
+  return topics.slice(0, 3);
+}
+
 function extractLatestTopicFromHistory(history: HistoryMessage[]): string {
-  const userTurns = history.filter((m) => m.role === 'user').map((m) => m.text.trim());
-  for (let i = userTurns.length - 1; i >= 0; i--) {
-    const subject = stripVisualFiller(userTurns[i]);
+  for (let i = history.length - 1; i >= 0; i--) {
+    const entry = history[i];
+    if (entry.role === 'model') {
+      const answerTopics = extractAnswerMediaTopics(entry.text);
+      if (answerTopics.length > 0) {
+        return answerTopics[0].slice(0, 100);
+      }
+    }
+    const subject = stripVisualFiller(entry.text);
     if (subject.length >= 2) {
       return subject.slice(0, 100);
     }
@@ -259,7 +425,12 @@ function extractLatestTopicFromHistory(history: HistoryMessage[]): string {
   return '';
 }
 
-function buildVisualSearchQuery(prompt: string, history: HistoryMessage[]): string {
+function buildVisualSearchQuery(prompt: string, history: HistoryMessage[], answer = ''): string {
+  const answerTopics = extractAnswerMediaTopics(answer);
+  if (answerTopics.length > 0) {
+    return answerTopics[0].slice(0, 100);
+  }
+
   const ownSubject = stripVisualFiller(prompt);
   const hasAnaphora = FOLLOW_UP_ANAPHORA_REGEX.test(prompt);
 
@@ -286,40 +457,111 @@ function buildVisualSearchQuery(prompt: string, history: HistoryMessage[]): stri
     .slice(0, 100);
 }
 
-function buildVideoSearchQuery(prompt: string, history: HistoryMessage[], visualQuery: string): string {
-  const ownSubject = stripVisualFiller(prompt);
-  const hasAnaphora = FOLLOW_UP_ANAPHORA_REGEX.test(prompt);
-  const cleanedPromptForVideo = prompt
-    .replace(/https?:\/\/\S+/gi, ' ')
-    .replace(
-      /\b(show me|give me|find me|send me|can you|could you|please|embed|embedded|display|watch|some|any|a|an|the|of it|about it|for it|of that|about that|of this|about this)\b/gi,
-      ' '
-    )
-    .replace(/[?.,!()"'`]/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim();
+function buildVideoSearchQuery(
+  prompt: string,
+  history: HistoryMessage[],
+  visualQuery: string,
+  directiveVideoQuery = ''
+): string {
+  const videoModifiers = prompt.match(
+    /\b(trailer|review|hands[- ]?on|tutorial|how to|demo|vlog|walking tour|tour|highlights?|unboxing|recipe|4k|live)\b/gi
+  );
+  const uniqueMods = videoModifiers
+    ? Array.from(new Set(videoModifiers.map((m) => m.toLowerCase())))
+    : [];
 
-  // If the current prompt clearly names its own subject (no pronoun back-reference), search strictly for it
-  if (ownSubject.length >= 2 && !hasAnaphora) {
-    return (cleanedPromptForVideo || ownSubject).slice(0, 100);
+  if (directiveVideoQuery.trim().length >= 2) {
+    let q = directiveVideoQuery.trim();
+    for (const mod of uniqueMods) {
+      if (!q.toLowerCase().includes(mod)) {
+        q = `${q} ${mod}`;
+      }
+    }
+    return q.slice(0, 100);
   }
 
-  // Genuine follow-up (e.g. "show me a video of it", "any tutorial videos?") -> anchor to resolved visualQuery
-  const videoModifiers = prompt.match(
-    /\b(trailer|review|hands[- ]?on|tutorial|how to|demo|vlog|walking tour|tour|highlights?|unboxing|4k|live)\b/gi
-  );
-  const modText = videoModifiers ? Array.from(new Set(videoModifiers.map((m) => m.toLowerCase()))).join(' ') : '';
-  return `${visualQuery}${modText ? ` ${modText}` : ''}`.trim().slice(0, 100);
+  if (visualQuery.trim().length >= 2) {
+    let q = visualQuery.trim();
+    for (const mod of uniqueMods) {
+      if (!q.toLowerCase().includes(mod)) {
+        q = `${q} ${mod}`;
+      }
+    }
+    return q.slice(0, 100);
+  }
+
+  const fallbackTopic = extractLatestTopicFromHistory(history);
+  return `${fallbackTopic}${uniqueMods.length > 0 ? ` ${uniqueMods.join(' ')}` : ''}`
+    .trim()
+    .slice(0, 100);
+}
+
+interface FetchEmbeddedMediaOptions {
+  answer?: string;
+  imageQueries?: string[];
+  videoQuery?: string;
+  explicitNone?: boolean;
+  extraTexts?: string[];
+}
+
+const EMBEDDED_MEDIA_CACHE_MAX = 60;
+const EMBEDDED_MEDIA_CACHE_TTL_MS = 10 * 60 * 1000;
+const embeddedMediaCache = new Map<
+  string,
+  { expiresAt: number; images: EmbeddedMediaItem[]; videos: EmbeddedMediaItem[] }
+>();
+
+function getCachedEmbeddedMedia(
+  key: string
+): { images: EmbeddedMediaItem[]; videos: EmbeddedMediaItem[] } | null {
+  const entry = embeddedMediaCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    embeddedMediaCache.delete(key);
+    return null;
+  }
+  return { images: entry.images, videos: entry.videos };
+}
+
+function setCachedEmbeddedMedia(
+  key: string,
+  images: EmbeddedMediaItem[],
+  videos: EmbeddedMediaItem[]
+) {
+  const now = Date.now();
+  if (embeddedMediaCache.size >= EMBEDDED_MEDIA_CACHE_MAX) {
+    for (const [k, v] of embeddedMediaCache.entries()) {
+      if (v.expiresAt <= now) embeddedMediaCache.delete(k);
+    }
+    while (embeddedMediaCache.size >= EMBEDDED_MEDIA_CACHE_MAX) {
+      const oldest = embeddedMediaCache.keys().next().value;
+      if (!oldest) break;
+      embeddedMediaCache.delete(oldest);
+    }
+  }
+  embeddedMediaCache.set(key, {
+    expiresAt: now + EMBEDDED_MEDIA_CACHE_TTL_MS,
+    images,
+    videos,
+  });
 }
 
 async function fetchEmbeddedMedia(
   prompt: string,
   history: HistoryMessage[],
-  extraTexts: string[] = []
+  options: FetchEmbeddedMediaOptions = {}
 ): Promise<EmbeddedMediaItem[]> {
+  const {
+    answer = '',
+    imageQueries: directiveImageQueries = [],
+    videoQuery: directiveVideoQuery = '',
+    explicitNone = false,
+    extraTexts = [],
+  } = options;
+
   const directMedia: EmbeddedMediaItem[] = [];
-  for (const txt of [prompt, ...extraTexts]) {
-    directMedia.push(...extractMediaFromText(txt));
+  for (const txt of [prompt, answer, ...extraTexts]) {
+    if (txt) directMedia.push(...extractMediaFromText(txt));
   }
 
   const wantsVideos = /\b(video|videos|clip|clips|watch|youtube|trailer|review|hands[- ]?on|tutorial|how to|demo|vlog|tour)\b/i.test(
@@ -334,12 +576,33 @@ async function fetchEmbeddedMedia(
     !wantsVideos &&
     /\b(what did we|earlier in this chat|remind me what|summarize our chat|previous message)\b/i.test(prompt);
 
-  if (isPureArithmetic || isPureMetaRecap) {
+  if (isPureArithmetic || isPureMetaRecap || (explicitNone && !wantsImages && !wantsVideos)) {
     return directMedia.slice(0, 5);
   }
 
-  const visualQuery = buildVisualSearchQuery(prompt, history);
-  if (!visualQuery || visualQuery.length < 2) {
+  // Prioritize concrete entities/topics from the AI's output over raw prompt keywords
+  const answerTopics = extractAnswerMediaTopics(answer);
+  const resolvedImageQueries: string[] = [];
+  const seenQueryKeys = new Set<string>();
+  const addSearchTopic = (q: string) => {
+    const trimmed = q.trim().slice(0, 90);
+    if (trimmed.length < 2) return;
+    const key = trimmed.toLowerCase();
+    if (seenQueryKeys.has(key)) return;
+    seenQueryKeys.add(key);
+    resolvedImageQueries.push(trimmed);
+  };
+
+  for (const q of directiveImageQueries) addSearchTopic(q);
+  if (resolvedImageQueries.length === 0) {
+    for (const q of answerTopics) addSearchTopic(q);
+  }
+  if (resolvedImageQueries.length === 0) {
+    addSearchTopic(buildVisualSearchQuery(prompt, history, answer));
+  }
+
+  const primaryVisualQuery = resolvedImageQueries[0] || '';
+  if (!primaryVisualQuery && !directiveVideoQuery) {
     return directMedia.slice(0, 5);
   }
 
@@ -368,103 +631,133 @@ async function fetchEmbeddedMedia(
     /\b(exchange rate|convert|fx|currency)\b/i.test(prompt) &&
     !/\b(city|country|phone|device|watch|photo|video)\b/i.test(prompt);
 
+  const ytQuery = isCurrencyOnly
+    ? ''
+    : buildVideoSearchQuery(prompt, history, primaryVisualQuery, directiveVideoQuery);
+
+  const mediaCacheKey = JSON.stringify({
+    q: resolvedImageQueries.slice(0, 3).map((s) => s.toLowerCase()),
+    v: ytQuery.toLowerCase(),
+    wi: wantsImages,
+    wv: wantsVideos,
+    c: isCurrencyOnly,
+  });
+
+  const cachedMedia = getCachedEmbeddedMedia(mediaCacheKey);
+  if (cachedMedia) {
+    for (const img of cachedMedia.images) addImage(img);
+    for (const vid of cachedMedia.videos) addVideo(vid);
+    const directImages = directMedia.filter((m) => m.type === 'image');
+    const directVideos = directMedia.filter((m) => m.type === 'video');
+    const finalImages = [...directImages, ...fetchedImages].slice(0, wantsImages ? 4 : 3);
+    const finalVideos = [...directVideos, ...fetchedVideos].slice(0, wantsVideos ? 2 : 1);
+    return wantsVideos ? [...finalVideos, ...finalImages] : [...finalImages, ...finalVideos];
+  }
+
   const tasks: Promise<void>[] = [];
 
   if (!isCurrencyOnly) {
-    // 1. Wikipedia page thumbnail / original image for top match
-    tasks.push(
-      (async () => {
-        const searchData = await fetchJsonWithTimeout<{
-          query?: { search?: { title: string }[] };
-        }>(
-          `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
-            visualQuery
-          )}&format=json&srlimit=2`,
-          3800
-        );
-        const hits = searchData?.query?.search ?? [];
-        for (const hit of hits.slice(0, 2)) {
-          const summary = await fetchJsonWithTimeout<{
-            title?: string;
-            thumbnail?: { source?: string; width?: number; height?: number };
-            originalimage?: { source?: string };
-            content_urls?: { desktop?: { page?: string } };
-          }>(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(hit.title)}`, 3500);
-          const thumb = summary?.thumbnail?.source;
-          const orig = summary?.originalimage?.source || thumb;
-          if (thumb && orig && !/\.svg(\?|$)/i.test(orig)) {
-            addImage({
-              id: `wiki-img-${hit.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
-              type: 'image',
-              title: summary?.title || hit.title,
-              url: orig,
-              thumbnailUrl: thumb,
-              sourceName: 'Wikipedia',
-              sourceUrl:
-                summary?.content_urls?.desktop?.page ||
-                `https://en.wikipedia.org/wiki/${encodeURIComponent(hit.title.replace(/\s+/g, '_'))}`,
-            });
+    // 1. Wikipedia page thumbnails / original images for each top output topic (up to 3)
+    const wikiTopics = resolvedImageQueries.slice(0, 3);
+    const hitsPerTopic = wikiTopics.length > 1 ? 1 : 2;
+
+    for (const topic of wikiTopics) {
+      tasks.push(
+        (async () => {
+          const searchData = await fetchJsonWithTimeout<{
+            query?: { search?: { title: string }[] };
+          }>(
+            `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(
+              topic
+            )}&format=json&srlimit=${hitsPerTopic}`,
+            3200
+          );
+          const hits = searchData?.query?.search ?? [];
+          for (const hit of hits.slice(0, hitsPerTopic)) {
+            const summary = await fetchJsonWithTimeout<{
+              title?: string;
+              thumbnail?: { source?: string; width?: number; height?: number };
+              originalimage?: { source?: string };
+              content_urls?: { desktop?: { page?: string } };
+            }>(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(hit.title)}`, 3000);
+            const thumb = summary?.thumbnail?.source;
+            const orig = summary?.originalimage?.source || thumb;
+            if (thumb && orig && !/\.svg(\?|$)/i.test(orig)) {
+              addImage({
+                id: `wiki-img-${hit.title.toLowerCase().replace(/[^a-z0-9]+/g, '-')}`,
+                type: 'image',
+                title: summary?.title || hit.title,
+                url: orig,
+                thumbnailUrl: thumb,
+                sourceName: 'Wikipedia',
+                sourceUrl:
+                  summary?.content_urls?.desktop?.page ||
+                  `https://en.wikipedia.org/wiki/${encodeURIComponent(hit.title.replace(/\s+/g, '_'))}`,
+              });
+            }
           }
-        }
-      })()
-    );
+        })()
+      );
+    }
 
-    // 2. Wikimedia Commons photographic images
+    // 2. Wikimedia Commons photographic images for primary output topic
+    if (primaryVisualQuery) {
+      tasks.push(
+        (async () => {
+          const commons = await fetchJsonWithTimeout<{
+            query?: {
+              pages?: Record<
+                string,
+                {
+                  pageid: number;
+                  title: string;
+                  imageinfo?: {
+                    url?: string;
+                    thumburl?: string;
+                    descriptionurl?: string;
+                    mime?: string;
+                    width?: number;
+                    height?: number;
+                  }[];
+                }
+              >;
+            };
+          }>(
+            `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
+              `${primaryVisualQuery} filetype:bitmap`
+            )}&gsrlimit=6&prop=imageinfo&iiprop=url|mime|size&iiurlwidth=640&format=json`,
+            3400
+          );
+          const pages = Object.values(commons?.query?.pages ?? {});
+          for (const page of pages) {
+            const info = page.imageinfo?.[0];
+            if (!info?.url || !info.mime) continue;
+            if (!/^image\/(jpeg|png|webp)$/i.test(info.mime)) continue;
+            if ((info.width ?? 0) < 280 || (info.height ?? 0) < 180) continue;
+            if (/logo|icon|flag|coat_of_arms|map_of/i.test(page.title)) continue;
+            addImage({
+              id: `commons-img-${page.pageid}`,
+              type: 'image',
+              title: cleanCommonsTitle(page.title) || primaryVisualQuery,
+              url: info.thumburl || info.url,
+              thumbnailUrl: info.thumburl || info.url,
+              sourceName: 'Wikimedia Commons',
+              sourceUrl: info.descriptionurl || info.url,
+            });
+            if (fetchedImages.length >= 4) break;
+          }
+        })()
+      );
+    }
+
+    // 3. YouTube live video search anchored to the AI output
     tasks.push(
       (async () => {
-        const commons = await fetchJsonWithTimeout<{
-          query?: {
-            pages?: Record<
-              string,
-              {
-                pageid: number;
-                title: string;
-                imageinfo?: {
-                  url?: string;
-                  thumburl?: string;
-                  descriptionurl?: string;
-                  mime?: string;
-                  width?: number;
-                  height?: number;
-                }[];
-              }
-            >;
-          };
-        }>(
-          `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
-            `${visualQuery} filetype:bitmap`
-          )}&gsrlimit=6&prop=imageinfo&iiprop=url|mime|size&iiurlwidth=640&format=json`,
-          4000
-        );
-        const pages = Object.values(commons?.query?.pages ?? {});
-        for (const page of pages) {
-          const info = page.imageinfo?.[0];
-          if (!info?.url || !info.mime) continue;
-          if (!/^image\/(jpeg|png|webp)$/i.test(info.mime)) continue;
-          if ((info.width ?? 0) < 280 || (info.height ?? 0) < 180) continue;
-          if (/logo|icon|flag|coat_of_arms|map_of/i.test(page.title)) continue;
-          addImage({
-            id: `commons-img-${page.pageid}`,
-            type: 'image',
-            title: cleanCommonsTitle(page.title) || visualQuery,
-            url: info.thumburl || info.url,
-            thumbnailUrl: info.thumburl || info.url,
-            sourceName: 'Wikimedia Commons',
-            sourceUrl: info.descriptionurl || info.url,
-          });
-          if (fetchedImages.length >= 4) break;
-        }
-      })()
-    );
-
-    // 3. YouTube live video search (embeddable via youtube-nocookie.com)
-    tasks.push(
-      (async () => {
-        const ytQuery = buildVideoSearchQuery(prompt, history, visualQuery);
+        if (!ytQuery || ytQuery.length < 2) return;
         const ytUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(ytQuery)}`;
-        let html = await fetchTextWithTimeout(ytUrl, 6500);
+        let html = await fetchTextWithTimeout(ytUrl, 5000);
         if (!html) {
-          html = await fetchTextWithTimeout(ytUrl, 6500);
+          html = await fetchTextWithTimeout(ytUrl, 4500);
         }
         if (!html) return;
         const videoRegex =
@@ -481,7 +774,7 @@ async function fetchEmbeddedMedia(
           addVideo({
             id: `yt-${vid}`,
             type: 'video',
-            title: title || `${visualQuery} video`,
+            title: title || `${ytQuery} video`,
             url: `https://www.youtube.com/watch?v=${vid}`,
             embedUrl: `https://www.youtube-nocookie.com/embed/${vid}?autoplay=1&rel=0`,
             thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`,
@@ -498,7 +791,8 @@ async function fetchEmbeddedMedia(
   await Promise.allSettled(tasks);
 
   // Fallback to Wikimedia Commons native video if user asked for videos and YouTube yielded none
-  if (wantsVideos && fetchedVideos.length === 0) {
+  const fallbackVidTopic = directiveVideoQuery || primaryVisualQuery;
+  if (wantsVideos && fetchedVideos.length === 0 && fallbackVidTopic) {
     const commonsVid = await fetchJsonWithTimeout<{
       query?: {
         pages?: Record<
@@ -517,9 +811,9 @@ async function fetchEmbeddedMedia(
       };
     }>(
       `https://commons.wikimedia.org/w/api.php?action=query&generator=search&gsrnamespace=6&gsrsearch=${encodeURIComponent(
-        `${visualQuery} filetype:video`
+        `${fallbackVidTopic} filetype:video`
       )}&gsrlimit=3&prop=imageinfo&iiprop=url|mime&iiurlwidth=480&format=json`,
-      3800
+      3400
     );
     const pages = Object.values(commonsVid?.query?.pages ?? {});
     for (const page of pages) {
@@ -528,7 +822,7 @@ async function fetchEmbeddedMedia(
       addVideo({
         id: `commons-vid-${page.pageid}`,
         type: 'video',
-        title: cleanCommonsTitle(page.title) || visualQuery,
+        title: cleanCommonsTitle(page.title) || fallbackVidTopic,
         url: info.url,
         thumbnailUrl: info.thumburl,
         sourceName: 'Wikimedia Commons',
@@ -537,6 +831,10 @@ async function fetchEmbeddedMedia(
       });
       if (fetchedVideos.length >= 2) break;
     }
+  }
+
+  if (fetchedImages.length > 0 || fetchedVideos.length > 0) {
+    setCachedEmbeddedMedia(mediaCacheKey, fetchedImages, fetchedVideos);
   }
 
   const directImages = directMedia.filter((m) => m.type === 'image');
@@ -850,19 +1148,58 @@ async function startServer() {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/api/health', (_req, res) => {
+    void processDuePushReminders();
     res.json({ ok: true });
   });
 
   // Web Push (VAPID) support for PWA Service Worker push notifications
+  const PUSH_STATE_FILE = path.join(os.tmpdir(), 'buh-push-state-v1.json');
+
+  interface PersistedPushState {
+    vapid?: { publicKey: string; privateKey: string };
+    subscriptions?: ValidatedPushSubscription[];
+    scheduled?: Record<string, ScheduledPushReminder[]>;
+    delivered?: Record<string, number>;
+  }
+
+  const readPersistedPushState = (): PersistedPushState => {
+    try {
+      if (!fs.existsSync(PUSH_STATE_FILE)) return {};
+      const raw = fs.readFileSync(PUSH_STATE_FILE, 'utf8');
+      const parsed = JSON.parse(raw) as PersistedPushState;
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+
+  const persistedPushState = readPersistedPushState();
+
   const envVapidPublic = process.env.VAPID_PUBLIC_KEY?.trim();
   const envVapidPrivate = process.env.VAPID_PRIVATE_KEY?.trim();
   const vapidSubject = process.env.VAPID_SUBJECT?.trim() || 'mailto:notifications@buh.app';
-  const runtimeVapidKeys =
+  let runtimeVapidKeys =
     envVapidPublic && envVapidPrivate
       ? { publicKey: envVapidPublic, privateKey: envVapidPrivate, persistent: true }
-      : { ...webpush.generateVAPIDKeys(), persistent: false };
+      : persistedPushState.vapid?.publicKey && persistedPushState.vapid?.privateKey
+        ? {
+            publicKey: persistedPushState.vapid.publicKey,
+            privateKey: persistedPushState.vapid.privateKey,
+            persistent: false,
+          }
+        : { ...webpush.generateVAPIDKeys(), persistent: false };
 
-  webpush.setVapidDetails(vapidSubject, runtimeVapidKeys.publicKey, runtimeVapidKeys.privateKey);
+  try {
+    webpush.setVapidDetails(vapidSubject, runtimeVapidKeys.publicKey, runtimeVapidKeys.privateKey);
+  } catch (vapidErr) {
+    console.warn('Invalid VAPID configuration, falling back to freshly generated keys:', vapidErr);
+    runtimeVapidKeys = { ...webpush.generateVAPIDKeys(), persistent: false };
+    webpush.setVapidDetails(
+      'mailto:notifications@buh.app',
+      runtimeVapidKeys.publicKey,
+      runtimeVapidKeys.privateKey
+    );
+  }
 
   interface ValidatedPushSubscription {
     endpoint: string;
@@ -942,6 +1279,7 @@ async function startServer() {
     silent: boolean;
   }
 
+  const MAX_DELIVERED_PUSH_KEYS = 5000;
   const scheduledPushReminders = new Map<string, ScheduledPushReminder[]>();
   const deliveredPushKeys = new Map<string, number>();
 
@@ -950,15 +1288,112 @@ async function startServer() {
     for (const [k, ts] of deliveredPushKeys.entries()) {
       if (ts < cutoff) deliveredPushKeys.delete(k);
     }
+    while (deliveredPushKeys.size > MAX_DELIVERED_PUSH_KEYS) {
+      const oldestKey = deliveredPushKeys.keys().next().value;
+      if (!oldestKey) break;
+      deliveredPushKeys.delete(oldestKey);
+    }
   };
+
+  const recordDeliveredPushKey = (key: string, now: number) => {
+    if (deliveredPushKeys.has(key)) {
+      deliveredPushKeys.delete(key);
+    } else if (deliveredPushKeys.size >= MAX_DELIVERED_PUSH_KEYS) {
+      pruneDeliveredPushKeys(now);
+      if (deliveredPushKeys.size >= MAX_DELIVERED_PUSH_KEYS) {
+        const oldestKey = deliveredPushKeys.keys().next().value;
+        if (oldestKey) deliveredPushKeys.delete(oldestKey);
+      }
+    }
+    deliveredPushKeys.set(key, now);
+  };
+
+  let persistTimer: ReturnType<typeof setTimeout> | null = null;
+  const schedulePersistPushState = () => {
+    if (persistTimer) return;
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      try {
+        const scheduledObj: Record<string, ScheduledPushReminder[]> = {};
+        for (const [endpoint, items] of scheduledPushReminders.entries()) {
+          if (items.length > 0) {
+            scheduledObj[endpoint] = items;
+          }
+        }
+        const now = Date.now();
+        pruneDeliveredPushKeys(now);
+        const deliveredObj: Record<string, number> = {};
+        for (const [k, ts] of deliveredPushKeys.entries()) {
+          deliveredObj[k] = ts;
+        }
+        const payload: PersistedPushState = {
+          vapid: runtimeVapidKeys.persistent
+            ? undefined
+            : {
+                publicKey: runtimeVapidKeys.publicKey,
+                privateKey: runtimeVapidKeys.privateKey,
+              },
+          subscriptions: Array.from(pushSubscriptions.values()),
+          scheduled: scheduledObj,
+          delivered: deliveredObj,
+        };
+        const tmpFile = `${PUSH_STATE_FILE}.tmp`;
+        fs.writeFileSync(tmpFile, JSON.stringify(payload), 'utf8');
+        fs.renameSync(tmpFile, PUSH_STATE_FILE);
+      } catch {
+        // Ignore transient tmpfs errors
+      }
+    }, 300);
+    if (typeof persistTimer.unref === 'function') {
+      persistTimer.unref();
+    }
+  };
+
+  // Restore any persisted subscriptions, delivered keys & pending reminders from the same container instance
+  if (persistedPushState.delivered && typeof persistedPushState.delivered === 'object') {
+    const cutoff = Date.now() - 6 * 60 * 60 * 1000;
+    for (const [k, ts] of Object.entries(persistedPushState.delivered)) {
+      if (typeof ts === 'number' && Number.isFinite(ts) && ts >= cutoff) {
+        recordDeliveredPushKey(k, ts);
+      }
+    }
+  }
+  if (Array.isArray(persistedPushState.subscriptions)) {
+    for (const rawSub of persistedPushState.subscriptions.slice(0, MAX_PUSH_SUBSCRIPTIONS)) {
+      const validated = validatePushSubscription(rawSub);
+      if (validated) {
+        pushSubscriptions.set(validated.endpoint, validated);
+      }
+    }
+  }
+  if (persistedPushState.scheduled && typeof persistedPushState.scheduled === 'object') {
+    const restoreCutoff = Date.now() - 60 * 60 * 1000;
+    for (const [endpoint, items] of Object.entries(persistedPushState.scheduled)) {
+      if (!pushSubscriptions.has(endpoint) || !Array.isArray(items)) continue;
+      const fresh = items.filter(
+        (item) =>
+          item &&
+          typeof item.triggerAtMs === 'number' &&
+          Number.isFinite(item.triggerAtMs) &&
+          item.triggerAtMs >= restoreCutoff &&
+          !deliveredPushKeys.has(`${endpoint}::${item.key}`) &&
+          !deliveredPushKeys.has(`${endpoint}::pair:${item.taskId}:${item.reminderId}`)
+      );
+      if (fresh.length > 0) {
+        scheduledPushReminders.set(endpoint, fresh.slice(0, MAX_SCHEDULED_PER_SUBSCRIPTION));
+      }
+    }
+  }
+  schedulePersistPushState();
 
   let processingPushQueue = false;
   const processDuePushReminders = async () => {
     if (processingPushQueue) return;
     processingPushQueue = true;
+    let mutated = false;
     try {
       const now = Date.now();
-      const CATCH_UP_MS = 30 * 60 * 1000;
+      const CATCH_UP_MS = 60 * 60 * 1000;
       pruneDeliveredPushKeys(now);
 
       for (const [endpoint, reminders] of Array.from(scheduledPushReminders.entries())) {
@@ -994,11 +1429,14 @@ async function startServer() {
         } else {
           scheduledPushReminders.delete(endpoint);
         }
+        mutated = true;
 
         for (const rem of due) {
           const dedupeKey = `${endpoint}::${rem.key}`;
-          if (deliveredPushKeys.has(dedupeKey)) continue;
-          deliveredPushKeys.set(dedupeKey, now);
+          const pairKey = `${endpoint}::pair:${rem.taskId}:${rem.reminderId}`;
+          if (deliveredPushKeys.has(dedupeKey) || deliveredPushKeys.has(pairKey)) continue;
+          recordDeliveredPushKey(dedupeKey, now);
+          recordDeliveredPushKey(pairKey, now);
 
           const payload = JSON.stringify({
             title: rem.title,
@@ -1013,7 +1451,7 @@ async function startServer() {
             category: rem.category,
             actions: [
               { action: 'snooze', title: 'Snooze 10m' },
-              { action: 'clear', title: 'Clear' },
+              { action: 'done', title: 'Done' },
             ],
           });
 
@@ -1027,12 +1465,16 @@ async function startServer() {
             if (statusCode === 404 || statusCode === 410) {
               pushSubscriptions.delete(endpoint);
               scheduledPushReminders.delete(endpoint);
+              mutated = true;
               break;
             }
           }
         }
       }
     } finally {
+      if (mutated) {
+        schedulePersistPushState();
+      }
       processingPushQueue = false;
     }
   };
@@ -1053,6 +1495,7 @@ async function startServer() {
       }
     }
     pushSubscriptions.set(validated.endpoint, validated);
+    schedulePersistPushState();
   };
 
   app.get('/api/push/public-key', (_req, res) => {
@@ -1080,8 +1523,39 @@ async function startServer() {
     if (endpoint) {
       pushSubscriptions.delete(endpoint);
       scheduledPushReminders.delete(endpoint);
+      schedulePersistPushState();
     }
     res.json({ ok: true });
+  });
+
+  const handlePushTick = async (_req: express.Request, res: express.Response) => {
+    try {
+      await processDuePushReminders();
+      let pendingReminders = 0;
+      for (const list of scheduledPushReminders.values()) {
+        pendingReminders += list.length;
+      }
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        ok: true,
+        checkedAt: Date.now(),
+        pendingSubscriptions: pushSubscriptions.size,
+        pendingReminders,
+        persistentVapid: runtimeVapidKeys.persistent,
+      });
+    } catch (err) {
+      console.error('Push tick error:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ ok: false, error: 'Failed to process scheduled reminders.' });
+      }
+    }
+  };
+
+  app.get('/api/push/tick', (req, res) => {
+    void handlePushTick(req, res);
+  });
+  app.post('/api/push/tick', (req, res) => {
+    void handlePushTick(req, res);
   });
 
   app.post('/api/push/schedule', (req, res) => {
@@ -1099,7 +1573,7 @@ async function startServer() {
 
     const rawList = Array.isArray(body.reminders) ? body.reminders : [];
     const now = Date.now();
-    const minTriggerMs = now - 5 * 60 * 1000;
+    const minTriggerMs = now - 5 * 1000;
     const maxTriggerMs = now + 365 * 24 * 60 * 60 * 1000;
     const sanitized: ScheduledPushReminder[] = [];
     const seenKeys = new Set<string>();
@@ -1115,7 +1589,13 @@ async function startServer() {
       if (triggerAtMs < minTriggerMs || triggerAtMs > maxTriggerMs) continue;
 
       const key = `${taskId}:${reminderId}:${Math.round(triggerAtMs / 1000)}`;
-      if (seenKeys.has(key)) continue;
+      if (
+        seenKeys.has(key) ||
+        deliveredPushKeys.has(`${validated.endpoint}::${key}`) ||
+        deliveredPushKeys.has(`${validated.endpoint}::pair:${taskId}:${reminderId}`)
+      ) {
+        continue;
+      }
       seenKeys.add(key);
 
       const title =
@@ -1147,9 +1627,11 @@ async function startServer() {
 
     if (sanitized.length > 0) {
       scheduledPushReminders.set(validated.endpoint, sanitized);
+      schedulePersistPushState();
       void processDuePushReminders();
     } else {
       scheduledPushReminders.delete(validated.endpoint);
+      schedulePersistPushState();
     }
 
     res.json({
@@ -1205,6 +1687,7 @@ async function startServer() {
       },
     ];
     scheduledPushReminders.set(validated.endpoint, next);
+    schedulePersistPushState();
     res.json({ ok: true, triggerAtMs });
   });
 
@@ -1213,6 +1696,48 @@ async function startServer() {
     const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
     if (endpoint) {
       scheduledPushReminders.delete(endpoint);
+      schedulePersistPushState();
+    }
+    res.json({ ok: true });
+  });
+
+  app.post('/api/push/dismiss', (req, res) => {
+    const body = (req.body ?? {}) as {
+      endpoint?: unknown;
+      taskId?: unknown;
+      reminderId?: unknown;
+      completeTask?: unknown;
+    };
+    const endpoint = typeof body.endpoint === 'string' ? body.endpoint.trim() : '';
+    const taskId = typeof body.taskId === 'string' ? body.taskId.trim() : '';
+    const reminderId = typeof body.reminderId === 'string' ? body.reminderId.trim() : '';
+    const completeTask = Boolean(body.completeTask);
+
+    if (endpoint && taskId) {
+      const now = Date.now();
+      if (reminderId) {
+        recordDeliveredPushKey(`${endpoint}::pair:${taskId}:${reminderId}`, now);
+      }
+      const existing = scheduledPushReminders.get(endpoint);
+      if (existing && existing.length > 0) {
+        const remaining: ScheduledPushReminder[] = [];
+        for (const rem of existing) {
+          const matchesTask = rem.taskId === taskId;
+          const matchesReminder = Boolean(reminderId) && rem.reminderId === reminderId;
+          if (matchesTask && (completeTask || matchesReminder || !reminderId)) {
+            recordDeliveredPushKey(`${endpoint}::${rem.key}`, now);
+            recordDeliveredPushKey(`${endpoint}::pair:${rem.taskId}:${rem.reminderId}`, now);
+          } else {
+            remaining.push(rem);
+          }
+        }
+        if (remaining.length > 0) {
+          scheduledPushReminders.set(endpoint, remaining);
+        } else {
+          scheduledPushReminders.delete(endpoint);
+        }
+      }
+      schedulePersistPushState();
     }
     res.json({ ok: true });
   });
@@ -1241,7 +1766,7 @@ async function startServer() {
     const messageBody =
       typeof body.body === 'string' && body.body.trim()
         ? body.body.trim().slice(0, 280)
-        : 'Service worker push alerts are enabled with Snooze & Clear actions.';
+        : 'Service worker push alerts are enabled with Snooze & Done actions.';
 
     const payload = JSON.stringify({
       title,
@@ -1255,7 +1780,7 @@ async function startServer() {
       reminderId: typeof body.reminderId === 'string' ? body.reminderId.slice(0, 100) : undefined,
       actions: [
         { action: 'snooze', title: 'Snooze 10m' },
-        { action: 'clear', title: 'Clear' },
+        { action: 'done', title: 'Done' },
       ],
     });
 
@@ -1270,6 +1795,7 @@ async function startServer() {
       if (statusCode === 404 || statusCode === 410) {
         pushSubscriptions.delete(validated.endpoint);
         scheduledPushReminders.delete(validated.endpoint);
+        schedulePersistPushState();
       }
       res.status(502).json({
         ok: false,
@@ -1294,7 +1820,7 @@ async function startServer() {
       taskContext?: unknown;
     };
 
-    const prompt = typeof body.prompt === 'string' ? body.prompt.trim() : '';
+    const prompt = typeof body.prompt === 'string' ? body.prompt.trim().slice(0, 4000) : '';
     if (!prompt) {
       res.status(400).json({ error: 'Please enter a question or quick check prompt.' });
       return;
@@ -1311,7 +1837,8 @@ async function startServer() {
       'You are buh Lookup, a lightweight, accurate assistant built into a personal productivity app.',
       'Always read and use the full conversation history in this chat to resolve follow-up questions, pronouns ("it", "there", "that"), comparisons, and references to earlier answers or user prompts.',
       'Use live Google Search grounding or provided live web context whenever facts, current events, weather, exchange rates, schedules, product specs, or local/live web data are involved.',
-      'The buh Lookup UI automatically embeds relevant web images and playable videos right beneath your answer whenever visual topics, places, products, or media requests come up. Never claim that you cannot show images or videos—answer helpfully and concisely while the media renders below.',
+      'The buh Lookup UI automatically embeds relevant web images and playable videos right beneath your answer whenever visual topics, places, products, dishes, people, or media requests come up. Never claim that you cannot show images or videos—answer helpfully and concisely while the media renders below.',
+      'At the very end of your response, on its own final line, ALWAYS append a hidden media tag grounded specifically in the concrete subjects, answers, or recommendations in YOUR OUTPUT (not just repeating the user prompt): `[[MEDIA: topic 1, topic 2 | specific youtube video query]]`. Include 1-3 short, specific Wikipedia/photo-friendly entity names from your answer before `|` and 1 concise YouTube search query illustrating your answer after `|`. For purely personal agenda summaries, simple arithmetic, currency-only conversions, or abstract text-only answers where photos/videos would not help, output `[[MEDIA: NONE]]` instead.',
       'Keep answers concise, direct, and easy to scan on a phone screen: lead with the direct answer in 1-2 sentences, followed by at most 3-4 brief bullet points if helpful.',
       'Never fabricate URLs or live figures; rely strictly on verified Google Search results, provided live web data, or facts already established in the conversation.',
     ];
@@ -1339,21 +1866,20 @@ async function startServer() {
     ];
 
     try {
-      const ai = new GoogleGenAI({
-        apiKey,
-        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
-      });
-
-      // Kick off embedded image & video lookup in parallel with Gemini generation
-      const mediaPromise = fetchEmbeddedMedia(prompt, baseHistory);
+      const ai = getGenAiClient(apiKey);
 
       const candidateModels = ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'] as const;
+      const getModelThinkingConfig = (modelName: (typeof candidateModels)[number]) =>
+        modelName === 'gemini-3.1-flash-lite'
+          ? { thinkingLevel: ThinkingLevel.MINIMAL }
+          : { thinkingLevel: ThinkingLevel.LOW };
+
       let response;
       let usedModel: string = candidateModels[0];
       let lastError: unknown = null;
       let fallbackSources: GroundingSource[] = [];
       let usedLiveWebFallback = false;
-      let hitSearchQuota429 = false;
+      let hitSearchFallback = false;
 
       for (const modelName of candidateModels) {
         try {
@@ -1364,6 +1890,7 @@ async function startServer() {
             config: {
               systemInstruction: systemInstructionParts.join('\n\n'),
               tools: [{ googleSearch: {} }],
+              thinkingConfig: getModelThinkingConfig(modelName),
             },
           });
           lastError = null;
@@ -1375,8 +1902,8 @@ async function startServer() {
             `Lookup attempt with ${modelName} (googleSearch) failed (${errObj?.status ?? 'unknown'}):`,
             errObj?.message
           );
-          if (errObj?.status === 429) {
-            hitSearchQuota429 = true;
+          if (errObj?.status === 429 || errObj?.status === 400 || errObj?.status === 403) {
+            hitSearchFallback = true;
             break;
           }
           if (errObj?.status !== 404 && errObj?.status !== 503) {
@@ -1385,10 +1912,10 @@ async function startServer() {
         }
       }
 
-      // If Google Search grounding hit 429 on free-tier key (or transient 503), retrieve real live web data server-side
-      // and synthesize with lightweight Gemini models directly.
+      // If Google Search grounding is rate-limited/unavailable on free tier, retrieve live web context server-side
+      // and synthesize directly with the lightweight free model.
       const lastStatus = (lastError as { status?: number })?.status;
-      if (!response && (hitSearchQuota429 || lastStatus === 429 || lastStatus === 503)) {
+      if (!response && (hitSearchFallback || lastStatus === 429 || lastStatus === 503 || lastStatus === 404)) {
         const liveData = await fetchLiveWebContext(prompt, baseHistory);
         const nowIso = new Date().toISOString();
         const liveContextBlock =
@@ -1417,6 +1944,7 @@ async function startServer() {
                 contents: fallbackContents,
                 config: {
                   systemInstruction: systemInstructionParts.join('\n\n'),
+                  thinkingConfig: getModelThinkingConfig(modelName),
                 },
               });
               lastError = null;
@@ -1448,7 +1976,7 @@ async function startServer() {
         throw lastError;
       }
 
-      const answer = response?.text?.trim() || '';
+      const rawAnswer = response?.text?.trim() || '';
       const metadata = response?.candidates?.[0]?.groundingMetadata;
       const rawChunks = metadata?.groundingChunks ?? [];
 
@@ -1472,18 +2000,26 @@ async function startServer() {
           ? [prompt]
           : [];
 
+      const parsedMediaDirective = parseMediaDirectiveFromAnswer(rawAnswer);
+      const answer = parsedMediaDirective.cleanAnswer;
+
       if (!answer) {
         res.status(502).json({ error: 'Gemini returned an empty response. Please try again.' });
         return;
       }
 
-      const fetchedMedia = await mediaPromise;
-      const answerMedia = extractMediaFromText(answer);
+      // Fetch images & videos grounded in the AI's actual output (directive topics + answer entities)
+      const fetchedMedia = await fetchEmbeddedMedia(prompt, baseHistory, {
+        answer,
+        imageQueries: parsedMediaDirective.imageQueries,
+        videoQuery: parsedMediaDirective.videoQuery,
+        explicitNone: parsedMediaDirective.explicitNone,
+      });
       const seenMediaKeys = new Set<string>();
       const mergedImages: EmbeddedMediaItem[] = [];
       const mergedVideos: EmbeddedMediaItem[] = [];
 
-      for (const item of [...fetchedMedia, ...answerMedia]) {
+      for (const item of fetchedMedia) {
         const key = item.embedUrl || item.url;
         if (!key || seenMediaKeys.has(key)) continue;
         seenMediaKeys.add(key);
@@ -1523,7 +2059,7 @@ async function startServer() {
       let friendlyMessage = rawMessage;
       if (status === 429 || rawMessage.includes('RESOURCE_EXHAUSTED')) {
         friendlyMessage =
-          'Gemini API quota exceeded (429 RESOURCE_EXHAUSTED) on the current API key. Wait for the quota window to reset or select a billing-enabled API key in AI Studio Settings > Secrets.';
+          'Gemini free-tier rate limit reached (429 RESOURCE_EXHAUSTED). Wait briefly for the quota window to reset or select an API key in AI Studio Settings > Secrets.';
       } else if (status === 503) {
         friendlyMessage = 'Gemini is experiencing a brief demand spike (503). Please try again in a moment.';
       }
@@ -1550,7 +2086,7 @@ async function startServer() {
     return (crc ^ 0xffffffff) >>> 0;
   };
 
-  const buildZipBuffer = (entries: { name: string; data: Buffer }[]): Buffer => {
+  const buildZipBufferAsync = async (entries: { name: string; data: Buffer }[]): Promise<Buffer> => {
     const localParts: Buffer[] = [];
     const centralParts: Buffer[] = [];
     let offset = 0;
@@ -1558,7 +2094,7 @@ async function startServer() {
     for (const entry of entries) {
       const nameBuf = Buffer.from(entry.name, 'utf8');
       const raw = entry.data;
-      const compressed = zlib.deflateRawSync(raw, { level: 6 });
+      const compressed = await deflateRawAsync(raw, { level: 6 });
       const crc = computeCrc32(raw);
 
       const localHeader = Buffer.alloc(30);
@@ -1613,7 +2149,7 @@ async function startServer() {
     return Buffer.concat([...localParts, centralDir, eocd]);
   };
 
-  app.get('/api/export/source', (_req, res) => {
+  app.get('/api/export/source', async (_req, res) => {
     try {
       const rootDir = __dirname;
       const rootFiles = [
@@ -1631,30 +2167,40 @@ async function startServer() {
 
       for (const rel of rootFiles) {
         const full = path.join(rootDir, rel);
-        if (fs.existsSync(full) && fs.lstatSync(full).isFile()) {
-          files.push({ name: `buh-source/${rel}`, data: fs.readFileSync(full) });
+        try {
+          const stat = await fs.promises.lstat(full);
+          if (stat.isFile()) {
+            files.push({ name: `buh-source/${rel}`, data: await fs.promises.readFile(full) });
+          }
+        } catch {
+          // File optional / missing
         }
       }
 
-      const walkDir = (dirFull: string, relPrefix: string) => {
-        if (!fs.existsSync(dirFull)) return;
-        const items = fs.readdirSync(dirFull, { withFileTypes: true });
+      const walkDir = async (dirFull: string, relPrefix: string) => {
+        let items: fs.Dirent[];
+        try {
+          items = await fs.promises.readdir(dirFull, { withFileTypes: true });
+        } catch {
+          return;
+        }
         for (const item of items) {
           if ((item.name.startsWith('.') && item.name !== '.well-known') || item.isSymbolicLink()) continue;
           const nextFull = path.join(dirFull, item.name);
           const nextRel = `${relPrefix}/${item.name}`;
           if (item.isDirectory()) {
-            walkDir(nextFull, nextRel);
+            await walkDir(nextFull, nextRel);
           } else if (item.isFile()) {
-            files.push({ name: `buh-source/${nextRel}`, data: fs.readFileSync(nextFull) });
+            files.push({ name: `buh-source/${nextRel}`, data: await fs.promises.readFile(nextFull) });
           }
         }
       };
 
-      walkDir(path.join(rootDir, 'src'), 'src');
-      walkDir(path.join(rootDir, 'public'), 'public');
+      await walkDir(path.join(rootDir, 'src'), 'src');
+      await walkDir(path.join(rootDir, 'public'), 'public');
 
-      const zipBuf = buildZipBuffer(files);
+      const zipBuf = await buildZipBufferAsync(files);
+      res.setHeader('Cache-Control', 'no-store');
       res.setHeader('Content-Type', 'application/zip');
       res.setHeader('Content-Disposition', 'attachment; filename="buh-source.zip"');
       res.setHeader('Content-Length', String(zipBuf.length));
@@ -1704,17 +2250,10 @@ async function startServer() {
     res.json([]);
   });
 
+  let viteInstance: Awaited<ReturnType<(typeof import('vite'))['createServer']>> | null = null;
+
   if (isDev) {
     const hmrDisabled = process.env.DISABLE_HMR === 'true';
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: hmrDisabled ? false : { server: httpServer },
-      },
-      appType: 'spa',
-    });
-
     if (hmrDisabled) {
       app.get('/@vite/client', (_req, res) => {
         res.setHeader('Content-Type', 'application/javascript');
@@ -1722,7 +2261,43 @@ async function startServer() {
       });
     }
 
-    app.use(vite.middlewares);
+    let viteError: unknown = null;
+    const viteReady = (async () => {
+      try {
+        const { createServer: createViteServer } = await import('vite');
+        const vite = await createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: hmrDisabled ? false : { server: httpServer },
+          },
+          appType: 'spa',
+        });
+        viteInstance = vite;
+        return vite;
+      } catch (err) {
+        viteError = err;
+        console.error('Failed to initialize Vite middleware:', err);
+        throw err;
+      }
+    })();
+
+    app.use((req, res, next) => {
+      if (viteInstance) {
+        viteInstance.middlewares(req, res, next);
+        return;
+      }
+      if (viteError) {
+        res.status(503).send('Dev bundler failed to initialize.');
+        return;
+      }
+      viteReady
+        .then((vite) => vite.middlewares(req, res, next))
+        .catch(() => {
+          if (!res.headersSent) {
+            res.status(503).send('Dev bundler failed to initialize.');
+          }
+        });
+    });
   } else {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(
@@ -1746,9 +2321,30 @@ async function startServer() {
     });
   }
 
+  httpServer.on('error', (err) => {
+    console.error('HTTP server error:', err);
+    process.exit(1);
+  });
+
+  // Bind port 3000 immediately so health probes pass while Vite warms up in the background
   httpServer.listen(port, '0.0.0.0', () => {
     console.log(`buh server listening on http://0.0.0.0:${port}`);
   });
+
+  const shutdown = () => {
+    void (async () => {
+      try {
+        await viteInstance?.close();
+      } catch {
+        // ignore close errors during shutdown
+      }
+      httpServer.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 1500).unref();
+    })();
+  };
+
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
 }
 
 startServer().catch((err) => {

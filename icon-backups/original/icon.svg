@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <!-- White superellipse squircle -->
+  <path
+    d="M 256 12 C 428 12, 500 84, 500 256 C 500 428, 428 500, 256 500 C 84 500, 12 428, 12 256 C 12 84, 84 12, 256 12 Z"
+    fill="#FFFFFF"
+    stroke="#E7E5E4"
+    stroke-width="3"
+  />
+  <!-- Centered minimalist wordmark -->
+  <text
+    x="258"
+    y="305"
+    text-anchor="middle"
+    font-family="'Plus Jakarta Sans', 'Noto Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+    font-size="162"
+    font-weight="700"
+    letter-spacing="-6"
+    fill="#111312"
+  >buh<tspan fill="#C7DFF1">.</tspan></text>
+</svg>

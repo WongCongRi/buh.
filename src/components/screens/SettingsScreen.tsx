@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowDown,
   ArrowUp,
@@ -7,6 +7,7 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clock,
   Download,
   Folder,
   GripVertical,
@@ -30,7 +31,9 @@ import {
   NoteItem,
   TaskItem,
 } from '../../types/taskflow';
-import { normalizeHex } from '../../utils/colorUtils';
+import { isValidHex, normalizeHex } from '../../utils/colorUtils';
+import { formatDateObjDDMMYYYY } from '../../utils/dateLabels';
+import { formatTimeDisplay, useTimeFormat } from '../../utils/timeFormat';
 import {
   dispatchTestNotification,
   getNotificationPermissionState,
@@ -102,7 +105,24 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
   googleTasks,
   cloudNotesSync,
 }) => {
+  const activeTimeFormat = useTimeFormat();
   const [showExportPreview, setShowExportPreview] = useState(false);
+
+  const taskCountByCategory = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const t of tasks) {
+      map.set(t.category, (map.get(t.category) || 0) + 1);
+    }
+    return map;
+  }, [tasks]);
+
+  const noteCountByFolder = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const n of notes) {
+      map.set(n.folder, (map.get(n.folder) || 0) + 1);
+    }
+    return map;
+  }, [notes]);
 
   // Lists & Folders sections are collapsed by default
   const [listsExpanded, setListsExpanded] = useState(false);
@@ -148,8 +168,20 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
     return perm === 'denied' || isAndroidDevice();
   });
   const debounceRef = useRef<number | null>(null);
+  const pendingCommitHexRef = useRef<string | null>(null);
   const currentHex = normalizeHex(accentColor);
+  const [hexInput, setHexInput] = useState<string>(currentHex);
+  const [isEditingHex, setIsEditingHex] = useState<boolean>(false);
+  const [hexError, setHexError] = useState<boolean>(false);
+  const hexInputRef = useRef<HTMLInputElement | null>(null);
   const inIframe = isEmbeddedIframe();
+
+  useEffect(() => {
+    if (!isEditingHex) {
+      setHexInput(currentHex);
+      setHexError(false);
+    }
+  }, [currentHex, isEditingHex]);
 
   // Auto-refresh notification permission & Service Worker push status when returning from Android Settings
   useEffect(() => {
@@ -266,12 +298,16 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
 
   const handlePickerChange = (rawHex: string) => {
     const normalized = normalizeHex(rawHex);
+    setHexInput(normalized);
+    setHexError(false);
+    pendingCommitHexRef.current = normalized;
     onPreviewAccentColor(normalized);
     if (debounceRef.current) {
       window.clearTimeout(debounceRef.current);
     }
     debounceRef.current = window.setTimeout(() => {
       onSelectAccentColor(normalized);
+      pendingCommitHexRef.current = null;
       debounceRef.current = null;
     }, 450);
   };
@@ -281,7 +317,77 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       window.clearTimeout(debounceRef.current);
       debounceRef.current = null;
     }
-    onSelectAccentColor(currentHex);
+    const target = pendingCommitHexRef.current ?? currentHex;
+    pendingCommitHexRef.current = null;
+    onSelectAccentColor(target);
+  };
+
+  const handleHexInputChange = (raw: string) => {
+    const trimmed = raw.trimStart();
+    const hasLeadingHash = trimmed.startsWith('#');
+    const digits = trimmed.replace(/[^0-9a-fA-F]/g, '').slice(0, 6);
+    const nextValue = (hasLeadingHash ? '#' : '') + digits;
+    setHexInput(nextValue);
+    setHexError(false);
+
+    if (digits.length === 6) {
+      const normalized = normalizeHex(nextValue);
+      pendingCommitHexRef.current = normalized;
+      onPreviewAccentColor(normalized);
+      if (debounceRef.current) {
+        window.clearTimeout(debounceRef.current);
+      }
+      debounceRef.current = window.setTimeout(() => {
+        onSelectAccentColor(normalized);
+        pendingCommitHexRef.current = null;
+        debounceRef.current = null;
+      }, 450);
+    }
+  };
+
+  const handleHexSubmit = () => {
+    if (!isValidHex(hexInput)) {
+      setHexError(true);
+      return;
+    }
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    const normalized = normalizeHex(hexInput);
+    pendingCommitHexRef.current = null;
+    setHexInput(normalized);
+    setHexError(false);
+    setIsEditingHex(false);
+    onSelectAccentColor(normalized);
+    hexInputRef.current?.blur();
+  };
+
+  const handleHexBlur = () => {
+    if (debounceRef.current) {
+      window.clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    if (isValidHex(hexInput)) {
+      const normalized = normalizeHex(hexInput);
+      const shouldCommit =
+        normalized !== currentHex || pendingCommitHexRef.current !== null;
+      pendingCommitHexRef.current = null;
+      setHexInput(normalized);
+      setHexError(false);
+      setIsEditingHex(false);
+      if (shouldCommit) {
+        onSelectAccentColor(normalized);
+      }
+      return;
+    }
+    if (pendingCommitHexRef.current) {
+      onSelectAccentColor(pendingCommitHexRef.current);
+      pendingCommitHexRef.current = null;
+    }
+    setHexInput(currentHex);
+    setHexError(false);
+    setIsEditingHex(false);
   };
 
   const handleCreateList = (e: React.FormEvent) => {
@@ -380,7 +486,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </span>
             <div className="min-w-0">
               <p className="text-[14.5px] font-medium text-stone-900 dark:text-stone-100 leading-snug">
-                Lists
+                Task Lists
               </p>
               <p className="text-[12.5px] text-stone-500 dark:text-stone-400 truncate leading-snug mt-0.5">
                 {listsExpanded
@@ -399,7 +505,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         {listsExpanded && (
           <div>
             {taskLists.map((listName, idx) => {
-              const count = tasks.filter((t) => t.category === listName).length;
+              const count = taskCountByCategory.get(listName) || 0;
               const isEditing = editingList === listName;
               const isDragging = dragIndex === idx;
               const isDropTarget = dropIndex === idx && dragIndex !== null && dragIndex !== idx;
@@ -568,7 +674,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             </span>
             <div className="min-w-0">
               <p className="text-[14.5px] font-medium text-stone-900 dark:text-stone-100 leading-snug">
-                Folders
+                Note Folders
               </p>
               <p className="text-[12.5px] text-stone-500 dark:text-stone-400 truncate leading-snug mt-0.5">
                 {foldersExpanded
@@ -587,7 +693,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
         {foldersExpanded && (
           <div>
             {noteFolders.map((folderName, idx) => {
-              const count = notes.filter((n) => n.folder === folderName).length;
+              const count = noteCountByFolder.get(folderName) || 0;
               const isEditing = editingFolder === folderName;
               const isDragging = folderDragIndex === idx;
               const isDropTarget =
@@ -755,11 +861,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       now.getMonth() - historyMonths,
       now.getDate()
     );
-    const formatted = cutoff.toLocaleDateString(undefined, {
-      month: 'short',
-      day: 'numeric',
-      year: 'numeric',
-    });
+    const formatted = formatDateObjDDMMYYYY(cutoff);
     return `Showing completed tasks since ${formatted}`;
   })();
 
@@ -1010,7 +1112,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
             <div className="mt-2 space-y-1.5 text-[12.5px] text-stone-500 dark:text-stone-400 leading-relaxed">
               <p>
                 <strong className="text-stone-700 dark:text-stone-200">1. Register permission:</strong>{' '}
-                Tap <strong>Enable</strong> above (or <strong>Send test</strong>) first so Android creates the notification channel for <strong>buh.</strong> Notifications include <strong>Snooze 10m</strong> and <strong>Clear</strong> buttons.
+                Tap <strong>Enable</strong> above (or <strong>Send test</strong>) first so Android creates the notification channel for <strong>buh.</strong> Notifications include <strong>Snooze 10m</strong> and <strong>Done</strong> buttons.
               </p>
               <p>
                 <strong className="text-stone-700 dark:text-stone-200">2. Installed app (Android / Samsung):</strong>{' '}
@@ -1060,30 +1162,116 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           </button>
         </div>
 
-        {/* Accent Colour Picker + 5 Most Recent Colours */}
+        {/* Time Format (24h / 12h) */}
+        <div className={`flex items-center justify-between gap-2.5 px-3.5 py-2.5 border-b ${tokens.divider}`}>
+          <div className="min-w-0">
+            <p className="text-[14.5px] font-medium text-stone-900 dark:text-stone-100 leading-snug">Time format</p>
+            <p className="text-[12.5px] text-stone-500 dark:text-stone-400 truncate leading-snug mt-0.5 tabular-nums">
+              {(settings.timeFormat ?? '24h') === '12h'
+                ? '12-hour clock (2:30 PM)'
+                : '24-hour clock (14:30)'}
+            </p>
+          </div>
+          <div
+            className={`inline-flex items-center p-0.5 ${tokens.subtleBg} ${tokens.buttonRadius} shrink-0`}
+            role="group"
+            aria-label="Time format"
+          >
+            {(['24h', '12h'] as const).map((fmt) => {
+              const active = (settings.timeFormat ?? '24h') === fmt;
+              return (
+                <button
+                  key={fmt}
+                  type="button"
+                  onClick={() => onUpdateSettings({ timeFormat: fmt })}
+                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-[12.5px] font-medium tabular-nums ${tokens.buttonRadius} transition-colors ${
+                    active
+                      ? tokens.accentBg
+                      : 'text-stone-600 dark:text-stone-300 hover:text-stone-900 dark:hover:text-stone-100'
+                  }`}
+                >
+                  {fmt === '24h' && <Clock className="w-3.5 h-3.5" />}
+                  {fmt}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Accent Colour Picker + Hex Input + 5 Most Recent Colours */}
         <div className={`px-3.5 py-2.5 space-y-2.5 border-b ${tokens.divider}`}>
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex items-center justify-between gap-2 flex-wrap">
             <div className="min-w-0">
               <p className="text-[14.5px] font-medium text-stone-900 dark:text-stone-100">Accent colour</p>
-              <p className="text-[12.5px] font-mono-tabular text-stone-500 dark:text-stone-400">
-                {currentHex}
+              <p className="text-[12px] text-stone-500 dark:text-stone-400">
+                {hexError ? (
+                  <span className="text-rose-500 dark:text-rose-400">Enter 3 or 6 hex digits</span>
+                ) : (
+                  'Enter hex code or pick'
+                )}
               </p>
             </div>
-            <label
-              htmlFor="settings-accent-picker"
-              className={`inline-flex items-center gap-2 px-3 py-1.5 ${tokens.subtleBg} ${tokens.buttonRadius} cursor-pointer shrink-0`}
-            >
-              <input
-                id="settings-accent-picker"
-                type="color"
-                value={currentHex}
-                onChange={(e) => handlePickerChange(e.target.value)}
-                onBlur={handlePickerBlur}
-                aria-label="Choose custom accent colour"
-                className="w-6 h-6 rounded border border-stone-300 dark:border-stone-700 bg-transparent cursor-pointer p-0"
-              />
-              <span className="text-[13px] font-medium text-stone-700 dark:text-stone-200">Pick</span>
-            </label>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  handleHexSubmit();
+                }}
+                className="flex items-center"
+              >
+                <input
+                  ref={hexInputRef}
+                  type="text"
+                  value={hexInput}
+                  onFocus={(e) => {
+                    setIsEditingHex(true);
+                    e.currentTarget.select();
+                  }}
+                  onChange={(e) => handleHexInputChange(e.target.value)}
+                  onBlur={handleHexBlur}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Escape') {
+                      if (debounceRef.current) {
+                        window.clearTimeout(debounceRef.current);
+                        debounceRef.current = null;
+                      }
+                      pendingCommitHexRef.current = null;
+                      setHexError(false);
+                      setHexInput(currentHex);
+                      setIsEditingHex(false);
+                      e.currentTarget.blur();
+                    }
+                  }}
+                  maxLength={7}
+                  enterKeyHint="done"
+                  spellCheck={false}
+                  autoCapitalize="characters"
+                  autoComplete="off"
+                  placeholder="#C7DFF1"
+                  aria-label="Accent colour hex code"
+                  className={`w-[5.75rem] px-2.5 py-1.5 text-[13px] font-mono-tabular uppercase text-center ${tokens.subtleBg} text-stone-800 dark:text-stone-100 placeholder:text-stone-400 ${tokens.buttonRadius} border transition-colors focus:outline-none ${
+                    hexError
+                      ? 'border-rose-400 dark:border-rose-500'
+                      : 'border-transparent focus:border-stone-300 dark:focus:border-stone-600'
+                  }`}
+                />
+              </form>
+              <label
+                htmlFor="settings-accent-picker"
+                className={`inline-flex items-center gap-2 px-2.5 py-1.5 ${tokens.subtleBg} ${tokens.buttonRadius} cursor-pointer shrink-0`}
+              >
+                <input
+                  id="settings-accent-picker"
+                  type="color"
+                  value={currentHex}
+                  onChange={(e) => handlePickerChange(e.target.value)}
+                  onBlur={handlePickerBlur}
+                  aria-label="Choose custom accent colour"
+                  className="w-6 h-6 rounded border border-stone-300 dark:border-stone-700 bg-transparent cursor-pointer p-0"
+                />
+                <span className="text-[13px] font-medium text-stone-700 dark:text-stone-200">Pick</span>
+              </label>
+            </div>
           </div>
 
           <div className="flex items-center justify-between gap-2">
@@ -1152,12 +1340,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
       </span>
       <div className={`${tokens.cardBg} ${tokens.cardRadius} overflow-hidden`}>
         {renderToggleRow(
-          'buh. Cloud notes sync',
+          'buh. Cloud Sync',
           cloudNotesSync.isSignedIn
             ? cloudSyncEnabled
-              ? `${cloudNotesSync.syncedNotesCount} ${cloudNotesSync.syncedNotesCount === 1 ? 'note' : 'notes'} · ${cloudNotesSync.syncedFoldersCount} ${cloudNotesSync.syncedFoldersCount === 1 ? 'folder' : 'folders'} synced${cloudNotesSync.lastSyncedAt ? ` · ${cloudNotesSync.lastSyncedAt}` : ''}`
-              : 'Paused — enable to sync notes & folders across devices'
-            : 'Sign in with Google below to sync notes & folders across devices',
+              ? `Active in background · ${cloudNotesSync.syncedNotesCount} notes · ${cloudNotesSync.syncedTasksCount ?? 0} tasks · ${cloudNotesSync.syncedEventsCount ?? 0} blocks · ${cloudNotesSync.syncedLookupCount ?? 0} lookups${cloudNotesSync.lastSyncedAt ? ` · ${formatTimeDisplay(cloudNotesSync.lastSyncedAt, activeTimeFormat)}` : ''}`
+              : 'Paused — enable for silent background sync across devices'
+            : 'Sign in with Google below to sync tasks, notes, blocks, Lookup & settings automatically',
           cloudSyncEnabled,
           () => onUpdateSettings({ buhCloudSync: !cloudSyncEnabled })
         )}
@@ -1165,7 +1353,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           'Google Calendar sync',
           googleCalendar.isConnected
             ? `Synced with ${googleCalendar.userEmail || 'Google account'}`
-            : 'Connect Google to view & add calendar events',
+            : googleCalendar.userEmail
+              ? `${googleCalendar.syncedCount} cached events · tap refresh to pull updates`
+              : 'Connect Google to view & add calendar events',
           settings.googleCalendarSync,
           () => onUpdateSettings({ googleCalendarSync: !settings.googleCalendarSync })
         )}
@@ -1173,7 +1363,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
           'Google Tasks sync',
           googleTasks.isConnected
             ? `${googleTasks.syncedCount} synced tasks across ${Math.max(1, googleTasks.taskLists.length)} list${googleTasks.taskLists.length === 1 ? '' : 's'}`
-            : 'Sync task lists, due dates, and completion status',
+            : googleTasks.userEmail
+              ? `${googleTasks.syncedCount} cached tasks · tap refresh to pull updates`
+              : 'Sync task lists, due dates, and completion status',
           settings.googleTasksSync,
           () => onUpdateSettings({ googleTasksSync: !settings.googleTasksSync })
         )}
@@ -1185,9 +1377,9 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                   {googleCalendar.userEmail || 'Google account connected'}
                 </p>
                 <p className="text-[12.5px] text-stone-500 dark:text-stone-400 truncate tabular-nums">
-                  {googleCalendar.syncedCount} events · {googleTasks.syncedCount} tasks ·{' '}
+                  {googleCalendar.syncedCount} events · {googleTasks.syncedCount} Google tasks ·{' '}
                   {cloudNotesSync.syncedNotesCount} notes
-                  {lastGoogleUpdate ? ` · ${lastGoogleUpdate}` : ''}
+                  {lastGoogleUpdate ? ` · ${formatTimeDisplay(lastGoogleUpdate, activeTimeFormat)}` : ''}
                 </p>
               </div>
               <div className="flex items-center gap-1.5 shrink-0">
@@ -1201,7 +1393,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                       void cloudNotesSync.onSyncNow();
                     }
                   }}
-                  aria-label="Sync Google Calendar, Tasks, and buh. Cloud Notes now"
+                  aria-label="Sync Google Calendar, Tasks, and buh. Cloud Sync now"
                   className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} disabled:opacity-60`}
                 >
                   <RefreshCw className={`w-3.5 h-3.5 ${isAnyGoogleSyncing ? 'animate-spin' : ''}`} />
@@ -1228,8 +1420,8 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                     </p>
                     <p className="text-[12px] text-stone-500 dark:text-stone-400 truncate tabular-nums">
                       {cloudSyncEnabled
-                        ? `Notes cloud sync active · ${cloudNotesSync.syncedNotesCount} notes`
-                        : 'Notes cloud sync paused'}
+                        ? `Cloud sync active · ${cloudNotesSync.syncedNotesCount} notes · ${cloudNotesSync.syncedTasksCount ?? 0} tasks · ${cloudNotesSync.syncedEventsCount ?? 0} blocks · ${cloudNotesSync.syncedLookupCount ?? 0} lookups`
+                        : 'buh. Cloud Sync paused'}
                     </p>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
@@ -1238,13 +1430,13 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
                         type="button"
                         disabled={cloudNotesSync.isSyncing}
                         onClick={() => void cloudNotesSync.onSyncNow()}
-                        aria-label="Sync buh. Cloud Notes now"
+                        aria-label="Sync buh. Cloud workspace now"
                         className={`inline-flex items-center gap-1 px-2.5 py-1 text-[12.5px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} ${tokens.buttonRadius} disabled:opacity-60`}
                       >
                         <RefreshCw
                           className={`w-3.5 h-3.5 ${cloudNotesSync.isSyncing ? 'animate-spin' : ''}`}
                         />
-                        Sync notes
+                        Sync cloud
                       </button>
                     )}
                     <button
@@ -1262,12 +1454,12 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({
               <GoogleSignInButton
                 onClick={() => googleCalendar.onSignIn()}
                 loading={googleCalendar.isSigningIn}
-                label={googleCalendar.userEmail ? 'Reconnect Google' : 'Sign in with Google'}
+                label={googleCalendar.userEmail ? 'Refresh Google Calendar & Tasks' : 'Sign in with Google'}
               />
               <p className="text-[12.5px] text-stone-400 dark:text-stone-500 leading-snug">
                 {googleCalendar.userEmail
-                  ? `Tap above to resume live Google Calendar & Tasks sync for ${googleCalendar.userEmail}.`
-                  : 'Sign in with Google to sync notes & folders across devices plus Google Calendar & Tasks.'}
+                  ? `New tasks, blocks, notes, Lookup history & settings sync silently in buh. Cloud. Tap above anytime to refresh mirrored Google Calendar & Tasks for ${googleCalendar.userEmail}.`
+                  : 'Sign in with Google for silent background sync across devices plus Google Calendar & Tasks.'}
               </p>
             </div>
           )}

@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Check, Copy, X } from 'lucide-react';
 import { DefaultHome, DesignDecisions, NavMode, QuickCaptureMode, VisualStyle } from '../types/taskflow';
 import { normalizeHex } from '../utils/colorUtils';
@@ -20,6 +20,15 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   onConfirmApprove,
 }) => {
   const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   useBackLayer(open, onClose, 20);
 
@@ -67,7 +76,13 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
     try {
       await navigator.clipboard.writeText(specText);
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopied(false);
+        copyTimerRef.current = null;
+      }, 2000);
     } catch {
       setCopied(false);
     }

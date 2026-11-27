@@ -5,22 +5,39 @@ import {
   User,
 } from 'firebase/auth';
 import { auth } from '../firebase';
-import { CalendarEvent } from '../types/taskflow';
+import { CalendarEvent, RecurrenceRule } from '../types/taskflow';
+import { parseGoogleRRule, toGoogleCalendarRRule } from '../utils/recurrence';
 
-export const SCOPES = [
+const SCOPES = [
   'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/tasks',
 ] as const;
 
-const provider = new GoogleAuthProvider();
-for (const scope of SCOPES) {
-  provider.addScope(scope);
+function createGoogleProvider(customParams?: Record<string, string>): GoogleAuthProvider {
+  const p = new GoogleAuthProvider();
+  for (const scope of SCOPES) {
+    p.addScope(scope);
+  }
+  p.setCustomParameters({
+    include_granted_scopes: 'true',
+    ...(customParams ?? {}),
+  });
+  return p;
 }
-provider.setCustomParameters({ prompt: 'select_account' });
 
 // Strict in-memory token cache (never stored in localStorage/sessionStorage)
+const TOKEN_TTL_MS = 55 * 60 * 1000;
 let isSigningIn = false;
 let cachedAccessToken: string | null = null;
+let cachedAccessTokenExpiresAt: number | null = null;
+
+function setCachedAccessToken(token: string | null): void {
+  cachedAccessToken = token;
+  cachedAccessTokenExpiresAt = token ? Date.now() + TOKEN_TTL_MS : null;
+}
+
+export const isCalendarAccessTokenFresh = (): boolean =>
+  Boolean(cachedAccessToken && cachedAccessTokenExpiresAt && Date.now() < cachedAccessTokenExpiresAt);
 
 export const initGoogleAuth = (
   onAuthSuccess?: (user: User, token: string) => void,
@@ -29,10 +46,10 @@ export const initGoogleAuth = (
 ) => {
   return onAuthStateChanged(auth, (user: User | null) => {
     if (user) {
-      if (cachedAccessToken) {
+      if (cachedAccessToken && isCalendarAccessTokenFresh()) {
         onAuthSuccess?.(user, cachedAccessToken);
       } else if (!isSigningIn) {
-        cachedAccessToken = null;
+        setCachedAccessToken(null);
         if (onNeedsReconnect) {
           onNeedsReconnect(user);
         } else {
@@ -40,7 +57,7 @@ export const initGoogleAuth = (
         }
       }
     } else {
-      cachedAccessToken = null;
+      setCachedAccessToken(null);
       onAuthFailure?.();
     }
   });
@@ -54,31 +71,52 @@ export const signInWithGoogleCalendar = async (
 }> => {
   try {
     isSigningIn = true;
-    if (loginHint) {
-      provider.setCustomParameters({ login_hint: loginHint });
+    const trimmedHint = loginHint && loginHint.includes('@') ? loginHint.trim() : null;
+    let result;
+
+    if (trimmedHint) {
+      // Try zero-click auto-closing popup first using remembered email + prompt: 'none'
+      try {
+        result = await signInWithPopup(
+          auth,
+          createGoogleProvider({ login_hint: trimmedHint, prompt: 'none' })
+        );
+      } catch (silentErr: unknown) {
+        const code = (silentErr as { code?: string })?.code;
+        if (
+          code === 'auth/popup-closed-by-user' ||
+          code === 'auth/cancelled-popup-request' ||
+          code === 'auth/network-request-failed'
+        ) {
+          throw silentErr;
+        }
+        // Fallback to single-account interactive prompt if Google requires confirmation
+        result = await signInWithPopup(auth, createGoogleProvider({ login_hint: trimmedHint }));
+      }
     } else {
-      provider.setCustomParameters({ prompt: 'select_account' });
+      result = await signInWithPopup(auth, createGoogleProvider({ prompt: 'select_account' }));
     }
-    const result = await signInWithPopup(auth, provider);
+
     const credential = GoogleAuthProvider.credentialFromResult(result);
     if (!credential?.accessToken) {
       throw new Error('Google permission token was not returned. Please try again.');
     }
-    cachedAccessToken = credential.accessToken;
-    return { user: result.user, accessToken: cachedAccessToken };
+    setCachedAccessToken(credential.accessToken);
+    return { user: result.user, accessToken: credential.accessToken };
   } finally {
     isSigningIn = false;
   }
 };
 
-export const getCalendarAccessToken = (): string | null => cachedAccessToken;
+export const getCalendarAccessToken = (): string | null =>
+  isCalendarAccessTokenFresh() ? cachedAccessToken : null;
 
 export const clearCachedGoogleAccessToken = (): void => {
-  cachedAccessToken = null;
+  setCachedAccessToken(null);
 };
 
 export const signOutGoogleCalendar = async (): Promise<void> => {
-  cachedAccessToken = null;
+  setCachedAccessToken(null);
   await auth.signOut();
 };
 
@@ -88,6 +126,8 @@ interface GoogleApiEvent {
   location?: string;
   htmlLink?: string;
   status?: string;
+  recurrence?: string[];
+  recurringEventId?: string;
   start?: {
     dateTime?: string;
     date?: string;
@@ -164,13 +204,15 @@ function mapGoogleEventToLocal(item: GoogleApiEvent): CalendarEvent | null {
     durationMinutes,
     calendarName: 'Google Calendar',
     location: item.location?.trim() || undefined,
+    recurrence: parseGoogleRRule(item.recurrence),
+    recurringEventId: item.recurringEventId,
     source: 'google',
     htmlLink: item.htmlLink,
   };
 }
 
 export async function fetchGoogleCalendarEvents(tokenOverride?: string): Promise<CalendarEvent[]> {
-  const token = tokenOverride || cachedAccessToken;
+  const token = tokenOverride || getCalendarAccessToken();
   if (!token) {
     throw new Error('NOT_AUTHENTICATED');
   }
@@ -193,7 +235,7 @@ export async function fetchGoogleCalendarEvents(tokenOverride?: string): Promise
   });
 
   if (resp.status === 401 || resp.status === 403) {
-    cachedAccessToken = null;
+    clearCachedGoogleAccessToken();
     throw new Error('AUTH_EXPIRED');
   }
 
@@ -220,10 +262,11 @@ export async function createGoogleCalendarEvent(
     endTime: string;
     location?: string;
     calendarName?: string;
+    recurrence?: RecurrenceRule;
   },
   tokenOverride?: string
 ): Promise<CalendarEvent> {
-  const token = tokenOverride || cachedAccessToken;
+  const token = tokenOverride || getCalendarAccessToken();
   if (!token) {
     throw new Error('NOT_AUTHENTICATED');
   }
@@ -248,29 +291,35 @@ export async function createGoogleCalendarEvent(
   }
 
   const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+  const rrule = eventInput.recurrence ? toGoogleCalendarRRule(eventInput.recurrence) : null;
+  const payload: Record<string, unknown> = {
+    summary: eventInput.title,
+    location: eventInput.location,
+    description: eventInput.calendarName ? `Created from buh. (${eventInput.calendarName})` : 'Created from buh.',
+    start: {
+      dateTime: startDt.toISOString(),
+      timeZone,
+    },
+    end: {
+      dateTime: endDt.toISOString(),
+      timeZone,
+    },
+  };
+  if (rrule) {
+    payload.recurrence = [rrule];
+  }
+
   const resp = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      summary: eventInput.title,
-      location: eventInput.location,
-      description: eventInput.calendarName ? `Created from buh. (${eventInput.calendarName})` : 'Created from buh.',
-      start: {
-        dateTime: startDt.toISOString(),
-        timeZone,
-      },
-      end: {
-        dateTime: endDt.toISOString(),
-        timeZone,
-      },
-    }),
+    body: JSON.stringify(payload),
   });
 
   if (resp.status === 401 || resp.status === 403) {
-    cachedAccessToken = null;
+    clearCachedGoogleAccessToken();
     throw new Error('AUTH_EXPIRED');
   }
 
@@ -291,7 +340,7 @@ export async function deleteGoogleCalendarEvent(
   googleEventId: string,
   tokenOverride?: string
 ): Promise<void> {
-  const token = tokenOverride || cachedAccessToken;
+  const token = tokenOverride || getCalendarAccessToken();
   if (!token) {
     throw new Error('NOT_AUTHENTICATED');
   }
@@ -307,7 +356,7 @@ export async function deleteGoogleCalendarEvent(
   );
 
   if (resp.status === 401 || resp.status === 403) {
-    cachedAccessToken = null;
+    clearCachedGoogleAccessToken();
     throw new Error('AUTH_EXPIRED');
   }
 

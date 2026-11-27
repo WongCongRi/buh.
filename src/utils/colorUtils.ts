@@ -1,4 +1,4 @@
-export interface AccentPalette {
+interface AccentPalette {
   hex: string;
   solidBg: string;
   solidHoverBg: string;
@@ -10,10 +10,10 @@ export interface AccentPalette {
   border: string;
 }
 
-export const DEFAULT_ACCENT_COLOR = '#7BB6E0';
+export const DEFAULT_ACCENT_COLOR = '#C7DFF1';
 
 export const ACCENT_PRESETS: { name: string; hex: string }[] = [
-  { name: 'Soft Sky', hex: '#7BB6E0' },
+  { name: 'Soft Sky', hex: '#C7DFF1' },
   { name: 'Mist Blue', hex: '#93C5E8' },
   { name: 'Powder Slate', hex: '#86A8C9' },
   { name: 'Periwinkle', hex: '#8FA8E0' },
@@ -23,6 +23,11 @@ export const ACCENT_PRESETS: { name: string; hex: string }[] = [
 
 function clampByte(n: number): number {
   return Math.max(0, Math.min(255, Math.round(n)));
+}
+
+export function isValidHex(input: string): boolean {
+  const clean = input.trim().replace(/^#/, '');
+  return /^[0-9a-fA-F]{6}$/.test(clean) || /^[0-9a-fA-F]{3}$/.test(clean);
 }
 
 export function normalizeHex(input: string): string {
@@ -75,7 +80,7 @@ function mixRgb(
   };
 }
 
-export function buildAccentPalette(rawHex: string): AccentPalette {
+function buildAccentPalette(rawHex: string): AccentPalette {
   const hex = normalizeHex(rawHex);
   const rgb = hexToRgb(hex);
   const lum = relativeLuminance(rgb.r, rgb.g, rgb.b);

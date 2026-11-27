@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Battery,
   Bell,
@@ -11,14 +11,15 @@ import {
   LayoutDashboard,
   Menu,
   Plus,
+  Repeat,
   RotateCcw,
   Search,
   Settings as SettingsIcon,
   Wifi,
   X,
 } from 'lucide-react';
-import { TODAY_DATE_KEY, TOMORROW_DATE_KEY } from '../data/initialData';
 import { useOnlineStatus } from '../hooks/useOnlineStatus';
+import { useTodayDateKey } from '../hooks/useTodayDateKey';
 import { useBackLayer } from '../hooks/useAndroidBackNavigation';
 import {
   AppSettingsState,
@@ -35,30 +36,48 @@ import {
   ScreenId,
   TaskItem,
 } from '../types/taskflow';
-import {
-  loadCachedLookupEntries,
-  saveCachedLookupEntries,
-} from '../utils/offlineSync';
 import { parseQuickTaskInput } from '../utils/quickAddParser';
+import { formatRelativeTaskDate } from '../utils/dateLabels';
+import { formatTimeDisplay, useTimeFormat } from '../utils/timeFormat';
+import {
+  RECURRENCE_PRESETS,
+  RecurrencePresetId,
+  buildRuleFromPreset,
+  formatRecurrenceLabel,
+  getPresetIdForRule,
+} from '../utils/recurrence';
 import {
   formatReminderLabel,
   getNotificationPermissionState,
   requestAppNotificationPermission,
 } from '../utils/taskReminders';
 import { getDeviceStyleTokens } from '../utils/themeTokens';
-import { AndroidKeyboardSimulator } from './AndroidKeyboardSimulator';
-import { GlobalSearchModal, SearchSelection } from './GlobalSearchModal';
-import {
-  GoogleTaskConfirmModal,
-  PendingGoogleTaskMutation,
-} from './GoogleTaskConfirmModal';
+import type { SearchSelection } from './GlobalSearchModal';
+import type { PendingGoogleTaskMutation } from './GoogleTaskConfirmModal';
 import { NlpTaskInput } from './NlpTaskInput';
 import { PWAInstallButton } from './PWAInstallButton';
 import { HomeScreen } from './screens/HomeScreen';
-import { NotesScreen } from './screens/NotesScreen';
-import { QuickCheckEntry, QuickCheckScreen } from './screens/QuickCheckScreen';
-import { SettingsScreen } from './screens/SettingsScreen';
+import type { QuickCheckEntry } from './screens/QuickCheckScreen';
 import { TasksScreen } from './screens/TasksScreen';
+
+const AndroidKeyboardSimulator = lazy(() =>
+  import('./AndroidKeyboardSimulator').then((m) => ({ default: m.AndroidKeyboardSimulator }))
+);
+const GlobalSearchModal = lazy(() =>
+  import('./GlobalSearchModal').then((m) => ({ default: m.GlobalSearchModal }))
+);
+const GoogleTaskConfirmModal = lazy(() =>
+  import('./GoogleTaskConfirmModal').then((m) => ({ default: m.GoogleTaskConfirmModal }))
+);
+const NotesScreen = lazy(() =>
+  import('./screens/NotesScreen').then((m) => ({ default: m.NotesScreen }))
+);
+const QuickCheckScreen = lazy(() =>
+  import('./screens/QuickCheckScreen').then((m) => ({ default: m.QuickCheckScreen }))
+);
+const SettingsScreen = lazy(() =>
+  import('./screens/SettingsScreen').then((m) => ({ default: m.SettingsScreen }))
+);
 
 export interface ActiveReminderAlert {
   id: string;
@@ -70,12 +89,7 @@ export interface ActiveReminderAlert {
 }
 
 function formatPreviewDateKey(dateKey: string): string {
-  if (dateKey === TODAY_DATE_KEY) return 'Today';
-  if (dateKey === TOMORROW_DATE_KEY) return 'Tomorrow';
-  const [yStr, mStr, dStr] = dateKey.split('-');
-  const dt = new Date(Number(yStr), Number(mStr) - 1, Number(dStr));
-  if (Number.isNaN(dt.getTime())) return dateKey;
-  return dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  return formatRelativeTaskDate(dateKey).label;
 }
 
 interface FoldDeviceFrameProps {
@@ -137,6 +151,9 @@ interface FoldDeviceFrameProps {
   externalShortcut?: { action: 'new-task' | 'new-note'; nonce: number } | null;
   onConsumeExternalShortcut?: () => void;
   hiddenCompletedTasksCount?: number;
+  quickCheckEntries: QuickCheckEntry[];
+  onChangeQuickCheckEntries: React.Dispatch<React.SetStateAction<QuickCheckEntry[]>>;
+  syncBanner?: React.ReactNode;
 }
 
 export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
@@ -198,7 +215,11 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   externalShortcut = null,
   onConsumeExternalShortcut,
   hiddenCompletedTasksCount = 0,
+  quickCheckEntries,
+  onChangeQuickCheckEntries: setQuickCheckEntries,
+  syncBanner,
 }) => {
+  const timeFormat = useTimeFormat();
   const isOnline = useOnlineStatus();
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedNoteId, setSelectedNoteId] = useState<string>(notes[0]?.id || '');
@@ -212,17 +233,15 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   const [shortcutFocusNoteId, setShortcutFocusNoteId] = useState<string | null>(null);
   const [quickBarText, setQuickBarText] = useState('');
   const [fabModalOpen, setFabModalOpen] = useState(false);
+  const fabBackdropPointerDownRef = useRef(false);
   const [fabText, setFabText] = useState('');
-  const [fabListChoice, setFabListChoice] = useState<string>('AUTO');
+  const [fabListChoice, setFabListChoice] = useState<string | null>(null);
+  const [fabRepeatChoice, setFabRepeatChoice] = useState<RecurrencePresetId | null>(null);
   const [moreDrawerOpen, setMoreDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchHighlight, setSearchHighlight] = useState<SearchSelection | null>(null);
-  const [quickCheckEntries, setQuickCheckEntries] = useState<QuickCheckEntry[]>(() =>
-    loadCachedLookupEntries()
-  );
   const [pendingTaskMutation, setPendingTaskMutation] =
     useState<PendingGoogleTaskMutation | null>(null);
-  const [pendingReplaceLocalId, setPendingReplaceLocalId] = useState<string | null>(null);
   const [taskMutationBusy, setTaskMutationBusy] = useState(false);
   const [taskSyncToast, setTaskSyncToast] = useState<string | null>(null);
   const [undoDelete, setUndoDelete] = useState<{
@@ -231,7 +250,6 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     onUndo: () => void;
   } | null>(null);
   const undoTimerRef = useRef<number | null>(null);
-  const pendingTaskSavedCallbackRef = useRef<((createdTaskId?: string) => void) | null>(null);
 
   const showUndoToast = (label: string, onUndo: () => void) => {
     if (undoTimerRef.current !== null) {
@@ -289,10 +307,6 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   }, [activeScreen]);
 
   useEffect(() => {
-    saveCachedLookupEntries(quickCheckEntries);
-  }, [quickCheckEntries]);
-
-  useEffect(() => {
     if (!externalOpenTask) return;
     setSelectedTaskId(externalOpenTask.taskId);
     onConsumeExternalOpenTask?.();
@@ -318,7 +332,8 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
 
     if (externalShortcut.action === 'new-task') {
       setFabText('');
-      setFabListChoice('AUTO');
+      setFabListChoice(null);
+      setFabRepeatChoice(null);
       setFabModalOpen(true);
     } else if (externalShortcut.action === 'new-note') {
       setFabModalOpen(false);
@@ -333,9 +348,26 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     onConsumeExternalShortcut?.();
   }, [externalShortcut, onConsumeExternalShortcut]);
 
+  const { todayDateKey } = useTodayDateKey();
+  const taskToastTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (taskToastTimerRef.current !== null) {
+        window.clearTimeout(taskToastTimerRef.current);
+      }
+    };
+  }, []);
+
   const showTaskToast = (msg: string) => {
     setTaskSyncToast(msg);
-    window.setTimeout(() => setTaskSyncToast(null), 2600);
+    if (taskToastTimerRef.current !== null) {
+      window.clearTimeout(taskToastTimerRef.current);
+    }
+    taskToastTimerRef.current = window.setTimeout(() => {
+      setTaskSyncToast(null);
+      taskToastTimerRef.current = null;
+    }, 2600);
   };
 
   const resolveGoogleTargetList = (category?: string) => {
@@ -347,39 +379,6 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   };
 
   const requestAddTask = (created: TaskItem, onSaved?: (createdTaskId?: string) => void) => {
-    const wantsGoogleSync =
-      settings.googleTasksSync && (googleTasks.isConnected || Boolean(googleTasks.userEmail));
-    if (wantsGoogleSync && isOnline && googleTasks.isConnected) {
-      const target = resolveGoogleTargetList(created.category);
-      pendingTaskSavedCallbackRef.current = onSaved || null;
-      setPendingReplaceLocalId(null);
-      setPendingTaskMutation({
-        action: 'create',
-        task: created,
-        targetListId: target.id,
-        targetListTitle: target.title,
-      });
-      return;
-    }
-    if (wantsGoogleSync && !isOnline) {
-      const target = resolveGoogleTargetList(created.category);
-      void googleTasks
-        .onCreateGoogleTask({
-          title: created.title,
-          notes: created.notes,
-          dateKey: created.isInbox ? undefined : created.dateKey,
-          timeLabel: created.timeLabel,
-          priority: created.priority,
-          taskListId: target.id,
-          category: target.title,
-          reminders: created.reminders,
-        })
-        .then((createdId) => {
-          onSaved?.(typeof createdId === 'string' ? createdId : undefined);
-        });
-      showTaskToast(`Saved "${created.title}" offline · will sync when online`);
-      return;
-    }
     onAddTask(created);
     onSaved?.(created.id);
     if (!isOnline) {
@@ -388,35 +387,50 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   };
 
   const requestPushLocalTaskToGoogle = (task: TaskItem) => {
-    if (!settings.googleTasksSync || !googleTasks.isConnected) return;
+    if (!settings.googleTasksSync || (!googleTasks.isConnected && !googleTasks.userEmail)) return;
     const target = resolveGoogleTargetList(task.category);
-    setPendingReplaceLocalId(task.id);
-    setPendingTaskMutation({
-      action: 'create',
-      task,
-      targetListId: target.id,
-      targetListTitle: target.title,
-    });
+    const willSyncLive = isOnline && googleTasks.isConnected;
+    void googleTasks
+      .onCreateGoogleTask({
+        title: task.title,
+        notes: task.notes,
+        dateKey: task.isInbox ? undefined : task.dateKey,
+        timeLabel: task.timeLabel,
+        priority: task.priority,
+        taskListId: target.id,
+        category: target.title,
+        reminders: task.reminders,
+        recurrence: task.recurrence,
+        recurrenceSeriesId: task.recurrenceSeriesId,
+      })
+      .then((createdId) => {
+        onDeleteTask(task.id);
+        if (selectedTaskId === task.id) {
+          setSelectedTaskId(typeof createdId === 'string' ? createdId : null);
+        }
+        showTaskToast(
+          willSyncLive
+            ? `Moved "${task.title}" to Google Tasks`
+            : `Queued "${task.title}" for Google Tasks`
+        );
+      })
+      .catch(() => {
+        showTaskToast(`Couldn't push "${task.title}" right now`);
+      });
   };
 
   const requestToggleTask = (taskId: string) => {
     const found = tasks.find((t) => t.id === taskId);
     if (found?.source === 'google') {
-      if (!isOnline || !googleTasks.isConnected) {
-        void googleTasks.onToggleGoogleTask(found);
+      const willSyncLive = isOnline && googleTasks.isConnected;
+      void googleTasks.onToggleGoogleTask(found);
+      if (!willSyncLive) {
         showTaskToast(
           !found.completed
-            ? `Completed "${found.title}" offline · will sync when online`
-            : `Reopened "${found.title}" offline · will sync when online`
+            ? `Completed "${found.title}" · queued for Google Tasks`
+            : `Reopened "${found.title}" · queued for Google Tasks`
         );
-        return;
       }
-      setPendingReplaceLocalId(null);
-      setPendingTaskMutation({
-        action: 'toggle',
-        task: found,
-        nextCompleted: !found.completed,
-      });
       return;
     }
     onToggleTask(taskId);
@@ -436,6 +450,8 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
         taskListId: target.id,
         category: target.title,
         reminders: deleted.reminders,
+        recurrence: deleted.recurrence,
+        recurrenceSeriesId: deleted.recurrenceSeriesId,
       });
       return;
     }
@@ -446,13 +462,6 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     const taskIndex = tasks.findIndex((t) => t.id === taskId);
     const found = taskIndex >= 0 ? tasks[taskIndex] : undefined;
     if (found?.source === 'google') {
-      if (!isOnline || !googleTasks.isConnected) {
-        void googleTasks.onDeleteGoogleTask(found);
-        if (selectedTaskId === taskId) setSelectedTaskId(null);
-        showUndoToast(`Deleted "${found.title}"`, () => restoreGoogleTask(found));
-        return;
-      }
-      setPendingReplaceLocalId(null);
       setPendingTaskMutation({
         action: 'delete',
         task: found,
@@ -561,61 +570,29 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
       showTaskToast(`Queued "${task.title}" to sync when online`);
       return;
     }
-    setPendingReplaceLocalId(null);
-    setPendingTaskMutation({
-      action: 'update',
-      task,
-    });
+    void googleTasks
+      .onUpdateGoogleTask(task)
+      .then(() => {
+        showTaskToast(`Synced "${task.title}" to Google Tasks`);
+      })
+      .catch(() => {
+        showTaskToast(`Couldn't sync "${task.title}" right now`);
+      });
   };
 
   const handleConfirmTaskMutation = async () => {
     if (!pendingTaskMutation || taskMutationBusy) return;
     setTaskMutationBusy(true);
     try {
-      if (pendingTaskMutation.action === 'create') {
-        const createdGoogleId = await googleTasks.onCreateGoogleTask({
-          title: pendingTaskMutation.task.title,
-          notes: pendingTaskMutation.task.notes,
-          dateKey: pendingTaskMutation.task.isInbox
-            ? undefined
-            : pendingTaskMutation.task.dateKey,
-          timeLabel: pendingTaskMutation.task.timeLabel,
-          priority: pendingTaskMutation.task.priority,
-          taskListId: pendingTaskMutation.targetListId,
-          category: pendingTaskMutation.targetListTitle,
-          reminders: pendingTaskMutation.task.reminders,
-        });
-        if (pendingReplaceLocalId) {
-          onDeleteTask(pendingReplaceLocalId);
-          if (selectedTaskId === pendingReplaceLocalId) setSelectedTaskId(null);
-        }
-        pendingTaskSavedCallbackRef.current?.(
-          typeof createdGoogleId === 'string' ? createdGoogleId : undefined
-        );
-        pendingTaskSavedCallbackRef.current = null;
-        showTaskToast(`Added "${pendingTaskMutation.task.title}" to Google Tasks`);
-      } else if (pendingTaskMutation.action === 'toggle') {
-        await googleTasks.onToggleGoogleTask(pendingTaskMutation.task);
-        showTaskToast(
-          pendingTaskMutation.nextCompleted
-            ? `Completed "${pendingTaskMutation.task.title}" in Google Tasks`
-            : `Reopened "${pendingTaskMutation.task.title}" in Google Tasks`
-        );
-      } else if (pendingTaskMutation.action === 'update') {
-        await googleTasks.onUpdateGoogleTask(pendingTaskMutation.task);
-        showTaskToast(`Updated "${pendingTaskMutation.task.title}" in Google Tasks`);
-      } else if (pendingTaskMutation.action === 'delete') {
+      if (pendingTaskMutation.action === 'delete') {
         const deletedTask = pendingTaskMutation.task;
         await googleTasks.onDeleteGoogleTask(deletedTask);
         if (selectedTaskId === deletedTask.id) setSelectedTaskId(null);
         showUndoToast(`Deleted "${deletedTask.title}"`, () => restoreGoogleTask(deletedTask));
       }
       setPendingTaskMutation(null);
-      setPendingReplaceLocalId(null);
     } catch {
-      pendingTaskSavedCallbackRef.current = null;
       setPendingTaskMutation(null);
-      setPendingReplaceLocalId(null);
     } finally {
       setTaskMutationBusy(false);
     }
@@ -625,7 +602,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     if (!searchHighlight) return;
     const timer = window.setTimeout(() => {
       setSearchHighlight(null);
-    }, 3500);
+    }, 4500);
     return () => window.clearTimeout(timer);
   }, [searchHighlight]);
 
@@ -653,11 +630,15 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
   const HomeIcon =
     decisions.defaultHome === DefaultHome.Inbox ? Inbox : LayoutDashboard;
 
-  const submitQuickTask = (rawText: string, clearFn: () => void, explicitList?: string) => {
+  const submitQuickTask = (
+    rawText: string,
+    clearFn: () => void,
+    explicitList?: string | null,
+    explicitRepeat?: RecurrencePresetId | null
+  ) => {
     const trimmed = rawText.trim();
     if (!trimmed) return;
-    const fallbackList =
-      explicitList && explicitList !== 'AUTO' ? explicitList : undefined;
+    const fallbackList = explicitList || undefined;
     const parsed = parseQuickTaskInput(
       trimmed,
       settings.nlpQuickParse,
@@ -665,21 +646,26 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
       taskLists,
       fallbackList
     );
-    const chosenCategory =
-      explicitList && explicitList !== 'AUTO' ? explicitList : parsed.category;
+    const chosenCategory = explicitList || parsed.category;
+    const resolvedRecurrence =
+      explicitRepeat != null
+        ? buildRuleFromPreset(explicitRepeat, parsed.dateKey)
+        : parsed.recurrence;
+    const isUnscheduled = !resolvedRecurrence && !parsed.explicitDate && chosenCategory === 'Inbox';
 
     const created: TaskItem = {
       id: `t-${Date.now()}`,
       title: parsed.title,
       timeLabel: parsed.timeLabel,
-      dateKey: parsed.dateKey,
+      dateKey: isUnscheduled ? '' : parsed.dateKey,
       category: chosenCategory,
       priority: parsed.priority,
       completed: false,
-      isInbox: chosenCategory === 'Inbox',
+      isInbox: isUnscheduled,
       notes: '',
       subtasks: [],
       reminders: parsed.reminders.length > 0 ? parsed.reminders : undefined,
+      ...(resolvedRecurrence ? { recurrence: resolvedRecurrence } : {}),
     };
     if (parsed.reminders.length > 0 && getNotificationPermissionState() === 'default') {
       void requestAppNotificationPermission();
@@ -688,13 +674,37 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
     clearFn();
   };
 
-  const fabParsedPreview = parseQuickTaskInput(
-    fabText,
-    settings.nlpQuickParse,
-    decisions.defaultHome === DefaultHome.Inbox,
-    taskLists,
-    fabListChoice !== 'AUTO' ? fabListChoice : undefined
-  );
+  const fabParsedPreview = useMemo(() => {
+    if (!fabModalOpen) {
+      const fallbackCategory =
+        fabListChoice ?? (decisions.defaultHome === DefaultHome.Inbox ? 'Inbox' : taskLists[0] || 'Personal');
+      return {
+        title: '',
+        timeLabel: 'No time set',
+        category: fallbackCategory,
+        priority: 'Normal' as const,
+        dateKey: todayDateKey,
+        explicitDate: false,
+        reminders: [],
+        recurrence: undefined,
+      };
+    }
+    return parseQuickTaskInput(
+      fabText,
+      settings.nlpQuickParse,
+      decisions.defaultHome === DefaultHome.Inbox,
+      taskLists,
+      fabListChoice ?? undefined
+    );
+  }, [fabModalOpen, fabText, settings.nlpQuickParse, decisions.defaultHome, taskLists, fabListChoice, todayDateKey]);
+  const fabEffectiveList = fabListChoice ?? fabParsedPreview.category;
+  const fabEffectiveRecurrence =
+    fabRepeatChoice !== null
+      ? buildRuleFromPreset(fabRepeatChoice, fabParsedPreview.dateKey)
+      : fabParsedPreview.recurrence;
+  const fabActiveRepeatPreset =
+    fabRepeatChoice ?? getPresetIdForRule(fabParsedPreview.recurrence);
+  const fabListOptions = useMemo(() => Array.from(new Set([...taskLists, 'Inbox'])), [taskLists]);
 
   const fiveTabs = [
     { id: ScreenId.Home, label: homeLabel, icon: HomeIcon },
@@ -764,6 +774,9 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
               searchHighlight?.targetType === 'task' ? searchHighlight.targetId : null
             }
             highlightQuery={searchHighlight?.targetType === 'task' ? searchHighlight.query : ''}
+            highlightTrigger={
+              searchHighlight?.targetType === 'task' ? searchHighlight.selectedAt : undefined
+            }
             onDismissHighlight={() => setSearchHighlight(null)}
             onSelectTask={setSelectedTaskId}
             onToggleTask={requestToggleTask}
@@ -792,7 +805,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                   id: `t-qc-${Date.now()}`,
                   title,
                   timeLabel: 'No time set',
-                  dateKey: TODAY_DATE_KEY,
+                  dateKey: '',
                   category: 'Inbox',
                   priority: 'Normal',
                   completed: false,
@@ -858,6 +871,9 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
               searchHighlight?.targetType === 'note' ? searchHighlight.targetId : null
             }
             highlightQuery={searchHighlight?.targetType === 'note' ? searchHighlight.query : ''}
+            highlightTrigger={
+              searchHighlight?.targetType === 'note' ? searchHighlight.selectedAt : undefined
+            }
             onDismissHighlight={() => setSearchHighlight(null)}
             onUpdateNote={onUpdateNote}
             onDeleteNote={handleRequestDeleteNote}
@@ -1125,7 +1141,9 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
 
             {/* Active Screen Canvas */}
             <div className="relative flex-1 min-h-0 min-w-0 max-w-full overflow-hidden">
-              {renderScreenBody()}
+              <Suspense fallback={<div className="h-full w-full" />}>
+                {renderScreenBody()}
+              </Suspense>
 
               {/* Center Hinge Crease Overlay (Inner Unfolded Mode) */}
               {posture === FoldPosture.Inner && (
@@ -1166,9 +1184,23 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
               {fabModalOpen && (
                 <div
                   className="absolute inset-0 z-40 bg-black/35 backdrop-blur-[1px] flex items-end"
-                  onClick={() => setFabModalOpen(false)}
+                  onPointerDown={(e) => {
+                    fabBackdropPointerDownRef.current = e.target === e.currentTarget;
+                  }}
+                  onClick={(e) => {
+                    const shouldClose =
+                      e.target === e.currentTarget && fabBackdropPointerDownRef.current;
+                    fabBackdropPointerDownRef.current = false;
+                    if (shouldClose) {
+                      setFabModalOpen(false);
+                    }
+                  }}
                 >
                   <form
+                    onPointerDown={(e) => {
+                      fabBackdropPointerDownRef.current = false;
+                      e.stopPropagation();
+                    }}
                     onClick={(e) => e.stopPropagation()}
                     onSubmit={(e) => {
                       e.preventDefault();
@@ -1176,10 +1208,12 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                         fabText,
                         () => {
                           setFabText('');
-                          setFabListChoice('AUTO');
+                          setFabListChoice(null);
+                          setFabRepeatChoice(null);
                           setFabModalOpen(false);
                         },
-                        fabListChoice
+                        fabListChoice,
+                        fabRepeatChoice
                       );
                     }}
                     className="w-full bg-white dark:bg-[#181B19] rounded-t-3xl border-t border-stone-200 dark:border-stone-800 p-4 space-y-3"
@@ -1190,7 +1224,10 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       </span>
                       <button
                         type="button"
-                        onClick={() => setFabModalOpen(false)}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFabModalOpen(false);
+                        }}
                         className="p-1.5 text-stone-400 hover:text-stone-700 dark:hover:text-stone-200"
                         aria-label="Close capture"
                       >
@@ -1203,7 +1240,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       onChange={setFabText}
                       nlpEnabled={settings.nlpQuickParse}
                       availableLists={taskLists}
-                      placeholder="e.g. Dentist tomorrow 2pm remind 1h before #personal"
+                      placeholder="e.g. Gym every mon, wed 7am remind 15m before #personal"
                       paddingClassName="px-3.5 py-3"
                       className={`w-full ${tokens.subtleBg} ${tokens.buttonRadius}`}
                     />
@@ -1215,46 +1252,98 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       }`}
                     >
                       <span className="text-[12.5px] text-stone-400 shrink-0 mr-1">List:</span>
-                      {['AUTO', ...taskLists, 'Inbox'].map((opt) => {
-                        const active = fabListChoice === opt;
-                        const label = opt === 'AUTO' ? 'Auto' : opt;
+                      {fabListOptions.map((opt) => {
+                        const active = fabEffectiveList === opt;
                         return (
                           <button
                             key={opt}
                             type="button"
-                            onClick={() => setFabListChoice(opt)}
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFabListChoice(opt);
+                            }}
                             className={`px-2.5 py-1 text-[12.5px] font-medium whitespace-nowrap shrink-0 transition-colors ${tokens.buttonRadius} ${
                               active
                                 ? `${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder}`
                                 : `${tokens.subtleBg} text-stone-600 dark:text-stone-300 border border-transparent`
                             }`}
                           >
-                            {label}
+                            {opt}
                           </button>
                         );
                       })}
                     </div>
 
-                    {settings.nlpQuickParse && fabParsedPreview.reminders.length > 0 && (
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        {fabParsedPreview.reminders.map((rem) => (
-                          <span
-                            key={rem.id}
-                            className={`inline-flex items-center gap-1 px-2 py-1 text-[12px] font-medium tabular-nums ${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder} ${tokens.buttonRadius}`}
+                    {/* Quick Repeat Picker during Task Creation */}
+                    <div
+                      className={`flex items-center gap-1.5 pb-0.5 ${
+                        posture === FoldPosture.Inner ? 'flex-wrap' : 'overflow-x-auto'
+                      }`}
+                    >
+                      <span className="text-[12.5px] text-stone-400 shrink-0 mr-1">Repeat:</span>
+                      {RECURRENCE_PRESETS.map((preset) => {
+                        const active = fabActiveRepeatPreset === preset.id;
+                        return (
+                          <button
+                            key={preset.id}
+                            type="button"
+                            onMouseDown={(e) => e.preventDefault()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setFabRepeatChoice(preset.id);
+                            }}
+                            className={`px-2.5 py-1 text-[12.5px] font-medium whitespace-nowrap shrink-0 transition-colors ${tokens.buttonRadius} ${
+                              active
+                                ? `${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder}`
+                                : `${tokens.subtleBg} text-stone-600 dark:text-stone-300 border border-transparent`
+                            }`}
                           >
-                            <Bell className="w-3.5 h-3.5 shrink-0" />
-                            {formatReminderLabel(rem)}
+                            {preset.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    {((settings.nlpQuickParse && fabParsedPreview.reminders.length > 0) ||
+                      Boolean(fabEffectiveRecurrence)) && (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {fabEffectiveRecurrence && (
+                          <span
+                            className={`inline-flex items-center gap-1 px-2 py-1 text-[12px] font-medium ${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder} ${tokens.buttonRadius}`}
+                          >
+                            <Repeat className="w-3.5 h-3.5 shrink-0" />
+                            {formatRecurrenceLabel(fabEffectiveRecurrence)}
                           </span>
-                        ))}
+                        )}
+                        {settings.nlpQuickParse &&
+                          fabParsedPreview.reminders.map((rem) => (
+                            <span
+                              key={rem.id}
+                              className={`inline-flex items-center gap-1 px-2 py-1 text-[12px] font-medium tabular-nums ${tokens.accentSoftBg} ${tokens.accentText} border ${tokens.accentBorder} ${tokens.buttonRadius}`}
+                            >
+                              <Bell className="w-3.5 h-3.5 shrink-0" />
+                              {formatReminderLabel(rem, timeFormat)}
+                            </span>
+                          ))}
                       </div>
                     )}
 
                     <div className="flex items-center justify-between gap-2">
                       <span className="text-[12.5px] text-stone-400 truncate tabular-nums">
                         {settings.nlpQuickParse && fabText.trim()
-                          ? `${fabParsedPreview.category} · ${formatPreviewDateKey(
-                              fabParsedPreview.dateKey
-                            )} · ${fabParsedPreview.timeLabel}${
+                          ? `${fabEffectiveList}${
+                              fabEffectiveList === 'Inbox' &&
+                              !fabParsedPreview.explicitDate &&
+                              !fabEffectiveRecurrence
+                                ? ' · No date'
+                                : ` · ${formatPreviewDateKey(fabParsedPreview.dateKey)}`
+                            }${
+                              fabParsedPreview.timeLabel &&
+                              fabParsedPreview.timeLabel !== 'No time set'
+                                ? ` · ${formatTimeDisplay(fabParsedPreview.timeLabel, timeFormat)}`
+                                : ''
+                            }${
                               fabParsedPreview.priority !== 'Normal'
                                 ? ` · ${fabParsedPreview.priority}`
                                 : ''
@@ -1265,6 +1354,7 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       </span>
                       <button
                         type="submit"
+                        onMouseDown={(e) => e.preventDefault()}
                         className={`px-4 py-2 text-[14px] font-medium ${tokens.accentBg} ${tokens.buttonRadius} shrink-0`}
                       >
                         Save task
@@ -1331,6 +1421,9 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
               )}
             </div>
           </div>
+
+          {/* Non-overlapping sync / reconnect banner directly above the bottom tab bar */}
+          {syncBanner}
 
           {/* Bottom Tab Bar on Cover & Flex Postures (stays at bottom beneath keyboard, never pushed above it) */}
           {posture !== FoldPosture.Inner && !keyboardOpen && (
@@ -1422,37 +1515,31 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
           )}
 
           {/* Global Search Overlay */}
-          <GlobalSearchModal
-            open={searchOpen}
-            tokens={tokens}
-            tasks={tasks}
-            notes={notes}
-            onClose={() => setSearchOpen(false)}
-            onSelectResult={handleSelectSearchResult}
-          />
+          {searchOpen && (
+            <Suspense fallback={null}>
+              <GlobalSearchModal
+                open={searchOpen}
+                tokens={tokens}
+                tasks={tasks}
+                notes={notes}
+                onClose={() => setSearchOpen(false)}
+                onSelectResult={handleSelectSearchResult}
+              />
+            </Suspense>
+          )}
 
-          {/* Explicit Confirmation Dialog for Google Tasks Mutations */}
-          <GoogleTaskConfirmModal
-            pending={pendingTaskMutation}
-            tokens={tokens}
-            busy={taskMutationBusy}
-            onCancel={() => {
-              pendingTaskSavedCallbackRef.current = null;
-              setPendingTaskMutation(null);
-              setPendingReplaceLocalId(null);
-            }}
-            onConfirm={handleConfirmTaskMutation}
-            onSaveLocalOnly={
-              pendingTaskMutation?.action === 'create' && !pendingReplaceLocalId
-                ? () => {
-                    onAddTask(pendingTaskMutation.task);
-                    pendingTaskSavedCallbackRef.current?.(pendingTaskMutation.task.id);
-                    pendingTaskSavedCallbackRef.current = null;
-                    setPendingTaskMutation(null);
-                  }
-                : undefined
-            }
-          />
+          {/* Explicit Confirmation Dialog for Destructive Google Tasks Deletes */}
+          {pendingTaskMutation && (
+            <Suspense fallback={null}>
+              <GoogleTaskConfirmModal
+                pending={pendingTaskMutation}
+                tokens={tokens}
+                busy={taskMutationBusy}
+                onCancel={() => setPendingTaskMutation(null)}
+                onConfirm={handleConfirmTaskMutation}
+              />
+            </Suspense>
+          )}
 
           {activeReminderAlerts.length > 0 && (
             <div className="absolute top-12 inset-x-3 z-50 flex flex-col gap-2 pointer-events-none">
@@ -1462,9 +1549,9 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                   role="alert"
                   className={`pointer-events-auto flex flex-col gap-2 px-3.5 py-2.5 bg-white dark:bg-[#1A1E1C] border ${tokens.accentBorder} shadow-lg shadow-stone-900/15 dark:shadow-black/50 ${tokens.cardRadius}`}
                 >
-                  <div className="flex items-center gap-2.5">
+                  <div className="flex items-start gap-2.5">
                     <span
-                      className={`w-8 h-8 rounded-full ${tokens.accentSoftBg} ${tokens.accentText} flex items-center justify-center shrink-0`}
+                      className={`w-8 h-8 rounded-full ${tokens.accentSoftBg} ${tokens.accentText} flex items-center justify-center shrink-0 mt-0.5`}
                     >
                       <Bell className="w-4 h-4" />
                     </span>
@@ -1484,6 +1571,17 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                         {alert.label} · {alert.category}
                       </p>
                     </button>
+                    {onDismissReminderAlert && (
+                      <button
+                        type="button"
+                        onClick={() => onDismissReminderAlert(alert.id)}
+                        aria-label="Dismiss reminder alert"
+                        title="Dismiss"
+                        className="p-1 text-stone-400 hover:text-stone-700 dark:hover:text-stone-200 rounded-md transition-colors shrink-0"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                   <div className="flex items-center justify-end gap-1.5">
                     {onSnoozeReminderAlert && (
@@ -1496,15 +1594,6 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
                       >
                         <Clock className="w-3.5 h-3.5" />
                         Snooze 10m
-                      </button>
-                    )}
-                    {onDismissReminderAlert && (
-                      <button
-                        type="button"
-                        onClick={() => onDismissReminderAlert(alert.id)}
-                        className={`inline-flex items-center gap-1 px-2.5 py-1.5 text-[12px] font-medium ${tokens.subtleBg} text-stone-600 dark:text-stone-300 ${tokens.buttonRadius} shrink-0 hover:opacity-90`}
-                      >
-                        Clear
                       </button>
                     )}
                     {onCompleteFromReminderAlert && (
@@ -1578,10 +1667,12 @@ export const FoldDeviceFrame: React.FC<FoldDeviceFrameProps> = ({
 
       {/* Simulated Android On-Screen Keyboard (Preview Studio only) */}
       {!standalone && keyboardOpen && (
-        <AndroidKeyboardSimulator
-          posture={posture}
-          onDismiss={() => onDismissKeyboard?.()}
-        />
+        <Suspense fallback={null}>
+          <AndroidKeyboardSimulator
+            posture={posture}
+            onDismiss={() => onDismissKeyboard?.()}
+          />
+        </Suspense>
       )}
     </div>
   );

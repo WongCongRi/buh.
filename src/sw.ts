@@ -61,6 +61,26 @@ interface SwClients {
   openWindow(url: string): Promise<SwWindowClient | null>;
 }
 
+interface SwSyncEvent extends SwExtendableEvent {
+  readonly tag: string;
+}
+
+interface SwPeriodicSyncEvent extends SwExtendableEvent {
+  readonly tag: string;
+}
+
+interface SwLocalScheduledReminder {
+  key: string;
+  taskId: string;
+  reminderId: string;
+  triggerAtMs: number;
+  title: string;
+  body: string;
+  category: string;
+  tag: string;
+  silent: boolean;
+}
+
 interface SwGlobalScope {
   readonly location: Location;
   readonly caches: CacheStorage;
@@ -80,15 +100,21 @@ interface SwGlobalScope {
     listener: (event: SwNotificationEvent) => void
   ): void;
   addEventListener(type: 'message', listener: (event: SwMessageEvent) => void): void;
+  addEventListener(type: 'sync', listener: (event: SwSyncEvent) => void): void;
+  addEventListener(type: 'periodicsync', listener: (event: SwPeriodicSyncEvent) => void): void;
 }
 
 declare const self: SwGlobalScope;
 
-const PRECACHE_NAME = 'buh-precache-v2';
-const RUNTIME_CACHE_NAME = 'buh-runtime-v2';
+const PRECACHE_NAME = 'buh-precache-v5';
+const RUNTIME_CACHE_NAME = 'buh-runtime-v5';
 const FONTS_CACHE_NAME = 'buh-fonts-v1';
 const REMINDER_ACTIONS_CACHE = 'buh-reminder-actions-v1';
 const REMINDER_ACTIONS_URL = '/__buh_pending_reminder_actions__';
+const SCHEDULED_REMINDERS_CACHE = 'buh-scheduled-reminders-v1';
+const SCHEDULED_REMINDERS_URL = '/__buh_scheduled_reminders__';
+const FIRED_REMINDERS_CACHE = 'buh-fired-reminders-v1';
+const FIRED_REMINDERS_URL = '/__buh_fired_reminders__';
 
 const rawManifest = self.__WB_MANIFEST;
 const manifestEntries: Array<SwPrecacheEntry | string> = Array.isArray(rawManifest)
@@ -105,7 +131,8 @@ const precacheUrls = Array.from(
 );
 
 async function persistPendingReminderAction(actionPayload: {
-  action: 'snooze' | 'clear';
+  actionId?: string;
+  action: 'snooze' | 'done' | 'clear';
   taskId?: string;
   reminderId?: string;
   snoozeMinutes?: number;
@@ -123,16 +150,280 @@ async function persistPendingReminderAction(actionPayload: {
         list = [];
       }
     }
-    list.push(actionPayload);
+    const withId = {
+      ...actionPayload,
+      actionId:
+        actionPayload.actionId ||
+        `${actionPayload.action}:${actionPayload.taskId || ''}:${actionPayload.reminderId || ''}:${actionPayload.timestamp}`,
+    };
+    list.push(withId);
     await cache.put(
       REMINDER_ACTIONS_URL,
-      new Response(JSON.stringify(list.slice(-25)), {
+      new Response(JSON.stringify(list.slice(-30)), {
         headers: { 'Content-Type': 'application/json' },
       })
     );
   } catch {
     // Ignore cache storage issues
   }
+}
+
+async function loadScheduledReminders(): Promise<SwLocalScheduledReminder[]> {
+  try {
+    const cache = await self.caches.open(SCHEDULED_REMINDERS_CACHE);
+    const res = await cache.match(SCHEDULED_REMINDERS_URL);
+    if (!res) return [];
+    const parsed = await res.json();
+    return Array.isArray(parsed) ? (parsed as SwLocalScheduledReminder[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function saveScheduledReminders(reminders: SwLocalScheduledReminder[]): Promise<void> {
+  try {
+    const cache = await self.caches.open(SCHEDULED_REMINDERS_CACHE);
+    await cache.put(
+      SCHEDULED_REMINDERS_URL,
+      new Response(JSON.stringify(reminders.slice(0, 100)), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+  } catch {
+    // Ignore cache storage errors
+  }
+}
+
+async function loadFiredReminderKeys(): Promise<Record<string, number>> {
+  try {
+    const cache = await self.caches.open(FIRED_REMINDERS_CACHE);
+    const res = await cache.match(FIRED_REMINDERS_URL);
+    if (!res) return {};
+    const parsed = await res.json();
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, number>) : {};
+  } catch {
+    return {};
+  }
+}
+
+async function saveFiredReminderKeys(keys: Record<string, number>): Promise<void> {
+  try {
+    const now = Date.now();
+    const cutoff = now - 24 * 60 * 60 * 1000;
+    const pruned: Record<string, number> = {};
+    for (const [k, ts] of Object.entries(keys)) {
+      if (typeof ts === 'number' && ts >= cutoff) {
+        pruned[k] = ts;
+      }
+    }
+    const cache = await self.caches.open(FIRED_REMINDERS_CACHE);
+    await cache.put(
+      FIRED_REMINDERS_URL,
+      new Response(JSON.stringify(pruned), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    );
+  } catch {
+    // Ignore cache storage errors
+  }
+}
+
+async function markLocalReminderFired(key: string, taskId?: string, reminderId?: string): Promise<void> {
+  const fired = await loadFiredReminderKeys();
+  const now = Date.now();
+  if (key) fired[key] = now;
+  if (taskId && reminderId) {
+    fired[`${taskId}:${reminderId}`] = now;
+  }
+  await saveFiredReminderKeys(fired);
+}
+
+async function clearLocalReminderFired(taskId?: string, reminderId?: string): Promise<void> {
+  if (!taskId || !reminderId) return;
+  const fired = await loadFiredReminderKeys();
+  const prefix = `${taskId}:${reminderId}`;
+  let changed = false;
+  for (const k of Object.keys(fired)) {
+    if (k === prefix || k.startsWith(`${prefix}:`)) {
+      delete fired[k];
+      changed = true;
+    }
+  }
+  if (changed) {
+    await saveFiredReminderKeys(fired);
+  }
+  await removeScheduledRemindersFor(taskId, reminderId, false);
+  await closeMatchingNotifications(taskId, reminderId, false);
+}
+
+async function removeScheduledRemindersFor(
+  taskId?: string,
+  reminderId?: string,
+  removeAllForTask = false
+): Promise<void> {
+  if (!taskId) return;
+  const scheduled = await loadScheduledReminders();
+  if (scheduled.length === 0) return;
+  const filtered = scheduled.filter((rem) => {
+    if (rem.taskId !== taskId) return true;
+    if (removeAllForTask || !reminderId) return false;
+    return rem.reminderId !== reminderId;
+  });
+  if (filtered.length !== scheduled.length) {
+    await saveScheduledReminders(filtered);
+  }
+}
+
+async function closeMatchingNotifications(
+  taskId?: string,
+  reminderId?: string,
+  closeAllForTask = false
+): Promise<void> {
+  if (!taskId) return;
+  try {
+    const regWithTrigger = self.registration as ServiceWorkerRegistration & {
+      getNotifications: (filter?: { tag?: string; includeTriggered?: boolean }) => Promise<Notification[]>;
+    };
+    let list: Notification[] = [];
+    try {
+      list = await regWithTrigger.getNotifications({ includeTriggered: true });
+    } catch {
+      list = await self.registration.getNotifications();
+    }
+    for (const notif of list) {
+      const nData = (notif as Notification & { data?: SwNotificationData }).data;
+      if (nData?.taskId !== taskId) continue;
+      if (closeAllForTask || !reminderId || nData?.reminderId === reminderId) {
+        notif.close();
+      }
+    }
+  } catch {
+    // Ignore getNotifications errors
+  }
+}
+
+async function notifyServerDismiss(
+  taskId?: string,
+  reminderId?: string,
+  completeTask = false
+): Promise<void> {
+  if (!taskId || !self.registration.pushManager) return;
+  try {
+    const sub = await self.registration.pushManager.getSubscription();
+    if (!sub?.endpoint) return;
+    await fetch('/api/push/dismiss', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        endpoint: sub.endpoint,
+        taskId,
+        reminderId,
+        completeTask,
+      }),
+    });
+  } catch {
+    // Ignore offline dismiss errors
+  }
+}
+
+async function checkLocalDueReminders(): Promise<void> {
+  const scheduled = await loadScheduledReminders();
+  if (scheduled.length === 0) return;
+
+  const fired = await loadFiredReminderKeys();
+  const now = Date.now();
+  const CATCH_UP_MS = 60 * 60 * 1000;
+  const remaining: SwLocalScheduledReminder[] = [];
+  const due: SwLocalScheduledReminder[] = [];
+
+  for (const rem of scheduled) {
+    if (!rem || typeof rem.triggerAtMs !== 'number') continue;
+    const pairKey = `${rem.taskId}:${rem.reminderId}`;
+    if (fired[rem.key] || fired[pairKey]) continue;
+
+    if (rem.triggerAtMs <= now) {
+      if (now - rem.triggerAtMs <= CATCH_UP_MS) {
+        due.push(rem);
+      }
+    } else {
+      remaining.push(rem);
+    }
+  }
+
+  if (due.length === 0) {
+    if (remaining.length !== scheduled.length) {
+      await saveScheduledReminders(remaining);
+    }
+    return;
+  }
+
+  await saveScheduledReminders(remaining);
+
+  const windowClients = await self.clients.matchAll({
+    type: 'window',
+    includeUncontrolled: true,
+  });
+
+  for (const rem of due) {
+    fired[rem.key] = now;
+    fired[`${rem.taskId}:${rem.reminderId}`] = now;
+
+    const notifOptions: NotificationOptions & {
+      actions?: Array<{ action: string; title: string }>;
+      vibrate?: number[];
+      renotify?: boolean;
+    } = {
+      body: rem.body || 'Scheduled task reminder',
+      icon: '/pwa-192x192.png',
+      badge: '/badge-96x96.png',
+      tag: rem.tag || `buh-reminder-${rem.taskId}-${rem.reminderId}`,
+      renotify: true,
+      silent: Boolean(rem.silent),
+      vibrate: rem.silent ? undefined : [180, 90, 180],
+      actions: [
+        { action: 'snooze', title: 'Snooze 10m' },
+        { action: 'done', title: 'Done' },
+      ],
+      data: {
+        taskId: rem.taskId,
+        reminderId: rem.reminderId,
+        taskTitle: rem.title,
+        category: rem.category,
+        url: resolveSafeSameOriginUrl('/'),
+      },
+    };
+
+    try {
+      await self.registration.showNotification(
+        rem.title || 'buh. reminder',
+        notifOptions as NotificationOptions
+      );
+    } catch {
+      // Ignore notification errors if permission was revoked
+    }
+
+    const actionId = `delivered:${rem.taskId}:${rem.reminderId}:${now}`;
+    await persistPendingReminderAction({
+      actionId,
+      action: 'clear',
+      taskId: rem.taskId,
+      reminderId: rem.reminderId,
+      timestamp: now,
+    });
+
+    if (windowClients.length > 0) {
+      for (const client of windowClients) {
+        client.postMessage({
+          type: 'REMINDER_PUSH_DELIVERED',
+          actionId,
+          taskId: rem.taskId,
+          reminderId: rem.reminderId,
+        });
+      }
+    }
+  }
+
+  await saveFiredReminderKeys(fired);
 }
 
 self.addEventListener('install', (event) => {
@@ -164,12 +455,15 @@ self.addEventListener('activate', (event) => {
     RUNTIME_CACHE_NAME,
     FONTS_CACHE_NAME,
     REMINDER_ACTIONS_CACHE,
+    SCHEDULED_REMINDERS_CACHE,
+    FIRED_REMINDERS_CACHE,
   ]);
   event.waitUntil(
     (async () => {
       const keys = await self.caches.keys();
       await Promise.all(keys.filter((k) => !keepCaches.has(k)).map((k) => self.caches.delete(k)));
       await self.clients.claim();
+      await checkLocalDueReminders();
     })()
   );
 });
@@ -179,12 +473,61 @@ self.addEventListener('message', (event) => {
     type?: string;
     title?: string;
     options?: NotificationOptions;
+    reminders?: SwLocalScheduledReminder[];
+    key?: string;
+    taskId?: string;
+    reminderId?: string;
   } | null;
   if (data && data.type === 'SKIP_WAITING') {
     event.waitUntil(self.skipWaiting());
   } else if (data && data.type === 'SHOW_LOCAL_NOTIFICATION' && typeof data.title === 'string') {
     event.waitUntil(self.registration.showNotification(data.title, data.options || {}));
+  } else if (data && data.type === 'SYNC_LOCAL_REMINDERS' && Array.isArray(data.reminders)) {
+    event.waitUntil(
+      (async () => {
+        await saveScheduledReminders(data.reminders || []);
+        await checkLocalDueReminders();
+      })()
+    );
+  } else if (data && data.type === 'MARK_REMINDER_FIRED') {
+    event.waitUntil(
+      markLocalReminderFired(data.key || '', data.taskId, data.reminderId)
+    );
+  } else if (data && data.type === 'CLEAR_REMINDER_FIRED') {
+    event.waitUntil(
+      clearLocalReminderFired(data.taskId, data.reminderId)
+    );
+  } else if (data && data.type === 'CHECK_LOCAL_REMINDERS') {
+    event.waitUntil(checkLocalDueReminders());
   }
+});
+
+self.addEventListener('periodicsync', (event) => {
+  if (event.tag !== 'buh-reminder-check') return;
+  event.waitUntil(
+    (async () => {
+      await checkLocalDueReminders();
+      try {
+        await fetch('/api/push/tick', { method: 'POST' });
+      } catch {
+        // Offline or server unreachable; local check above already ran
+      }
+    })()
+  );
+});
+
+self.addEventListener('sync', (event) => {
+  if (event.tag !== 'buh-reminder-check') return;
+  event.waitUntil(
+    (async () => {
+      await checkLocalDueReminders();
+      try {
+        await fetch('/api/push/tick', { method: 'POST' });
+      } catch {
+        // Ignore offline tick errors
+      }
+    })()
+  );
 });
 
 function resolveSafeSameOriginUrl(rawUrl?: string): string {
@@ -258,9 +601,9 @@ self.addEventListener('push', (event) => {
       const defaultActions = payload.taskId
         ? [
             { action: 'snooze', title: 'Snooze 10m' },
-            { action: 'clear', title: 'Clear' },
+            { action: 'done', title: 'Done' },
           ]
-        : [{ action: 'clear', title: 'Clear' }];
+        : [{ action: 'done', title: 'Done' }];
 
       const actions =
         Array.isArray(payload.actions) && payload.actions.length > 0
@@ -297,16 +640,30 @@ self.addEventListener('push', (event) => {
       await self.registration.showNotification(title, notifOptions as NotificationOptions);
 
       if (payload.taskId && payload.reminderId) {
+        const now = Date.now();
+        const actionId = `push:${payload.taskId}:${payload.reminderId}:${now}`;
+        await markLocalReminderFired('', payload.taskId, payload.reminderId);
+        await removeScheduledRemindersFor(payload.taskId, payload.reminderId, false);
+        await persistPendingReminderAction({
+          actionId,
+          action: 'clear',
+          taskId: payload.taskId,
+          reminderId: payload.reminderId,
+          timestamp: now,
+        });
         const windowClients = await self.clients.matchAll({
           type: 'window',
           includeUncontrolled: true,
         });
-        for (const client of windowClients) {
-          client.postMessage({
-            type: 'REMINDER_PUSH_DELIVERED',
-            taskId: payload.taskId,
-            reminderId: payload.reminderId,
-          });
+        if (windowClients.length > 0) {
+          for (const client of windowClients) {
+            client.postMessage({
+              type: 'REMINDER_PUSH_DELIVERED',
+              actionId,
+              taskId: payload.taskId,
+              reminderId: payload.reminderId,
+            });
+          }
         }
       }
     })()
@@ -365,10 +722,17 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(request.url);
 
-  // Never intercept backend API routes or Digital Asset Links (.well-known)
+  // Never intercept backend API routes, Digital Asset Links, Service Worker scripts, or Vite dev-server module URLs
   if (
     url.origin === self.location.origin &&
-    (url.pathname.startsWith('/api/') || url.pathname.startsWith('/.well-known/'))
+    (url.pathname.startsWith('/api/') ||
+      url.pathname.startsWith('/.well-known/') ||
+      url.pathname.startsWith('/@') ||
+      url.pathname.startsWith('/src/') ||
+      url.pathname.startsWith('/node_modules/') ||
+      url.pathname === '/sw.js' ||
+      url.pathname === '/dev-sw.js' ||
+      url.pathname === '/registerSW.js')
   ) {
     return;
   }
@@ -436,7 +800,12 @@ self.addEventListener('fetch', (event) => {
       (async () => {
         const precache = await self.caches.open(PRECACHE_NAME);
         const runtime = await self.caches.open(RUNTIME_CACHE_NAME);
-        const cached = (await precache.match(request)) || (await runtime.match(request));
+        const cached =
+          (await precache.match(request)) ||
+          (request.destination === 'image'
+            ? await precache.match(request, { ignoreSearch: true })
+            : undefined) ||
+          (await runtime.match(request));
 
         const networkPromise = fetch(request)
           .then((res) => {
@@ -459,6 +828,48 @@ self.addEventListener('fetch', (event) => {
   }
 });
 
+self.addEventListener('notificationclose', (event) => {
+  const data: SwNotificationData = event.notification.data || {};
+  if (!data.taskId && !data.reminderId) return;
+
+  event.waitUntil(
+    (async () => {
+      const now = Date.now();
+      const actionId = `close:${data.taskId || ''}:${data.reminderId || ''}:${now}`;
+      if (data.taskId && data.reminderId) {
+        await markLocalReminderFired('', data.taskId, data.reminderId);
+      }
+      await removeScheduledRemindersFor(data.taskId, data.reminderId, false);
+      await persistPendingReminderAction({
+        actionId,
+        action: 'clear',
+        taskId: data.taskId,
+        reminderId: data.reminderId,
+        timestamp: now,
+      });
+
+      const windowClients = await self.clients.matchAll({
+        type: 'window',
+        includeUncontrolled: true,
+      });
+
+      if (windowClients.length > 0) {
+        for (const client of windowClients) {
+          client.postMessage({
+            type: 'REMINDER_ACTION',
+            actionId,
+            action: 'clear',
+            taskId: data.taskId,
+            reminderId: data.reminderId,
+          });
+        }
+      }
+
+      await notifyServerDismiss(data.taskId, data.reminderId, false);
+    })()
+  );
+});
+
 self.addEventListener('notificationclick', (event) => {
   const notification = event.notification;
   const data: SwNotificationData = notification.data || {};
@@ -466,10 +877,26 @@ self.addEventListener('notificationclick', (event) => {
 
   notification.close();
 
-  if (action === 'snooze' || action === 'clear') {
+  if (action === 'snooze' || action === 'done' || action === 'clear') {
     const snoozeMinutes = action === 'snooze' ? 10 : undefined;
     event.waitUntil(
       (async () => {
+        const now = Date.now();
+        const actionId = `${action}:${data.taskId || ''}:${data.reminderId || ''}:${now}`;
+        if (data.taskId && data.reminderId) {
+          await markLocalReminderFired('', data.taskId, data.reminderId);
+        }
+        await removeScheduledRemindersFor(data.taskId, data.reminderId, action === 'done');
+        await closeMatchingNotifications(data.taskId, data.reminderId, action === 'done');
+        await persistPendingReminderAction({
+          actionId,
+          action,
+          taskId: data.taskId,
+          reminderId: data.reminderId,
+          snoozeMinutes,
+          timestamp: now,
+        });
+
         const windowClients = await self.clients.matchAll({
           type: 'window',
           includeUncontrolled: true,
@@ -477,6 +904,7 @@ self.addEventListener('notificationclick', (event) => {
 
         const payload = {
           type: 'REMINDER_ACTION',
+          actionId,
           action,
           taskId: data.taskId,
           reminderId: data.reminderId,
@@ -487,65 +915,126 @@ self.addEventListener('notificationclick', (event) => {
           for (const client of windowClients) {
             client.postMessage(payload);
           }
-        } else {
-          await persistPendingReminderAction({
-            action,
-            taskId: data.taskId,
-            reminderId: data.reminderId,
-            snoozeMinutes,
-            timestamp: Date.now(),
-          });
+        }
 
-          if (action === 'snooze' && self.registration.pushManager) {
-            try {
-              const sub = await self.registration.pushManager.getSubscription();
-              if (sub) {
-                await fetch('/api/push/snooze', {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({
-                    subscription: sub.toJSON(),
-                    taskId: data.taskId,
-                    reminderId: data.reminderId,
-                    taskTitle: data.taskTitle,
-                    category: data.category,
-                    snoozeMinutes: snoozeMinutes ?? 10,
-                  }),
-                });
-              }
-            } catch {
-              // Offline fallback: pending snooze is already saved in cache for next open
-            }
+        const networkTasks: Promise<unknown>[] = [
+          notifyServerDismiss(data.taskId, data.reminderId, action === 'done'),
+        ];
+
+        if (action === 'snooze' && windowClients.length === 0) {
+          const snoozeTriggerMs = now + (snoozeMinutes ?? 10) * 60 * 1000;
+          const snoozeRemId = `snooze-${now}`;
+          const snoozeTaskId = data.taskId || snoozeRemId;
+          const currentScheduled = await loadScheduledReminders();
+          await saveScheduledReminders([
+            ...currentScheduled.slice(-99),
+            {
+              key: `${snoozeTaskId}:${snoozeRemId}:${Math.round(snoozeTriggerMs / 1000)}`,
+              taskId: snoozeTaskId,
+              reminderId: snoozeRemId,
+              triggerAtMs: snoozeTriggerMs,
+              title: data.taskTitle || 'Snoozed reminder',
+              body: [`Snoozed ${snoozeMinutes ?? 10}m`, data.category].filter(Boolean).join(' · '),
+              category: data.category || '',
+              tag: `buh-reminder-${snoozeTaskId}-${snoozeRemId}`,
+              silent: false,
+            },
+          ]);
+
+          if (self.registration.pushManager) {
+            networkTasks.push(
+              (async () => {
+                try {
+                  const sub = await self.registration.pushManager.getSubscription();
+                  if (sub) {
+                    await fetch('/api/push/snooze', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        subscription: sub.toJSON(),
+                        taskId: data.taskId,
+                        reminderId: data.reminderId,
+                        taskTitle: data.taskTitle,
+                        category: data.category,
+                        snoozeMinutes: snoozeMinutes ?? 10,
+                      }),
+                    });
+                  }
+                } catch {
+                  // Offline fallback: pending snooze is already saved in local cache
+                }
+              })()
+            );
           }
         }
+
+        await Promise.allSettled(networkTasks);
       })()
     );
     return;
   }
 
-  // Default tap on notification body: focus existing standalone app window or open '/'
+  // Default tap on notification body: permanently dismiss this reminder FIRST, then focus/open window
   event.waitUntil(
     (async () => {
-      const targetUrl = resolveSafeSameOriginUrl(data.url);
+      const now = Date.now();
+      const actionId = `open-clear:${data.taskId || ''}:${data.reminderId || ''}:${now}`;
+      if (data.taskId && data.reminderId) {
+        await markLocalReminderFired('', data.taskId, data.reminderId);
+      }
+      await removeScheduledRemindersFor(data.taskId, data.reminderId, false);
+      await closeMatchingNotifications(data.taskId, data.reminderId, false);
+      if (data.taskId || data.reminderId) {
+        await persistPendingReminderAction({
+          actionId,
+          action: 'clear',
+          taskId: data.taskId,
+          reminderId: data.reminderId,
+          timestamp: now,
+        });
+      }
+
+      const dismissPromise = notifyServerDismiss(data.taskId, data.reminderId, false);
+
+      const baseTargetUrl = resolveSafeSameOriginUrl(data.url);
       const windowClients = await self.clients.matchAll({
         type: 'window',
         includeUncontrolled: true,
       });
 
+      let focusedClient: SwWindowClient | null = null;
       for (const client of windowClients) {
         if (client.url.startsWith(self.location.origin)) {
           await client.focus();
+          if (data.taskId || data.reminderId) {
+            client.postMessage({
+              type: 'REMINDER_ACTION',
+              actionId,
+              action: 'clear',
+              taskId: data.taskId,
+              reminderId: data.reminderId,
+            });
+          }
           if (data.taskId) {
             client.postMessage({ type: 'REMINDER_OPEN', taskId: data.taskId });
           }
-          return;
+          focusedClient = client;
+          break;
         }
       }
 
-      const opened = await self.clients.openWindow(targetUrl);
-      if (opened && data.taskId) {
-        opened.postMessage({ type: 'REMINDER_OPEN', taskId: data.taskId });
+      if (!focusedClient) {
+        const targetUrlObj = new URL(baseTargetUrl);
+        if (data.taskId) {
+          targetUrlObj.searchParams.set('openTask', data.taskId);
+        }
+        const opened = await self.clients.openWindow(targetUrlObj.href);
+        if (opened && data.taskId) {
+          opened.postMessage({ type: 'REMINDER_OPEN', taskId: data.taskId });
+        }
       }
+
+      await dismissPromise;
     })()
   );
 });

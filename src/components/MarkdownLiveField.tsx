@@ -13,6 +13,7 @@ export interface MarkdownLiveFieldHandle {
   focus: () => void;
   setCaret: (pos: number | 'start' | 'end') => void;
   getCaret: () => number;
+  getElement: () => HTMLElement | null;
   scrollIntoView: (opts?: ScrollIntoViewOptions) => void;
   isFocused: () => boolean;
 }
@@ -26,6 +27,7 @@ interface MarkdownLiveFieldProps {
   placeholderClassName?: string;
   onChange: (nextValue: string) => void;
   onCaretChange?: (caret: number) => void;
+  onEnsureCaretVisible?: () => void;
   onEnterSingleLine?: () => void;
   onBackspaceEmpty?: () => void;
   fieldRef?: (handle: MarkdownLiveFieldHandle | null) => void;
@@ -280,6 +282,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
   placeholderClassName = '',
   onChange,
   onCaretChange,
+  onEnsureCaretVisible,
   onEnterSingleLine,
   onBackspaceEmpty,
   fieldRef,
@@ -292,6 +295,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
   rawRef.current = value;
   const focusedRef = useRef(false);
   const composingRef = useRef(false);
+  const pendingFocusSyncRef = useRef(false);
   const caretRef = useRef<{ start: number; end: number }>({
     start: value.length,
     end: value.length,
@@ -329,19 +333,29 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
       return;
     }
 
+    const scrollEl = root.closest('.device-scroll') as HTMLElement | null;
+    const prevScrollTop = scrollEl ? scrollEl.scrollTop : null;
+
     renderKeyRef.current = nextKey;
     suppressSelectionSyncRef.current = true;
     renderProjectionToDom(root, nextProj);
 
-    if (focused && document.activeElement === root) {
+    if (focused && document.activeElement === root && !pendingFocusSyncRef.current) {
       const visStart = rawOffsetToVisible(nextProj, cStart);
       const visEnd = rawOffsetToVisible(nextProj, cEnd);
       lastVisCaretRef.current = visStart;
       setVisibleSelection(root, visStart, visEnd);
     }
 
+    if (scrollEl && prevScrollTop !== null && scrollEl.scrollTop !== prevScrollTop) {
+      scrollEl.scrollTop = prevScrollTop;
+    }
+
     Promise.resolve().then(() => {
       suppressSelectionSyncRef.current = false;
+      if (scrollEl && prevScrollTop !== null && scrollEl.scrollTop !== prevScrollTop) {
+        scrollEl.scrollTop = prevScrollTop;
+      }
     });
   };
 
@@ -353,6 +367,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
       const rawLen = rawRef.current.length;
       const resolved =
         pos === 'start' ? 0 : pos === 'end' ? rawLen : Math.max(0, Math.min(pos, rawLen));
+      pendingFocusSyncRef.current = false;
       caretRef.current = { start: resolved, end: resolved };
       focusedRef.current = true;
       setIsFocused(true);
@@ -360,6 +375,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
       syncDom(true);
     },
     getCaret: () => caretRef.current.start,
+    getElement: () => editorRef.current,
     scrollIntoView: (opts?: ScrollIntoViewOptions) => {
       editorRef.current?.scrollIntoView(opts);
     },
@@ -414,6 +430,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
     const root = editorRef.current;
     if (!root || composingRef.current) return;
 
+    pendingFocusSyncRef.current = false;
     const { text: newVisibleRaw, selStart, hasSelection } = readVisibleTextAndSelection(root);
     const newVisible = multiline ? newVisibleRaw : newVisibleRaw.replace(/\n+/g, ' ');
     const caretVis = hasSelection ? Math.min(selStart, newVisible.length) : newVisible.length;
@@ -430,9 +447,11 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
     onCaretChange?.(nextRawCaret);
     onChange(nextRaw);
     syncDom(true);
+    onEnsureCaretVisible?.();
   };
 
   const insertNewlineAtCaret = () => {
+    pendingFocusSyncRef.current = false;
     const raw = rawRef.current;
     const lo = Math.min(caretRef.current.start, caretRef.current.end);
     const hi = Math.max(caretRef.current.start, caretRef.current.end);
@@ -443,6 +462,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
     onCaretChange?.(nextCaret);
     onChange(nextRaw);
     syncDom(true);
+    onEnsureCaretVisible?.();
   };
 
   return (
@@ -464,12 +484,14 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
         spellCheck
         onFocus={() => {
           focusedRef.current = true;
+          pendingFocusSyncRef.current = true;
           setIsFocused(true);
           const syncFocusCaret = () => {
             const root = editorRef.current;
             if (!root || !focusedRef.current) return;
             const { selStart, selEnd, hasSelection } = readVisibleTextAndSelection(root);
             if (hasSelection) {
+              pendingFocusSyncRef.current = false;
               const proj = projectionRef.current;
               const startBias: 'before' | 'after' =
                 selStart === proj.visibleText.length ? 'after' : 'before';
@@ -484,14 +506,17 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
             }
             syncDom(false);
           };
+          syncFocusCaret();
           Promise.resolve().then(syncFocusCaret);
           window.requestAnimationFrame(() => {
+            pendingFocusSyncRef.current = false;
             syncFocusCaret();
-            editorRef.current?.scrollIntoView({ block: 'nearest' });
+            onEnsureCaretVisible?.();
           });
         }}
         onBlur={() => {
           composingRef.current = false;
+          pendingFocusSyncRef.current = false;
           focusedRef.current = false;
           setIsFocused(false);
           syncDom(true);
@@ -533,6 +558,7 @@ export const MarkdownLiveField: React.FC<MarkdownLiveFieldProps> = ({
           onCaretChange?.(nextCaret);
           onChange(nextRaw);
           syncDom(true);
+          onEnsureCaretVisible?.();
         }}
         onKeyDown={(e) => {
           if (e.nativeEvent.isComposing) return;

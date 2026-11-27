@@ -1,6 +1,8 @@
 import React, { useMemo, useState } from 'react';
 import { CheckSquare, FileText, Search, X } from 'lucide-react';
 import { NoteItem, TaskItem } from '../types/taskflow';
+import { formatRelativeTaskDate } from '../utils/dateLabels';
+import { formatTimeDisplay, useTimeFormat } from '../utils/timeFormat';
 import { StyleThemeTokens } from '../utils/themeTokens';
 import { HighlightedText } from './HighlightedText';
 import { MarkdownPreviewText } from './MarkdownPreviewText';
@@ -10,6 +12,7 @@ export interface SearchSelection {
   targetType: 'task' | 'note';
   targetId: string;
   query: string;
+  selectedAt?: number;
 }
 
 interface GlobalSearchModalProps {
@@ -28,6 +31,7 @@ interface SearchMatchItem {
   title: string;
   meta: string;
   snippet: string;
+  snippetPrefix?: string;
   markdownEnabled?: boolean;
 }
 
@@ -39,6 +43,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
   onClose,
   onSelectResult,
 }) => {
+  const timeFormat = useTimeFormat();
   const [query, setQuery] = useState('');
 
   useBackLayer(open, onClose, 20);
@@ -53,33 +58,41 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
       const titleHit = task.title.toLowerCase().includes(q);
       const notesHit = task.notes.toLowerCase().includes(q);
       const subtaskHit = task.subtasks.find((s) => s.title.toLowerCase().includes(q));
-      const catHit = task.category.toLowerCase().includes(q);
 
-      if (titleHit || notesHit || subtaskHit || catHit) {
+      if (titleHit || notesHit || subtaskHit) {
         const snippet = titleHit
           ? task.title
           : notesHit
             ? task.notes
             : subtaskHit
-              ? `Subtask: ${subtaskHit.title}`
+              ? subtaskHit.title
               : task.title;
+        const snippetPrefix = !titleHit && !notesHit && subtaskHit ? 'Subtask: ' : undefined;
+        const dateSegment =
+          !task.isInbox && task.dateKey
+            ? `${formatRelativeTaskDate(task.dateKey).label} · `
+            : '';
+        const timeSegment =
+          task.timeLabel && task.timeLabel !== 'No time set'
+            ? ` · ${formatTimeDisplay(task.timeLabel, timeFormat)}`
+            : '';
         matches.push({
           id: `task-${task.id}`,
           targetType: 'task',
           targetId: task.id,
           title: task.title,
-          meta: `Task · ${task.category} · ${task.timeLabel}`,
+          meta: `Task · ${dateSegment}${task.category}${timeSegment}`,
           snippet,
+          snippetPrefix,
         });
       }
     }
 
     for (const note of notes) {
       const titleHit = note.title.toLowerCase().includes(q);
-      const folderHit = note.folder.toLowerCase().includes(q);
       const blockHit = note.blocks.find((b) => b.text.toLowerCase().includes(q));
 
-      if (titleHit || folderHit || blockHit) {
+      if (titleHit || blockHit) {
         const snippet = blockHit ? blockHit.text : note.blocks[0]?.text || note.title;
         matches.push({
           id: `note-${note.id}`,
@@ -94,7 +107,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
     }
 
     return matches;
-  }, [query, tasks, notes]);
+  }, [query, tasks, notes, timeFormat]);
 
   if (!open) return null;
 
@@ -104,6 +117,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
       targetType: item.targetType,
       targetId: item.targetId,
       query: q,
+      selectedAt: Date.now(),
     });
     setQuery('');
     onClose();
@@ -165,7 +179,7 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                 Search across all tasks and notes
               </p>
               <p className="text-[13px] text-stone-400">
-                Search by title, list, subtasks, or note content.
+                Search by title, subtasks, or note content.
               </p>
             </div>
           ) : results.length === 0 ? (
@@ -195,9 +209,14 @@ export const GlobalSearchModal: React.FC<GlobalSearchModalProps> = ({
                   </span>
                   <div className="flex-1 min-w-0">
                     <p className="text-[15px] font-semibold text-stone-900 dark:text-stone-100 truncate">
-                      <HighlightedText text={item.title} query={query} />
+                      {item.title.trim() ? (
+                        <HighlightedText text={item.title} query={query} />
+                      ) : (
+                        'Untitled Note'
+                      )}
                     </p>
                     <p className="text-[13px] text-stone-500 dark:text-stone-400 truncate mt-0.5">
+                      {item.snippetPrefix}
                       {item.markdownEnabled ? (
                         <MarkdownPreviewText text={item.snippet} query={query} highlightActive />
                       ) : (

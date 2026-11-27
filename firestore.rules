@@ -20,6 +20,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidHexColor(val) {
+      return val is string && val.size() == 7 && val.matches('^#[0-9a-fA-F]{6}$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -64,6 +68,106 @@ service cloud.firestore {
         data.ownerId == userId &&
         isValidFolderList(data.folders, true) &&
         isValidFolderList(data.collapsedFolders, false) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAppSettingsMap(s) {
+      return s is map &&
+        s.keys().hasAll([
+          'hingeAwareSplit',
+          'oneHandedCoverReach',
+          'googleCalendarSync',
+          'googleTasksSync',
+          'buhCloudSync',
+          'nlpQuickParse',
+          'morningDigestTime',
+          'taskRemindersEnabled',
+          'reminderSound',
+          'completedTaskHistoryYears',
+          'completedTaskHistoryMonths',
+          'timeFormat'
+        ]) &&
+        s.keys().hasOnly([
+          'hingeAwareSplit',
+          'oneHandedCoverReach',
+          'googleCalendarSync',
+          'googleTasksSync',
+          'buhCloudSync',
+          'nlpQuickParse',
+          'morningDigestTime',
+          'taskRemindersEnabled',
+          'reminderSound',
+          'completedTaskHistoryYears',
+          'completedTaskHistoryMonths',
+          'timeFormat'
+        ]) &&
+        s.hingeAwareSplit is bool &&
+        s.oneHandedCoverReach is bool &&
+        s.googleCalendarSync is bool &&
+        s.googleTasksSync is bool &&
+        s.buhCloudSync is bool &&
+        s.nlpQuickParse is bool &&
+        s.morningDigestTime is string &&
+        s.morningDigestTime.size() <= 20 &&
+        s.taskRemindersEnabled is bool &&
+        s.reminderSound is bool &&
+        s.completedTaskHistoryYears is number &&
+        s.completedTaskHistoryYears >= 0 &&
+        s.completedTaskHistoryYears <= 100 &&
+        s.completedTaskHistoryMonths is number &&
+        s.completedTaskHistoryMonths >= 0 &&
+        s.completedTaskHistoryMonths <= 11 &&
+        s.timeFormat is string &&
+        s.timeFormat in ['24h', '12h'];
+    }
+
+    function isValidDesignDecisionsMap(d) {
+      return d is map &&
+        d.keys().hasAll(['visualStyle', 'navMode', 'quickCapture', 'defaultHome', 'accentColor']) &&
+        d.keys().hasOnly(['visualStyle', 'navMode', 'quickCapture', 'defaultHome', 'accentColor']) &&
+        d.visualStyle is string &&
+        d.visualStyle in ['minimal', 'samsung', 'professional'] &&
+        d.navMode is string &&
+        d.navMode in ['five', 'four'] &&
+        d.quickCapture is string &&
+        d.quickCapture in ['fab', 'bar', 'both'] &&
+        d.defaultHome is string &&
+        d.defaultHome in ['today', 'inbox', 'dashboard'] &&
+        isValidHexColor(d.accentColor);
+    }
+
+    function isValidWorkspacePreferences(data, userId) {
+      return data.keys().hasAll([
+          'ownerId',
+          'taskLists',
+          'settings',
+          'decisions',
+          'recentColors',
+          'darkMode',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'ownerId',
+          'taskLists',
+          'settings',
+          'decisions',
+          'recentColors',
+          'darkMode',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        isValidFolderList(data.taskLists, true) &&
+        isValidAppSettingsMap(data.settings) &&
+        isValidDesignDecisionsMap(data.decisions) &&
+        data.recentColors is list &&
+        data.recentColors.size() <= 12 &&
+        (data.recentColors.size() == 0 || isValidHexColor(data.recentColors[0])) &&
+        data.darkMode is bool &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -128,6 +232,279 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
+    function isValidSubTaskItem(st) {
+      return st is map &&
+        st.keys().hasAll(['id', 'title', 'done']) &&
+        st.keys().hasOnly(['id', 'title', 'done']) &&
+        isValidId(st.id) &&
+        st.title is string &&
+        st.title.size() <= 300 &&
+        st.done is bool;
+    }
+
+    function isValidReminderItem(rem) {
+      return rem is map &&
+        rem.keys().hasAll(['id', 'mode']) &&
+        rem.keys().hasOnly(['id', 'mode', 'offsetMinutes', 'dateKey', 'time24', 'firedAt']) &&
+        isValidId(rem.id) &&
+        rem.mode is string &&
+        rem.mode in ['relative', 'exact'] &&
+        (!('offsetMinutes' in rem) || (rem.offsetMinutes is number && rem.offsetMinutes >= 0 && rem.offsetMinutes <= 525600)) &&
+        (!('dateKey' in rem) || (rem.dateKey is string && rem.dateKey.size() <= 20)) &&
+        (!('time24' in rem) || (rem.time24 is string && rem.time24.size() <= 10)) &&
+        (!('firedAt' in rem) || rem.firedAt is number);
+    }
+
+    function isValidRecurrenceRule(rec) {
+      return rec is map &&
+        rec.keys().hasAll(['frequency', 'interval']) &&
+        rec.keys().hasOnly(['frequency', 'interval', 'daysOfWeek', 'endDateKey']) &&
+        rec.frequency is string &&
+        rec.frequency in ['daily', 'weekly', 'monthly', 'yearly'] &&
+        rec.interval is number &&
+        rec.interval >= 1 &&
+        rec.interval <= 365 &&
+        (!('daysOfWeek' in rec) || (
+          rec.daysOfWeek is list &&
+          rec.daysOfWeek.size() <= 7 &&
+          (rec.daysOfWeek.size() == 0 || (
+            rec.daysOfWeek[0] is number &&
+            rec.daysOfWeek[0] >= 0 &&
+            rec.daysOfWeek[0] <= 6
+          ))
+        )) &&
+        (!('endDateKey' in rec) || (rec.endDateKey is string && rec.endDateKey.size() <= 20));
+    }
+
+    function isValidTask(data, userId, taskId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'title',
+          'timeLabel',
+          'dateKey',
+          'category',
+          'priority',
+          'completed',
+          'isInbox',
+          'notes',
+          'subtasks',
+          'reminders',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'title',
+          'timeLabel',
+          'dateKey',
+          'category',
+          'priority',
+          'completed',
+          'completedAt',
+          'isInbox',
+          'notes',
+          'subtasks',
+          'reminders',
+          'recurrence',
+          'recurrenceSeriesId',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == taskId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.title is string &&
+        data.title.size() <= 300 &&
+        data.timeLabel is string &&
+        data.timeLabel.size() <= 40 &&
+        data.dateKey is string &&
+        data.dateKey.size() <= 20 &&
+        data.category is string &&
+        data.category.size() >= 1 &&
+        data.category.size() <= 100 &&
+        data.priority is string &&
+        data.priority in ['High', 'Normal', 'Low'] &&
+        data.completed is bool &&
+        (!('completedAt' in data) || (data.completedAt is string && data.completedAt.size() <= 40)) &&
+        data.isInbox is bool &&
+        data.notes is string &&
+        data.notes.size() <= 10000 &&
+        data.subtasks is list &&
+        data.subtasks.size() <= 100 &&
+        (data.subtasks.size() == 0 || isValidSubTaskItem(data.subtasks[0])) &&
+        data.reminders is list &&
+        data.reminders.size() <= 20 &&
+        (data.reminders.size() == 0 || isValidReminderItem(data.reminders[0])) &&
+        (!('recurrence' in data) || isValidRecurrenceRule(data.recurrence)) &&
+        (!('recurrenceSeriesId' in data) || isValidId(data.recurrenceSeriesId)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidEvent(data, userId, eventId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'title',
+          'dateKey',
+          'startTime',
+          'endTime',
+          'durationMinutes',
+          'calendarName',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'title',
+          'dateKey',
+          'endDateKey',
+          'startTime',
+          'endTime',
+          'durationMinutes',
+          'calendarName',
+          'location',
+          'linkedTaskId',
+          'recurrence',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == eventId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.title is string &&
+        data.title.size() <= 300 &&
+        data.dateKey is string &&
+        data.dateKey.size() <= 20 &&
+        (!('endDateKey' in data) || (data.endDateKey is string && data.endDateKey.size() <= 20)) &&
+        data.startTime is string &&
+        data.startTime.size() <= 10 &&
+        data.endTime is string &&
+        data.endTime.size() <= 10 &&
+        data.durationMinutes is number &&
+        data.durationMinutes >= 1 &&
+        data.durationMinutes <= 10080 &&
+        data.calendarName is string &&
+        data.calendarName.size() >= 1 &&
+        data.calendarName.size() <= 100 &&
+        (!('location' in data) || (data.location is string && data.location.size() <= 300)) &&
+        (!('linkedTaskId' in data) || isValidId(data.linkedTaskId)) &&
+        (!('recurrence' in data) || isValidRecurrenceRule(data.recurrence)) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidLookupSourceItem(src) {
+      return src is map &&
+        src.keys().hasAll(['title', 'uri']) &&
+        src.keys().hasOnly(['title', 'uri']) &&
+        src.title is string &&
+        src.title.size() <= 300 &&
+        src.uri is string &&
+        src.uri.size() <= 2000;
+    }
+
+    function isValidLookupMediaItem(item) {
+      return item is map &&
+        item.keys().hasAll(['id', 'type', 'title', 'url']) &&
+        item.keys().hasOnly([
+          'id',
+          'type',
+          'title',
+          'url',
+          'embedUrl',
+          'thumbnailUrl',
+          'sourceName',
+          'sourceUrl',
+          'mimeType'
+        ]) &&
+        isValidId(item.id) &&
+        item.type is string &&
+        item.type in ['image', 'video'] &&
+        item.title is string &&
+        item.title.size() <= 300 &&
+        item.url is string &&
+        item.url.size() <= 2000 &&
+        (!('embedUrl' in item) || (item.embedUrl is string && item.embedUrl.size() <= 2000)) &&
+        (!('thumbnailUrl' in item) || (item.thumbnailUrl is string && item.thumbnailUrl.size() <= 2000)) &&
+        (!('sourceName' in item) || (item.sourceName is string && item.sourceName.size() <= 200)) &&
+        (!('sourceUrl' in item) || (item.sourceUrl is string && item.sourceUrl.size() <= 2000)) &&
+        (!('mimeType' in item) || (item.mimeType is string && item.mimeType.size() <= 100));
+    }
+
+    function isValidLookupEntry(data, userId, entryId) {
+      return data.keys().hasAll([
+          'id',
+          'ownerId',
+          'prompt',
+          'answer',
+          'sources',
+          'media',
+          'webSearchQueries',
+          'timestamp',
+          'usedAgenda',
+          'orderMs',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'id',
+          'ownerId',
+          'prompt',
+          'answer',
+          'sources',
+          'media',
+          'webSearchQueries',
+          'timestamp',
+          'usedAgenda',
+          'savedTask',
+          'savedTaskId',
+          'savedNote',
+          'savedNoteId',
+          'orderMs',
+          'createdAt',
+          'updatedAt'
+        ]) &&
+        isValidId(data.id) &&
+        data.id == entryId &&
+        isValidId(data.ownerId) &&
+        data.ownerId == request.auth.uid &&
+        data.ownerId == userId &&
+        data.prompt is string &&
+        data.prompt.size() <= 2000 &&
+        data.answer is string &&
+        data.answer.size() <= 40000 &&
+        data.sources is list &&
+        data.sources.size() <= 30 &&
+        (data.sources.size() == 0 || isValidLookupSourceItem(data.sources[0])) &&
+        data.media is list &&
+        data.media.size() <= 20 &&
+        (data.media.size() == 0 || isValidLookupMediaItem(data.media[0])) &&
+        data.webSearchQueries is list &&
+        data.webSearchQueries.size() <= 20 &&
+        (data.webSearchQueries.size() == 0 || (
+          data.webSearchQueries[0] is string &&
+          data.webSearchQueries[0].size() <= 300
+        )) &&
+        data.timestamp is string &&
+        data.timestamp.size() <= 60 &&
+        data.usedAgenda is bool &&
+        (!('savedTask' in data) || data.savedTask is bool) &&
+        (!('savedTaskId' in data) || isValidId(data.savedTaskId)) &&
+        (!('savedNote' in data) || data.savedNote is bool) &&
+        (!('savedNoteId' in data) || isValidId(data.savedNoteId)) &&
+        data.orderMs is number &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // --- Collection: /users/{userId} ---
     match /users/{userId} {
       allow get: if isVerifiedUser() &&
@@ -161,7 +538,7 @@ service cloud.firestore {
         allow get: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(prefId) &&
-          prefId == 'notes' &&
+          prefId in ['notes', 'workspace'] &&
           userId == request.auth.uid &&
           (resource == null || existing().ownerId == request.auth.uid) &&
           ownsWorkspace(userId);
@@ -171,9 +548,11 @@ service cloud.firestore {
         allow create: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(prefId) &&
-          prefId == 'notes' &&
           userId == request.auth.uid &&
-          isValidNotePreferences(incoming(), userId) &&
+          (
+            (prefId == 'notes' && isValidNotePreferences(incoming(), userId)) ||
+            (prefId == 'workspace' && isValidWorkspacePreferences(incoming(), userId))
+          ) &&
           incoming().createdAt == request.time &&
           incoming().updatedAt == request.time &&
           ownsWorkspace(userId);
@@ -181,18 +560,35 @@ service cloud.firestore {
         allow update: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(prefId) &&
-          prefId == 'notes' &&
           userId == request.auth.uid &&
-          isValidNotePreferences(incoming(), userId) &&
+          (
+            (prefId == 'notes' && isValidNotePreferences(incoming(), userId)) ||
+            (prefId == 'workspace' && isValidWorkspacePreferences(incoming(), userId))
+          ) &&
           existing().ownerId == request.auth.uid &&
           incoming().ownerId == existing().ownerId &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
           (
-            // Action: Update folders and/or collapsedFolders
-            incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'collapsedFolders', 'updatedAt']) ||
-            incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'updatedAt']) ||
-            incoming().diff(existing()).affectedKeys().hasOnly(['collapsedFolders', 'updatedAt'])
+            (
+              prefId == 'notes' &&
+              (
+                incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'collapsedFolders', 'updatedAt']) ||
+                incoming().diff(existing()).affectedKeys().hasOnly(['folders', 'updatedAt']) ||
+                incoming().diff(existing()).affectedKeys().hasOnly(['collapsedFolders', 'updatedAt'])
+              )
+            ) ||
+            (
+              prefId == 'workspace' &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'taskLists',
+                'settings',
+                'decisions',
+                'recentColors',
+                'darkMode',
+                'updatedAt'
+              ])
+            )
           ) &&
           ownsWorkspace(userId);
 
@@ -233,24 +629,194 @@ service cloud.firestore {
           incoming().id == existing().id &&
           incoming().createdAt == existing().createdAt &&
           incoming().updatedAt == request.time &&
-          (
-            // Action: Edit note content, metadata, pin, markdown, sort order, or move folder
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'title',
-              'folder',
-              'updatedAtLabel',
-              'pinned',
-              'markdownEnabled',
-              'blocks',
-              'sortOrder',
-              'updatedAt'
-            ])
-          ) &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'folder',
+            'updatedAtLabel',
+            'pinned',
+            'markdownEnabled',
+            'blocks',
+            'sortOrder',
+            'updatedAt'
+          ]) &&
           ownsWorkspace(userId);
 
         allow delete: if isVerifiedUser() &&
           isValidId(userId) &&
           isValidId(noteId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid &&
+          ownsWorkspace(userId);
+      }
+
+      // --- Subcollection: /users/{userId}/tasks/{taskId} ---
+      match /tasks/{taskId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(taskId) &&
+          userId == request.auth.uid &&
+          (resource == null || existing().ownerId == request.auth.uid) &&
+          ownsWorkspace(userId);
+
+        allow list: if isVerifiedUser() &&
+          isValidId(userId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(taskId) &&
+          userId == request.auth.uid &&
+          isValidTask(incoming(), userId, taskId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          ownsWorkspace(userId);
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(taskId) &&
+          userId == request.auth.uid &&
+          isValidTask(incoming(), userId, taskId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'timeLabel',
+            'dateKey',
+            'category',
+            'priority',
+            'completed',
+            'completedAt',
+            'isInbox',
+            'notes',
+            'subtasks',
+            'reminders',
+            'recurrence',
+            'recurrenceSeriesId',
+            'updatedAt'
+          ]) &&
+          ownsWorkspace(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(taskId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid &&
+          ownsWorkspace(userId);
+      }
+
+      // --- Subcollection: /users/{userId}/events/{eventId} ---
+      match /events/{eventId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(eventId) &&
+          userId == request.auth.uid &&
+          (resource == null || existing().ownerId == request.auth.uid) &&
+          ownsWorkspace(userId);
+
+        allow list: if isVerifiedUser() &&
+          isValidId(userId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(eventId) &&
+          userId == request.auth.uid &&
+          isValidEvent(incoming(), userId, eventId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          ownsWorkspace(userId);
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(eventId) &&
+          userId == request.auth.uid &&
+          isValidEvent(incoming(), userId, eventId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'title',
+            'dateKey',
+            'endDateKey',
+            'startTime',
+            'endTime',
+            'durationMinutes',
+            'calendarName',
+            'location',
+            'linkedTaskId',
+            'recurrence',
+            'updatedAt'
+          ]) &&
+          ownsWorkspace(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(eventId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid &&
+          ownsWorkspace(userId);
+      }
+
+      // --- Subcollection: /users/{userId}/lookupEntries/{entryId} ---
+      match /lookupEntries/{entryId} {
+        allow get: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(entryId) &&
+          userId == request.auth.uid &&
+          (resource == null || existing().ownerId == request.auth.uid) &&
+          ownsWorkspace(userId);
+
+        allow list: if isVerifiedUser() &&
+          isValidId(userId) &&
+          userId == request.auth.uid &&
+          existing().ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(entryId) &&
+          userId == request.auth.uid &&
+          isValidLookupEntry(incoming(), userId, entryId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          ownsWorkspace(userId);
+
+        allow update: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(entryId) &&
+          userId == request.auth.uid &&
+          isValidLookupEntry(incoming(), userId, entryId) &&
+          existing().ownerId == request.auth.uid &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().id == existing().id &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time &&
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'prompt',
+            'answer',
+            'sources',
+            'media',
+            'webSearchQueries',
+            'timestamp',
+            'usedAgenda',
+            'savedTask',
+            'savedTaskId',
+            'savedNote',
+            'savedNoteId',
+            'orderMs',
+            'updatedAt'
+          ]) &&
+          ownsWorkspace(userId);
+
+        allow delete: if isVerifiedUser() &&
+          isValidId(userId) &&
+          isValidId(entryId) &&
           userId == request.auth.uid &&
           existing().ownerId == request.auth.uid &&
           ownsWorkspace(userId);

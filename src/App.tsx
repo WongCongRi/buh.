@@ -1,26 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import {
-  Columns2,
-  Download,
-  Keyboard,
-  Loader2,
-  Maximize2,
-  Moon,
-  RotateCcw,
-  Smartphone,
-  SplitSquareVertical,
-  Sun,
-  Tablet,
-} from 'lucide-react';
-import { ApprovalModal } from './components/ApprovalModal';
-import { DesignDecisionsPanel } from './components/DesignDecisionsPanel';
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActiveReminderAlert, FoldDeviceFrame } from './components/FoldDeviceFrame';
 import { OfflineIndicator } from './components/OfflineIndicator';
-import { PWAInstallButton } from './components/PWAInstallButton';
-import { StudioHeader } from './components/StudioHeader';
 import { useAndroidBackController } from './hooks/useAndroidBackNavigation';
+
+const StudioPreviewShell = lazy(() =>
+  import('./components/StudioPreviewShell').then((m) => ({ default: m.StudioPreviewShell }))
+);
 import {
   DEMO_SEED_IDS,
+  getTodayDateKey,
   INITIAL_DECISIONS,
   INITIAL_EVENTS,
   INITIAL_LISTS,
@@ -35,10 +23,12 @@ import {
   deleteGoogleCalendarEvent,
   fetchGoogleCalendarEvents,
   initGoogleAuth,
+  isCalendarAccessTokenFresh,
   signInWithGoogleCalendar,
   signOutGoogleCalendar,
 } from './services/googleCalendar';
 import {
+  buildDefaultGoogleTaskReminders,
   createGoogleTask,
   deleteGoogleTask,
   fetchGoogleTasks,
@@ -58,6 +48,27 @@ import {
   upsertCloudNote,
 } from './services/cloudNotesSync';
 import {
+  deleteCloudEvent,
+  deleteCloudLookupEntry,
+  deleteCloudTask,
+  fetchAllCloudEventsOnce,
+  fetchAllCloudLookupEntriesOnce,
+  fetchAllCloudTasksOnce,
+  fingerprintCloudEvent,
+  fingerprintCloudLookupEntry,
+  fingerprintCloudTask,
+  fingerprintWorkspacePreferences,
+  saveCloudWorkspacePreferences,
+  subscribeCloudEvents,
+  subscribeCloudLookupEntries,
+  subscribeCloudTasks,
+  subscribeCloudWorkspacePreferences,
+  upsertCloudEvent,
+  upsertCloudLookupEntry,
+  upsertCloudTask,
+} from './services/cloudWorkspaceSync';
+import type { QuickCheckEntry } from './components/screens/QuickCheckScreen';
+import {
   AppSettingsState,
   CalendarEvent,
   CloudNotesSyncState,
@@ -68,11 +79,16 @@ import {
   GoogleTaskListInfo,
   GoogleTasksSyncState,
   NoteItem,
+  RecurrenceRule,
   ScreenId,
   TaskItem,
   TaskPriority,
   TaskReminder,
 } from './types/taskflow';
+import { formatRelativeTaskDate } from './utils/dateLabels';
+import { buildNextRecurringTaskInstance } from './utils/recurrence';
+import { compareEventsAscending, compareTasksAscending } from './utils/taskSort';
+import { TimeFormatProvider, formatClockDate } from './utils/timeFormat';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { applyAccentCssVars, normalizeHex } from './utils/colorUtils';
 import {
@@ -83,20 +99,36 @@ import {
   clearOfflineGoogleCache,
   enqueueSyncOp,
   isNetworkOrOfflineError,
+  loadCachedLookupEntries,
   loadOfflineGoogleCache,
   makeSyncOpId,
   OfflineSyncOp,
   requestPersistentStorage,
+  saveCachedLookupEntries,
   saveOfflineGoogleCache,
 } from './utils/offlineSync';
 import {
+  clearCloudTaskJournal,
+  loadCloudTaskJournal,
+  mergeGoogleTaskOfflinePriority,
+  mergeTaskItemOfflinePriority,
+  OfflineCloudTaskJournal,
+  saveCloudTaskJournal,
+} from './utils/taskReconciliation';
+import {
+  clearReminderFiredInServiceWorker,
   computeReminderTriggerMs,
   consumePendingSwReminderActions,
   createSnoozedReminder,
   dispatchSystemTaskNotification,
   formatReminderLabel,
   getNotificationPermissionState,
+  getSwFiredReminderKeys,
+  loadPersistedFiredReminderKeys,
+  makeRearmedReminderId,
+  markReminderFiredInServiceWorker,
   playSoftReminderChime,
+  syncRemindersToServiceWorker,
   syncScheduledRemindersToPushServer,
 } from './utils/taskReminders';
 
@@ -181,11 +213,32 @@ function loadInitialState(): PersistedReviewState {
             ? (rawScreen as ScreenId)
             : ScreenId.Home;
 
-      const accent = normalizeHex(parsed.decisions?.accentColor ?? INITIAL_DECISIONS.accentColor);
+      const rawAccent = normalizeHex(parsed.decisions?.accentColor ?? INITIAL_DECISIONS.accentColor);
       const parsedRecent = Array.isArray(parsed.recentColors)
         ? parsed.recentColors.map(normalizeHex).filter((c, i, arr) => arr.indexOf(c) === i).slice(0, 5)
         : INITIAL_RECENT_COLORS;
-      const recentColors = parsedRecent.length > 0 ? parsedRecent : [accent];
+      const accentMigrationKey = 'buh-accent-default-migrated-c7dff1';
+      let migratedUntouchedDefault = false;
+      try {
+        if (!localStorage.getItem(accentMigrationKey)) {
+          if (
+            rawAccent === '#7BB6E0' &&
+            parsedRecent.length <= 1 &&
+            parsedRecent.every((c) => c === '#7BB6E0')
+          ) {
+            migratedUntouchedDefault = true;
+          }
+          localStorage.setItem(accentMigrationKey, '1');
+        }
+      } catch {
+        // Ignore storage errors
+      }
+      const accent = migratedUntouchedDefault ? INITIAL_DECISIONS.accentColor : rawAccent;
+      const recentColors = migratedUntouchedDefault
+        ? INITIAL_RECENT_COLORS
+        : parsedRecent.length > 0
+          ? parsedRecent
+          : [accent];
 
       const parsedLists = Array.isArray(parsed.taskLists)
         ? Array.from(
@@ -341,7 +394,12 @@ export default function App() {
     action: PwaShortcutAction;
     nonce: number;
   } | null>(null);
-  const dispatchedReminderKeysRef = useRef<Set<string>>(new Set());
+  const dispatchedReminderKeysRef = useRef<Set<string>>(
+    new Set(Object.keys(loadPersistedFiredReminderKeys()))
+  );
+  const swActionsHydratedRef = useRef<boolean>(false);
+  const swWakePendingRef = useRef<boolean>(false);
+  const processedSwActionIdsRef = useRef<Set<string>>(new Set());
   const [isInstalledPwa, setIsInstalledPwa] = useState<boolean>(() => {
     if (typeof window === 'undefined') return false;
     return (
@@ -375,15 +433,18 @@ export default function App() {
     typeof window !== 'undefined' ? window.matchMedia('(pointer: coarse)').matches : false
   );
   const [isVirtualKeyboardOpen, setIsVirtualKeyboardOpen] = useState<boolean>(false);
+  const [dpiCompensationZoom, setDpiCompensationZoom] = useState<number>(1);
   const maxViewportHeightRef = useRef<Record<string, number>>({});
   const lastSyncedWidthRef = useRef<number>(viewportWidth);
+  const lastVhCssRef = useRef<string>('');
+  const lastVvTopCssRef = useRef<string>('');
 
   useEffect(() => {
     const INNER_POSTURE_BREAKPOINT = 560;
     const BASE_VIEWPORT_CONTENT =
-      'width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content';
-    const RESET_VIEWPORT_CONTENT =
-      'width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content';
+      'width=device-width, initial-scale=1.0, minimum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content';
+    const buildLockedViewportContent = (widthPx: number) =>
+      `width=${widthPx}, initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content`;
 
     const standaloneMedia = window.matchMedia('(display-mode: standalone)');
     const coarseMedia = window.matchMedia('(pointer: coarse)');
@@ -395,8 +456,10 @@ export default function App() {
     const screenOrientation = window.screen?.orientation;
     const settleTimers = new Set<number>();
     let rafId: number | null = null;
-    let viewportResetRafId: number | null = null;
-    let lastViewportResetAt = 0;
+    let innerReleaseTimerId: number | null = null;
+    let lockedCoverWidth: number | null = null;
+    let lockedCoverSince = 0;
+    let currentDprMedia: MediaQueryList | null = null;
 
     const clearPendingSettles = () => {
       if (rafId !== null) {
@@ -421,20 +484,12 @@ export default function App() {
       return Math.round(docWidth || winWidth);
     };
 
-    const resetMobileViewportScale = () => {
-      const now = Date.now();
-      if (now - lastViewportResetAt < 500) return;
+    const applyViewportMeta = (content: string) => {
       const viewportMeta = document.querySelector('meta[name="viewport"]');
       if (!viewportMeta) return;
-      lastViewportResetAt = now;
-      viewportMeta.setAttribute('content', RESET_VIEWPORT_CONTENT);
-      if (viewportResetRafId !== null) {
-        window.cancelAnimationFrame(viewportResetRafId);
+      if (viewportMeta.getAttribute('content') !== content) {
+        viewportMeta.setAttribute('content', content);
       }
-      viewportResetRafId = window.requestAnimationFrame(() => {
-        viewportResetRafId = null;
-        viewportMeta.setAttribute('content', BASE_VIEWPORT_CONTENT);
-      });
     };
 
     const readEffectiveWidth = () => {
@@ -458,9 +513,13 @@ export default function App() {
       if (screenWidth > 0 && screenWidth < effectiveWidth) {
         effectiveWidth = screenWidth;
       }
-      // Reverse case: launched on Cover then unfolded to Inner while Chrome stayed zoomed in
-      if (vvScaledWidth >= INNER_POSTURE_BREAKPOINT && vvScale > 1.25 && rawLayoutWidth < INNER_POSTURE_BREAKPOINT) {
-        effectiveWidth = vvScaledWidth;
+      // Reverse case: launched or locked on Cover then unfolded to Inner
+      if (
+        effectiveWidth < INNER_POSTURE_BREAKPOINT &&
+        (screenWidth >= INNER_POSTURE_BREAKPOINT ||
+          (screenWidth === 0 && vvScaledWidth >= INNER_POSTURE_BREAKPOINT && vvScale > 1.15))
+      ) {
+        effectiveWidth = Math.max(screenWidth, vvScaledWidth);
       }
 
       return { effectiveWidth, rawLayoutWidth, screenWidth, vvScaledWidth, vvScale };
@@ -477,24 +536,72 @@ export default function App() {
           activeEl.tagName === 'TEXTAREA' ||
           activeEl.isContentEditable);
 
-      // If Chrome kept a stale layout viewport width across an Inner <-> Cover display switch,
-      // nudge <meta name="viewport"> so Chrome recalculates device-width and snaps scale to 1.0.
-      if (mobile && !inputFocused) {
-        const stuckInnerOnCover =
-          rawLayoutWidth >= INNER_POSTURE_BREAKPOINT &&
-          effectiveWidth < INNER_POSTURE_BREAKPOINT;
-        const stuckCoverOnInner =
-          rawLayoutWidth < INNER_POSTURE_BREAKPOINT &&
-          vvScale > 1.25 &&
-          vvScaledWidth >= INNER_POSTURE_BREAKPOINT;
-        const stuckZoomedOutOnCover =
-          screenWidth > 0 &&
-          screenWidth < INNER_POSTURE_BREAKPOINT &&
-          vvScale < 0.92 &&
-          rawLayoutWidth > screenWidth + 24;
-        if (stuckInnerOnCover || stuckCoverOnInner || stuckZoomedOutOnCover) {
-          resetMobileViewportScale();
+      let nextZoom = 1;
+
+      if (mobile) {
+        if (effectiveWidth < INNER_POSTURE_BREAKPOINT) {
+          const targetCoverWidth =
+            screenWidth > 0 && screenWidth < INNER_POSTURE_BREAKPOINT
+              ? screenWidth
+              : vvScaledWidth > 0 && vvScaledWidth < INNER_POSTURE_BREAKPOINT
+                ? vvScaledWidth
+                : effectiveWidth;
+
+          const layoutTooWide = targetCoverWidth > 0 && rawLayoutWidth > targetCoverWidth + 16;
+          const scaleOff = vvScale < 0.94 || vvScale > 1.06;
+
+          if (layoutTooWide || scaleOff) {
+            if (innerReleaseTimerId !== null) {
+              window.clearTimeout(innerReleaseTimerId);
+              innerReleaseTimerId = null;
+            }
+            if (lockedCoverWidth !== targetCoverWidth) {
+              lockedCoverWidth = targetCoverWidth;
+              lockedCoverSince = Date.now();
+            }
+            applyViewportMeta(buildLockedViewportContent(targetCoverWidth));
+            // If Samsung One UI / Chrome WebAPK still keeps layout width inflated after the
+            // explicit viewport meta update settles, compensate visual DPI cleanly via CSS zoom
+            // — and keep this compensation active even while editing text or opening time/date pickers.
+            if (layoutTooWide && Date.now() - lockedCoverSince >= 280) {
+              const ratio = rawLayoutWidth / targetCoverWidth;
+              if (ratio >= 1.12) {
+                nextZoom = Math.min(2.4, Number(ratio.toFixed(3)));
+              }
+            }
+          } else {
+            nextZoom = 1;
+          }
+        } else if (!inputFocused || screenWidth >= INNER_POSTURE_BREAKPOINT) {
+          // Inner screen (unfolded): release any Cover viewport width lock so Chrome restores Inner DPI cleanly
+          nextZoom = 1;
+          const needsInnerReset =
+            lockedCoverWidth !== null ||
+            rawLayoutWidth < effectiveWidth - 24 ||
+            vvScale < 0.94 ||
+            vvScale > 1.06;
+          if (needsInnerReset) {
+            lockedCoverWidth = null;
+            lockedCoverSince = 0;
+            applyViewportMeta(buildLockedViewportContent(effectiveWidth));
+            if (innerReleaseTimerId !== null) {
+              window.clearTimeout(innerReleaseTimerId);
+            }
+            innerReleaseTimerId = window.setTimeout(() => {
+              innerReleaseTimerId = null;
+              if (lockedCoverWidth === null) {
+                applyViewportMeta(BASE_VIEWPORT_CONTENT);
+              }
+            }, 300);
+          }
         }
+      } else {
+        if (lockedCoverWidth !== null) {
+          lockedCoverWidth = null;
+          lockedCoverSince = 0;
+          applyViewportMeta(BASE_VIEWPORT_CONTENT);
+        }
+        nextZoom = 1;
       }
 
       const vvHeight = vv?.height ? Math.round(vv.height) : 0;
@@ -508,8 +615,16 @@ export default function App() {
             : winHeight;
       const offsetTop = inputFocused ? Math.max(0, Math.round(vv?.offsetTop ?? 0)) : 0;
 
-      document.documentElement.style.setProperty('--buh-vh', `${visibleHeight}px`);
-      document.documentElement.style.setProperty('--buh-vv-top', `${offsetTop}px`);
+      const nextVhCss = `${visibleHeight}px`;
+      if (lastVhCssRef.current !== nextVhCss) {
+        lastVhCssRef.current = nextVhCss;
+        document.documentElement.style.setProperty('--buh-vh', nextVhCss);
+      }
+      const nextVvTopCss = `${offsetTop}px`;
+      if (lastVvTopCssRef.current !== nextVvTopCss) {
+        lastVvTopCssRef.current = nextVvTopCss;
+        document.documentElement.style.setProperty('--buh-vv-top', nextVvTopCss);
+      }
 
       const widthBucket = String(Math.round(effectiveWidth / 40));
       const prevMax = maxViewportHeightRef.current[widthBucket] ?? 0;
@@ -520,6 +635,7 @@ export default function App() {
       const keyboardVisible = inputFocused && baseline - visibleHeight > 130;
 
       lastSyncedWidthRef.current = effectiveWidth;
+      setDpiCompensationZoom(nextZoom);
       setIsVirtualKeyboardOpen(keyboardVisible);
       setViewportWidth(effectiveWidth);
       setIsCoarseTouch(coarseMedia.matches);
@@ -530,9 +646,9 @@ export default function App() {
 
       if (
         document.documentElement.classList.contains('buh-standalone') &&
-        (window.scrollY !== 0 || offsetTop !== 0)
+        (window.scrollY !== 0 || window.scrollX !== 0)
       ) {
-        window.scrollTo(0, 0);
+        window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
       }
     };
 
@@ -552,24 +668,55 @@ export default function App() {
       }
     };
 
-    // Always process resize/orientation/posture events even if fired while screen is briefly hidden/locked.
+    // Always process resize/orientation/posture/DPR events even if fired while screen is briefly hidden/locked.
     const handleDisplayChange = () => {
-      scheduleSync([50, 180, 400, 800, 1400]);
+      scheduleSync([50, 180, 350, 650, 1200]);
+    };
+
+    // Re-bind a resolution (dppx) media query whenever DPR changes on fold/unfold
+    const bindDprListener = () => {
+      if (currentDprMedia) {
+        currentDprMedia.removeEventListener?.('change', handleDprChange);
+      }
+      currentDprMedia = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      currentDprMedia.addEventListener?.('change', handleDprChange);
+    };
+
+    const handleDprChange = () => {
+      bindDprListener();
+      handleDisplayChange();
     };
 
     // Folding/unfolding across a lock screen on Galaxy Z Fold can finish switching
     // displays 100-1000ms after visibility/focus resumes, so re-check across settle windows.
     const handleVisibilityResume = () => {
       if (document.visibilityState === 'hidden') return;
-      scheduleSync([50, 180, 400, 800, 1400]);
+      scheduleSync([50, 180, 350, 650, 1200]);
     };
 
-    const handleFocusToggle = () => scheduleSync([80, 200]);
+    const scheduleDeferredSync = (delays: number[]) => {
+      clearPendingSettles();
+      for (const delay of delays) {
+        const id = window.setTimeout(() => {
+          settleTimers.delete(id);
+          syncViewport();
+        }, delay);
+        settleTimers.add(id);
+      }
+    };
+
+    const handleFocusIn = () => scheduleSync([80, 200, 340]);
+    // Defer focusout sync so a tap on a bottom button (e.g. Lookup Send) finishes its click
+    // before --buh-vh snaps back to full height and shifts the button away.
+    const handleFocusOut = () => scheduleDeferredSync([120, 240, 380]);
 
     const handlePointerDriftCheck = () => {
-      const { effectiveWidth } = readEffectiveWidth();
-      if (Math.abs(effectiveWidth - lastSyncedWidthRef.current) > 4) {
-        scheduleSync([60, 220, 500]);
+      const { effectiveWidth, rawLayoutWidth } = readEffectiveWidth();
+      if (
+        Math.abs(effectiveWidth - lastSyncedWidthRef.current) > 4 ||
+        (effectiveWidth < INNER_POSTURE_BREAKPOINT && rawLayoutWidth > effectiveWidth + 16)
+      ) {
+        scheduleSync([60, 220, 420]);
       }
     };
 
@@ -581,14 +728,15 @@ export default function App() {
         : null;
     resizeObserver?.observe(document.documentElement);
 
+    bindDprListener();
     syncViewport();
     window.addEventListener('resize', handleDisplayChange);
     window.addEventListener('orientationchange', handleDisplayChange);
     window.addEventListener('focus', handleDisplayChange);
     window.addEventListener('pageshow', handleDisplayChange);
     document.addEventListener('visibilitychange', handleVisibilityResume);
-    window.addEventListener('focusin', handleFocusToggle);
-    window.addEventListener('focusout', handleFocusToggle);
+    window.addEventListener('focusin', handleFocusIn);
+    window.addEventListener('focusout', handleFocusOut);
     window.addEventListener('pointerdown', handlePointerDriftCheck, { passive: true });
     window.addEventListener('touchstart', handlePointerDriftCheck, { passive: true });
     vv?.addEventListener('resize', handleDisplayChange);
@@ -601,17 +749,18 @@ export default function App() {
 
     return () => {
       clearPendingSettles();
-      if (viewportResetRafId !== null) {
-        window.cancelAnimationFrame(viewportResetRafId);
+      if (innerReleaseTimerId !== null) {
+        window.clearTimeout(innerReleaseTimerId);
       }
+      currentDprMedia?.removeEventListener?.('change', handleDprChange);
       resizeObserver?.disconnect();
       window.removeEventListener('resize', handleDisplayChange);
       window.removeEventListener('orientationchange', handleDisplayChange);
       window.removeEventListener('focus', handleDisplayChange);
       window.removeEventListener('pageshow', handleDisplayChange);
       document.removeEventListener('visibilitychange', handleVisibilityResume);
-      window.removeEventListener('focusin', handleFocusToggle);
-      window.removeEventListener('focusout', handleFocusToggle);
+      window.removeEventListener('focusin', handleFocusIn);
+      window.removeEventListener('focusout', handleFocusOut);
       window.removeEventListener('pointerdown', handlePointerDriftCheck);
       window.removeEventListener('touchstart', handlePointerDriftCheck);
       vv?.removeEventListener('resize', handleDisplayChange);
@@ -624,12 +773,26 @@ export default function App() {
     };
   }, []);
 
-  // Handle PWA launcher shortcuts & OS note_taking triggers (cold URL launch + warm launchQueue)
+  // Handle PWA launcher shortcuts, notification ?openTask= launches & OS note_taking triggers
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const triggerShortcut = (action: PwaShortcutAction) => {
       setExternalShortcut({ action, nonce: Date.now() + Math.random() });
     };
+
+    const initialParams = new URLSearchParams(window.location.search);
+    const openTaskId = initialParams.get('openTask');
+    if (openTaskId) {
+      setActiveScreen(ScreenId.Tasks);
+      setExternalOpenTask({ taskId: openTaskId, nonce: Date.now() });
+      try {
+        const cleaned = new URL(window.location.href);
+        cleaned.searchParams.delete('openTask');
+        window.history.replaceState(window.history.state, '', cleaned.pathname + cleaned.search + cleaned.hash);
+      } catch {
+        // Ignore history restriction
+      }
+    }
 
     const initialAction = parsePwaShortcutFromUrl(window.location.href);
     if (initialAction) {
@@ -668,7 +831,12 @@ export default function App() {
   const [googleError, setGoogleError] = useState<string | null>(null);
 
   const [googleTasksSyncing, setGoogleTasksSyncing] = useState<boolean>(false);
-  const [googleTasks, setGoogleTasks] = useState<TaskItem[]>(initialGoogleCache.googleTasks);
+  const [googleTasks, setGoogleTasks] = useState<TaskItem[]>(() =>
+    initialGoogleCache.googleTasks.map((t) => {
+      const reminders = buildDefaultGoogleTaskReminders(t);
+      return reminders !== t.reminders ? { ...t, reminders } : t;
+    })
+  );
   const [googleTaskLists, setGoogleTaskLists] = useState<GoogleTaskListInfo[]>(
     initialGoogleCache.googleTaskLists
   );
@@ -689,6 +857,12 @@ export default function App() {
   const pendingSyncQueueRef = useRef<OfflineSyncOp[]>(pendingSyncQueue);
   const flushingQueueRef = useRef<boolean>(false);
   const googleConnectedRef = useRef<boolean>(googleConnected);
+  const dirtyGoogleTaskIdsRef = useRef<string[]>(dirtyGoogleTaskIds);
+  const googleTaskEditVersionRef = useRef<Map<string, number>>(new Map());
+  const pendingGoogleTaskAutoSyncRef = useRef<
+    Map<string, { timerId: number; version: number; task: TaskItem }>
+  >(new Map());
+  const inFlightGoogleTaskSyncIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     pendingSyncQueueRef.current = pendingSyncQueue;
@@ -697,6 +871,10 @@ export default function App() {
   useEffect(() => {
     googleConnectedRef.current = googleConnected;
   }, [googleConnected]);
+
+  useEffect(() => {
+    dirtyGoogleTaskIdsRef.current = dirtyGoogleTaskIds;
+  }, [dirtyGoogleTaskIds]);
 
   // Ask browser/OS to protect local tasks, notes, and offline sync queue from storage eviction
   useEffect(() => {
@@ -726,10 +904,24 @@ export default function App() {
     pendingSyncQueue,
   ]);
 
+  const offlineNoticeTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (offlineNoticeTimerRef.current !== null) {
+        window.clearTimeout(offlineNoticeTimerRef.current);
+      }
+    };
+  }, []);
+
   const showOfflineSyncNotice = useCallback((msg: string) => {
     setOfflineSyncNotice(msg);
-    window.setTimeout(() => {
+    if (offlineNoticeTimerRef.current !== null) {
+      window.clearTimeout(offlineNoticeTimerRef.current);
+    }
+    offlineNoticeTimerRef.current = window.setTimeout(() => {
       setOfflineSyncNotice((curr) => (curr === msg ? null : curr));
+      offlineNoticeTimerRef.current = null;
     }, 3400);
   }, []);
 
@@ -740,9 +932,7 @@ export default function App() {
     try {
       const fetched = await fetchGoogleCalendarEvents(tokenOverride);
       setGoogleEvents(fetched);
-      setGoogleLastSyncedAt(
-        new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      );
+      setGoogleLastSyncedAt(formatClockDate(new Date()));
     } catch (err: unknown) {
       if (isNetworkOrOfflineError(err)) return;
       const msg = err instanceof Error ? err.message : 'Unable to sync Google Calendar.';
@@ -757,37 +947,186 @@ export default function App() {
     }
   }, []);
 
+  const rearmRelativeReminders = useCallback(
+    (prevTask: TaskItem | undefined, updated: TaskItem): TaskItem => {
+      if (
+        !prevTask ||
+        !updated.reminders ||
+        updated.reminders.length === 0 ||
+        (prevTask.dateKey === updated.dateKey &&
+          prevTask.timeLabel === updated.timeLabel &&
+          Boolean(prevTask.isInbox) === Boolean(updated.isInbox))
+      ) {
+        return updated;
+      }
+      const now = Date.now();
+      const todayKey = getTodayDateKey();
+      const clearedReminderIds = new Set<string>();
+      let mutated = false;
+
+      const nextReminders = updated.reminders.map((r) => {
+        if (r.mode !== 'relative') return r;
+
+        const prevTrigger = computeReminderTriggerMs(prevTask, r);
+        const nextTrigger = computeReminderTriggerMs(updated, r);
+        const isRescheduledToTodayGoogleDefault =
+          updated.source === 'google' &&
+          r.id.startsWith('gtask-due-') &&
+          updated.timeLabel === 'No time set' &&
+          updated.dateKey === todayKey &&
+          prevTask.dateKey !== todayKey;
+
+        if (prevTrigger === nextTrigger && !isRescheduledToTodayGoogleDefault) {
+          return r;
+        }
+
+        const prefix = `${updated.id}:${r.id}`;
+        for (const existingKey of Array.from(dispatchedReminderKeysRef.current)) {
+          if (existingKey === prefix || existingKey.startsWith(`${prefix}:`)) {
+            dispatchedReminderKeysRef.current.delete(existingKey);
+          }
+        }
+        void clearReminderFiredInServiceWorker(updated.id, r.id);
+        clearedReminderIds.add(r.id);
+
+        if (nextTrigger === null) {
+          // Date was cleared; keep relative reminder saved and ready for when a date is assigned
+          if (r.firedAt !== undefined) {
+            mutated = true;
+            return { ...r, firedAt: undefined };
+          }
+          return r;
+        }
+
+        if (nextTrigger > now || isRescheduledToTodayGoogleDefault) {
+          mutated = true;
+          return {
+            ...r,
+            id: makeRearmedReminderId(r.id),
+            firedAt: undefined,
+          };
+        }
+
+        // Rescheduled to an already-past time: don't re-fire if it was already fired,
+        // otherwise rotate id so a fresh schedule change is cleanly tracked
+        if (!r.firedAt) {
+          mutated = true;
+          return {
+            ...r,
+            id: makeRearmedReminderId(r.id),
+            firedAt: undefined,
+          };
+        }
+        return r;
+      });
+
+      if (clearedReminderIds.size > 0) {
+        queueMicrotask(() => {
+          setActiveReminderAlerts((prev) =>
+            prev.filter(
+              (a) => !(a.taskId === updated.id && a.reminderId && clearedReminderIds.has(a.reminderId))
+            )
+          );
+        });
+      }
+
+      if (!mutated) return updated;
+      return {
+        ...updated,
+        reminders: nextReminders,
+      };
+    },
+    []
+  );
+
+  // Last confirmed remote snapshot for each Google Task (used as common ancestor for silent 3-way merge)
+  const googleTaskBaseByIdRef = useRef<Map<string, TaskItem>>(new Map());
+
   const syncGoogleTasksList = useCallback(async (tokenOverride?: string) => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
     setGoogleTasksSyncing(true);
     setGoogleTasksError(null);
     try {
       const { tasks: fetchedTasks, taskLists: fetchedLists } = await fetchGoogleTasks(tokenOverride);
-      // Preserve local reminders, timeLabel, and priority attached to Google Tasks
+      for (const fetched of fetchedTasks) {
+        googleTaskBaseByIdRef.current.set(fetched.id, fetched);
+      }
+
+      const pendingQueuedIds = new Set<string>();
+      const pendingDeletedIds = new Set<string>();
+      const pendingBaseByTaskId = new Map<string, TaskItem>();
+      for (const op of pendingSyncQueueRef.current) {
+        if (op.type === 'gtask-create') {
+          pendingQueuedIds.add(op.tempId);
+        } else if (op.type === 'gtask-update') {
+          pendingQueuedIds.add(op.taskId);
+          if (op.baseTask) {
+            pendingBaseByTaskId.set(op.taskId, op.baseTask);
+          }
+        } else if (op.type === 'gtask-delete') {
+          pendingDeletedIds.add(op.taskId);
+        }
+      }
+      const protectedIds = new Set<string>([
+        ...dirtyGoogleTaskIdsRef.current,
+        ...pendingQueuedIds,
+        ...pendingGoogleTaskAutoSyncRef.current.keys(),
+        ...inFlightGoogleTaskSyncIdsRef.current,
+      ]);
+
+      // Preserve local reminders, timeLabel, and priority attached to Google Tasks,
+      // prioritize and silently 3-way merge tasks with pending/offline local edits,
+      // suppress tasks with queued offline deletes, and re-arm rescheduled relative reminders
       setGoogleTasks((prev) => {
         const byGoogleId = new Map<string, TaskItem>();
         for (const existing of prev) {
           if (existing.googleTaskId) byGoogleId.set(existing.googleTaskId, existing);
         }
-        return fetchedTasks.map((incoming) => {
+        const mergedFetched: TaskItem[] = [];
+        for (const incoming of fetchedTasks) {
+          if (pendingDeletedIds.has(incoming.id)) {
+            continue;
+          }
           const prevMatch = incoming.googleTaskId ? byGoogleId.get(incoming.googleTaskId) : undefined;
-          if (!prevMatch) return incoming;
-          return {
+          if (!prevMatch) {
+            mergedFetched.push(incoming);
+            continue;
+          }
+          if (protectedIds.has(prevMatch.id)) {
+            const baseTask = pendingBaseByTaskId.get(prevMatch.id);
+            const reconciled = mergeGoogleTaskOfflinePriority(prevMatch, incoming, baseTask);
+            mergedFetched.push(rearmRelativeReminders(prevMatch, reconciled));
+            continue;
+          }
+          const merged: TaskItem = {
             ...incoming,
-            reminders: prevMatch.reminders ?? incoming.reminders,
+            reminders:
+              prevMatch.reminders !== undefined ? prevMatch.reminders : incoming.reminders,
+            recurrence: incoming.recurrence ?? prevMatch.recurrence,
+            recurrenceSeriesId: prevMatch.recurrenceSeriesId ?? incoming.recurrenceSeriesId,
             timeLabel:
-              prevMatch.timeLabel && prevMatch.timeLabel !== 'No time set'
-                ? prevMatch.timeLabel
-                : incoming.timeLabel,
+              incoming.timeLabel && incoming.timeLabel !== 'No time set'
+                ? incoming.timeLabel
+                : prevMatch.timeLabel && prevMatch.timeLabel !== 'No time set'
+                  ? prevMatch.timeLabel
+                  : incoming.timeLabel,
             priority: prevMatch.priority !== 'Normal' ? prevMatch.priority : incoming.priority,
           };
-        });
+          mergedFetched.push(rearmRelativeReminders(prevMatch, merged));
+        }
+        // Keep any offline-created or dirty local Google Tasks not yet present in remote response
+        const fetchedIds = new Set(mergedFetched.map((t) => t.id));
+        const offlineUnsynced = prev.filter(
+          (t) =>
+            !pendingDeletedIds.has(t.id) &&
+            !fetchedIds.has(t.id) &&
+            (Boolean(t.googleTaskId?.startsWith('offline-')) || protectedIds.has(t.id))
+        );
+        return offlineUnsynced.length > 0 ? [...offlineUnsynced, ...mergedFetched] : mergedFetched;
       });
       setGoogleTaskLists(fetchedLists);
-      setDirtyGoogleTaskIds([]);
-      setGoogleTasksLastSyncedAt(
-        new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      );
+      setDirtyGoogleTaskIds((prev) => prev.filter((id) => protectedIds.has(id)));
+      setGoogleTasksLastSyncedAt(formatClockDate(new Date()));
     } catch (err: unknown) {
       if (isNetworkOrOfflineError(err)) return;
       const msg = err instanceof Error ? err.message : 'Unable to sync Google Tasks.';
@@ -800,7 +1139,7 @@ export default function App() {
     } finally {
       setGoogleTasksSyncing(false);
     }
-  }, []);
+  }, [rearmRelativeReminders]);
 
   const flushPendingSyncQueue = useCallback(
     async (tokenOverride?: string): Promise<number> => {
@@ -815,7 +1154,6 @@ export default function App() {
       let touchedTasks = false;
       let touchedEvents = false;
       const tempToCreatedTask = new Map<string, TaskItem>();
-      let remaining: OfflineSyncOp[] = [...snapshot];
 
       try {
         for (let i = 0; i < snapshot.length; i += 1) {
@@ -823,23 +1161,42 @@ export default function App() {
           if (typeof navigator !== 'undefined' && !navigator.onLine) break;
 
           if (op.type === 'gtask-create') {
-            const created = await createGoogleTask(
-              {
-                title: op.payload.title,
-                notes: op.payload.notes,
-                dateKey: op.payload.dateKey,
-                timeLabel: op.payload.timeLabel,
-                priority: op.payload.priority,
-                taskListId: op.payload.taskListId || '@default',
-                taskListTitle: op.payload.category || 'My Tasks',
-              },
-              tokenOverride
-            );
+            const latestLocal =
+              googleTasksRef.current.find((t) => t.id === op.tempId) ?? undefined;
+            const createInput = latestLocal
+              ? {
+                  title: latestLocal.title,
+                  notes: latestLocal.notes,
+                  dateKey: latestLocal.isInbox ? undefined : latestLocal.dateKey,
+                  timeLabel: latestLocal.timeLabel,
+                  priority: latestLocal.priority,
+                  taskListId: op.payload.taskListId || latestLocal.googleTaskListId || '@default',
+                  taskListTitle:
+                    op.payload.category || latestLocal.googleTaskListTitle || 'My Tasks',
+                  recurrence: latestLocal.recurrence ?? op.payload.recurrence,
+                  reminders: latestLocal.reminders ?? op.payload.reminders,
+                }
+              : {
+                  title: op.payload.title,
+                  notes: op.payload.notes,
+                  dateKey: op.payload.dateKey,
+                  timeLabel: op.payload.timeLabel,
+                  priority: op.payload.priority,
+                  taskListId: op.payload.taskListId || '@default',
+                  taskListTitle: op.payload.category || 'My Tasks',
+                  recurrence: op.payload.recurrence,
+                  reminders: op.payload.reminders,
+                };
+            const created = await createGoogleTask(createInput, tokenOverride);
             const withMeta: TaskItem = {
               ...created,
-              reminders: op.payload.reminders,
+              reminders: createInput.reminders ?? created.reminders,
+              recurrence: createInput.recurrence,
+              recurrenceSeriesId:
+                latestLocal?.recurrenceSeriesId ?? op.payload.recurrenceSeriesId,
             };
             tempToCreatedTask.set(op.tempId, withMeta);
+            googleTaskBaseByIdRef.current.set(withMeta.id, withMeta);
             setGoogleTasks((prev) =>
               prev.map((t) => (t.id === op.tempId ? withMeta : t))
             );
@@ -847,32 +1204,103 @@ export default function App() {
             touchedTasks = true;
           } else if (op.type === 'gtask-update') {
             const mapped = tempToCreatedTask.get(op.taskId);
+            const liveLocal = googleTasksRef.current.find(
+              (t) => t.id === op.taskId || (mapped && t.id === mapped.id)
+            );
+            const freshestOfflineTask = liveLocal ?? op.task;
+            const remoteBase = googleTaskBaseByIdRef.current.get(
+              mapped ? mapped.id : freshestOfflineTask.id
+            );
+            const reconciledTask =
+              remoteBase && op.baseTask
+                ? mergeGoogleTaskOfflinePriority(freshestOfflineTask, remoteBase, op.baseTask)
+                : freshestOfflineTask;
             const targetTask: TaskItem = mapped
               ? {
-                  ...op.task,
+                  ...reconciledTask,
                   id: mapped.id,
                   googleTaskId: mapped.googleTaskId,
                   googleTaskListId: mapped.googleTaskListId,
                   googleTaskListTitle: mapped.googleTaskListTitle,
                 }
-              : op.task;
+              : reconciledTask;
+
             if (targetTask.googleTaskId && !targetTask.googleTaskId.startsWith('offline-')) {
-              const updated = await updateGoogleTask(targetTask, tokenOverride);
-              setGoogleTasks((prev) =>
-                prev.map((t) =>
-                  t.id === targetTask.id || t.id === op.taskId
-                    ? { ...updated, reminders: targetTask.reminders }
-                    : t
-                )
-              );
-              setDirtyGoogleTaskIds((prev) =>
-                prev.filter((id) => id !== op.taskId && id !== targetTask.id)
-              );
-              touchedTasks = true;
+              const editVersionAtStart =
+                googleTaskEditVersionRef.current.get(op.taskId) ??
+                googleTaskEditVersionRef.current.get(targetTask.id) ??
+                0;
+              inFlightGoogleTaskSyncIdsRef.current.add(op.taskId);
+              inFlightGoogleTaskSyncIdsRef.current.add(targetTask.id);
+              try {
+                let updated: TaskItem;
+                try {
+                  updated = await updateGoogleTask(targetTask, tokenOverride);
+                } catch (updateErr: unknown) {
+                  if (updateErr instanceof Error && updateErr.message === 'TASK_NOT_FOUND') {
+                    // Task was deleted remotely while edited offline: recreate silently so offline edit wins
+                    const recreated = await createGoogleTask(
+                      {
+                        title: targetTask.title,
+                        notes: targetTask.notes,
+                        dateKey: targetTask.isInbox ? undefined : targetTask.dateKey,
+                        timeLabel: targetTask.timeLabel,
+                        priority: targetTask.priority,
+                        taskListId: targetTask.googleTaskListId || '@default',
+                        taskListTitle: targetTask.googleTaskListTitle || targetTask.category || 'My Tasks',
+                        recurrence: targetTask.recurrence,
+                        reminders: targetTask.reminders,
+                      },
+                      tokenOverride
+                    );
+                    updated = targetTask.completed
+                      ? await updateGoogleTask(
+                          {
+                            ...recreated,
+                            completed: true,
+                            completedAt: targetTask.completedAt || new Date().toISOString(),
+                          },
+                          tokenOverride
+                        )
+                      : recreated;
+                  } else {
+                    throw updateErr;
+                  }
+                }
+
+                const finalSynced: TaskItem = {
+                  ...updated,
+                  reminders: targetTask.reminders,
+                  recurrence: targetTask.recurrence,
+                  recurrenceSeriesId: targetTask.recurrenceSeriesId,
+                };
+                googleTaskBaseByIdRef.current.set(finalSynced.id, finalSynced);
+                const latestVersion =
+                  googleTaskEditVersionRef.current.get(op.taskId) ??
+                  googleTaskEditVersionRef.current.get(targetTask.id) ??
+                  0;
+                if (latestVersion === editVersionAtStart) {
+                  setGoogleTasks((prev) =>
+                    prev.map((t) =>
+                      t.id === targetTask.id || t.id === op.taskId ? finalSynced : t
+                    )
+                  );
+                  setDirtyGoogleTaskIds((prev) =>
+                    prev.filter(
+                      (id) => id !== op.taskId && id !== targetTask.id && id !== finalSynced.id
+                    )
+                  );
+                }
+                touchedTasks = true;
+              } finally {
+                inFlightGoogleTaskSyncIdsRef.current.delete(op.taskId);
+                inFlightGoogleTaskSyncIdsRef.current.delete(targetTask.id);
+              }
             }
           } else if (op.type === 'gtask-delete') {
             if (op.googleTaskId && !op.googleTaskId.startsWith('offline-')) {
               await deleteGoogleTask(op.googleTaskListId, op.googleTaskId, tokenOverride);
+              googleTaskBaseByIdRef.current.delete(op.taskId);
               touchedTasks = true;
             }
           } else if (op.type === 'gcal-create') {
@@ -889,17 +1317,21 @@ export default function App() {
           }
 
           syncedOps += 1;
-          remaining = snapshot.slice(i + 1);
-          setPendingSyncQueue(remaining);
+          // Remove only this completed op by id so concurrent offline edits added during flush are preserved
+          setPendingSyncQueue((prev) => prev.filter((item) => item.id !== op.id));
         }
 
         if (syncedOps > 0) {
           showOfflineSyncNotice(
-            `Synced ${syncedOps} offline change${syncedOps === 1 ? '' : 's'}`
+            `Synced ${syncedOps} Google change${syncedOps === 1 ? '' : 's'}`
           );
           await Promise.allSettled([
-            touchedEvents ? syncGoogleCalendarEvents(tokenOverride) : Promise.resolve(),
-            touchedTasks ? syncGoogleTasksList(tokenOverride) : Promise.resolve(),
+            touchedEvents || settingsRef.current.googleCalendarSync
+              ? syncGoogleCalendarEvents(tokenOverride)
+              : Promise.resolve(),
+            touchedTasks || settingsRef.current.googleTasksSync
+              ? syncGoogleTasksList(tokenOverride)
+              : Promise.resolve(),
           ]);
         }
       } catch (err: unknown) {
@@ -949,18 +1381,46 @@ export default function App() {
     return () => unsubscribe();
   }, [flushPendingSyncQueue, syncGoogleCalendarEvents, syncGoogleTasksList]);
 
-  // --- buh. Cloud Sync (Firestore real-time sync for notes, folders & collapse state) ---
+  // --- buh. Cloud Sync (Firestore real-time sync for notes, tasks, schedule blocks, Lookup, lists & settings) ---
+  const [quickCheckEntries, setQuickCheckEntries] = useState<QuickCheckEntry[]>(() =>
+    loadCachedLookupEntries()
+  );
+  const [googleReconnectDismissed, setGoogleReconnectDismissed] = useState<boolean>(false);
+  const prevPendingSyncCountRef = useRef<number>(pendingSyncQueue.length);
+  useEffect(() => {
+    if (pendingSyncQueue.length > prevPendingSyncCountRef.current) {
+      setGoogleReconnectDismissed(false);
+    }
+    prevPendingSyncCountRef.current = pendingSyncQueue.length;
+  }, [pendingSyncQueue.length]);
+
+  useEffect(() => {
+    saveCachedLookupEntries(quickCheckEntries);
+  }, [quickCheckEntries]);
+
   const [firebaseUid, setFirebaseUid] = useState<string | null>(null);
   const [firebaseEmail, setFirebaseEmail] = useState<string | null>(null);
   const [firebaseEmailVerified, setFirebaseEmailVerified] = useState<boolean>(false);
   const [cloudNotesSyncing, setCloudNotesSyncing] = useState<boolean>(false);
   const [cloudNotesLastSyncedAt, setCloudNotesLastSyncedAt] = useState<string | null>(null);
   const [cloudNotesSyncedCount, setCloudNotesSyncedCount] = useState<number>(0);
+  const [cloudTasksSyncedCount, setCloudTasksSyncedCount] = useState<number>(0);
+  const [cloudEventsSyncedCount, setCloudEventsSyncedCount] = useState<number>(0);
+  const [cloudLookupSyncedCount, setCloudLookupSyncedCount] = useState<number>(0);
   const [cloudNotesError, setCloudNotesError] = useState<string | null>(null);
 
   const notesRef = useRef<NoteItem[]>(notes);
   const noteFoldersRef = useRef<string[]>(noteFolders);
   const collapsedNoteFoldersRef = useRef<string[]>(collapsedNoteFolders);
+  const tasksRef = useRef<TaskItem[]>(tasks);
+  const eventsRef = useRef<CalendarEvent[]>(events);
+  const quickCheckEntriesRef = useRef<QuickCheckEntry[]>(quickCheckEntries);
+  const taskListsRef = useRef<string[]>(taskLists);
+  const settingsRef = useRef<AppSettingsState>(settings);
+  const decisionsRef = useRef<DesignDecisions>(decisions);
+  const recentColorsRef = useRef<string[]>(recentColors);
+  const isDarkRef = useRef<boolean>(isDark);
+
   useEffect(() => {
     notesRef.current = notes;
   }, [notes]);
@@ -970,8 +1430,102 @@ export default function App() {
   useEffect(() => {
     collapsedNoteFoldersRef.current = collapsedNoteFolders;
   }, [collapsedNoteFolders]);
+  useEffect(() => {
+    tasksRef.current = tasks;
+  }, [tasks]);
+  useEffect(() => {
+    eventsRef.current = events;
+  }, [events]);
+  useEffect(() => {
+    quickCheckEntriesRef.current = quickCheckEntries;
+  }, [quickCheckEntries]);
+  useEffect(() => {
+    taskListsRef.current = taskLists;
+  }, [taskLists]);
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
+  useEffect(() => {
+    decisionsRef.current = decisions;
+  }, [decisions]);
+  useEffect(() => {
+    recentColorsRef.current = recentColors;
+  }, [recentColors]);
+  useEffect(() => {
+    isDarkRef.current = isDark;
+  }, [isDark]);
 
   const pendingNoteSaveTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingNoteSnapshotsRef = useRef<Map<string, NoteItem>>(new Map());
+  const pendingTaskCloudTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingTaskSnapshotsRef = useRef<Map<string, TaskItem>>(new Map());
+  const inFlightTaskCloudIdsRef = useRef<Set<string>>(new Set());
+  const localTaskEditVersionRef = useRef<Map<string, number>>(new Map());
+  const cloudTaskBaseByIdRef = useRef<Map<string, TaskItem>>(new Map());
+  const cloudTaskJournalRef = useRef<OfflineCloudTaskJournal>(loadCloudTaskJournal());
+  const pendingEventCloudTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingEventSnapshotsRef = useRef<Map<string, CalendarEvent>>(new Map());
+  const pendingLookupCloudTimersRef = useRef<Map<string, number>>(new Map());
+  const pendingLookupSnapshotsRef = useRef<Map<string, QuickCheckEntry>>(new Map());
+  const pendingWorkspacePrefsTimerRef = useRef<number | null>(null);
+  const pendingWorkspacePrefsPayloadRef = useRef<{
+    taskLists: string[];
+    settings: AppSettingsState;
+    decisions: DesignDecisions;
+    recentColors: string[];
+    darkMode: boolean;
+  } | null>(null);
+  const lastSyncedTasksFpRef = useRef<Map<string, string>>(new Map());
+  const lastSyncedEventsFpRef = useRef<Map<string, string>>(new Map());
+  const lastSyncedLookupFpRef = useRef<Map<string, string>>(new Map());
+  const lastSyncedWorkspacePrefsFpRef = useRef<string | null>(null);
+  const cloudWorkspaceHydratedRef = useRef<{
+    tasks: boolean;
+    events: boolean;
+    prefs: boolean;
+    lookup: boolean;
+  }>({
+    tasks: false,
+    events: false,
+    prefs: false,
+    lookup: false,
+  });
+
+  const persistCloudTaskJournalNow = useCallback(() => {
+    saveCloudTaskJournal(cloudTaskJournalRef.current);
+  }, []);
+
+  const recordLocalTaskDirty = useCallback(
+    (task: TaskItem, prevTask?: TaskItem) => {
+      if (task.source === 'google') return;
+      const journal = cloudTaskJournalRef.current;
+      delete journal.deletes[task.id];
+      const existing = journal.upserts[task.id];
+      const baseTask =
+        existing?.baseTask ?? cloudTaskBaseByIdRef.current.get(task.id) ?? prevTask;
+      journal.upserts[task.id] = {
+        task,
+        ...(baseTask ? { baseTask } : {}),
+        editedAt: Date.now(),
+      };
+      const nextVer = (localTaskEditVersionRef.current.get(task.id) ?? 0) + 1;
+      localTaskEditVersionRef.current.set(task.id, nextVer);
+      persistCloudTaskJournalNow();
+    },
+    [persistCloudTaskJournalNow]
+  );
+
+  const recordLocalTaskDeleted = useCallback(
+    (taskId: string) => {
+      const journal = cloudTaskJournalRef.current;
+      delete journal.upserts[taskId];
+      journal.deletes[taskId] = Date.now();
+      const nextVer = (localTaskEditVersionRef.current.get(taskId) ?? 0) + 1;
+      localTaskEditVersionRef.current.set(taskId, nextVer);
+      persistCloudTaskJournalNow();
+    },
+    [persistCloudTaskJournalNow]
+  );
   const cloudSyncReadyRef = useRef<{ uid: string | null; enabled: boolean }>({
     uid: null,
     enabled: false,
@@ -995,6 +1549,9 @@ export default function App() {
         setFirebaseEmail(null);
         setFirebaseEmailVerified(false);
         setCloudNotesSyncedCount(0);
+        setCloudTasksSyncedCount(0);
+        setCloudEventsSyncedCount(0);
+        setCloudLookupSyncedCount(0);
         setCloudNotesLastSyncedAt(null);
         setCloudNotesError(null);
       }
@@ -1003,9 +1560,7 @@ export default function App() {
   }, []);
 
   const markCloudNotesSyncedNow = useCallback(() => {
-    setCloudNotesLastSyncedAt(
-      new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-    );
+    setCloudNotesLastSyncedAt(formatClockDate(new Date()));
   }, []);
 
   const scheduleCloudNoteUpsert = useCallback(
@@ -1018,20 +1573,21 @@ export default function App() {
         window.clearTimeout(existingTimer);
         pendingNoteSaveTimersRef.current.delete(note.id);
       }
+      pendingNoteSnapshotsRef.current.set(note.id, note);
 
       const run = () => {
         const latest = cloudSyncReadyRef.current;
+        const snapshot = pendingNoteSnapshotsRef.current.get(note.id) || note;
+        pendingNoteSaveTimersRef.current.delete(note.id);
+        pendingNoteSnapshotsRef.current.delete(note.id);
         if (!latest.uid || !latest.enabled) return;
-        void upsertCloudNote(latest.uid, note, noteFoldersRef.current[0] || 'Work')
+        void upsertCloudNote(latest.uid, snapshot, noteFoldersRef.current[0] || 'Work')
           .then(() => {
             setCloudNotesError(null);
             markCloudNotesSyncedNow();
           })
           .catch((err) => {
             setCloudNotesError(formatFriendlyCloudSyncError(err));
-          })
-          .finally(() => {
-            pendingNoteSaveTimersRef.current.delete(note.id);
           });
       };
 
@@ -1052,6 +1608,7 @@ export default function App() {
         window.clearTimeout(existingTimer);
         pendingNoteSaveTimersRef.current.delete(noteId);
       }
+      pendingNoteSnapshotsRef.current.delete(noteId);
       const { uid, enabled } = cloudSyncReadyRef.current;
       if (!uid || !enabled) return;
       void deleteCloudNote(uid, noteId)
@@ -1082,16 +1639,29 @@ export default function App() {
     [markCloudNotesSyncedNow]
   );
 
-  // Real-time Firestore subscriptions for notes & note folder preferences
+  // Real-time Firestore subscriptions for notes, tasks, schedule blocks, Lookup & workspace preferences
   useEffect(() => {
     if (!firebaseUid || !firebaseEmailVerified || settings.buhCloudSync === false) {
+      cloudWorkspaceHydratedRef.current = {
+        tasks: false,
+        events: false,
+        prefs: false,
+        lookup: false,
+      };
       return;
     }
 
     let cancelled = false;
     let unsubPrefs: (() => void) | null = null;
+    let unsubWorkspacePrefs: (() => void) | null = null;
     let unsubNotes: (() => void) | null = null;
+    let unsubTasks: (() => void) | null = null;
+    let unsubEvents: (() => void) | null = null;
+    let unsubLookup: (() => void) | null = null;
     let hydratedNotes = false;
+    let hydratedTasks = false;
+    let hydratedEvents = false;
+    let hydratedLookup = false;
 
     setCloudNotesSyncing(true);
     setCloudNotesError(null);
@@ -1118,6 +1688,46 @@ export default function App() {
             }
             setNoteFolders(prefs.folders);
             setCollapsedNoteFolders(prefs.collapsedFolders);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
+
+        unsubWorkspacePrefs = subscribeCloudWorkspacePreferences(
+          firebaseUid,
+          (prefs) => {
+            if (cancelled) return;
+            if (!prefs) {
+              const localPayload = {
+                taskLists: taskListsRef.current,
+                settings: settingsRef.current,
+                decisions: decisionsRef.current,
+                recentColors: recentColorsRef.current,
+                darkMode: isDarkRef.current,
+              };
+              lastSyncedWorkspacePrefsFpRef.current =
+                fingerprintWorkspacePreferences(localPayload);
+              cloudWorkspaceHydratedRef.current.prefs = true;
+              void saveCloudWorkspacePreferences(firebaseUid, localPayload).catch((err) => {
+                if (!cancelled) setCloudNotesError(formatFriendlyCloudSyncError(err));
+              });
+              return;
+            }
+            lastSyncedWorkspacePrefsFpRef.current = fingerprintWorkspacePreferences(prefs);
+            cloudWorkspaceHydratedRef.current.prefs = true;
+            if (pendingWorkspacePrefsTimerRef.current === null) {
+              setTaskLists(prefs.taskLists);
+              setSettings((prev) => ({ ...prev, ...prefs.settings }));
+              setDecisions(prefs.decisions);
+              setRecentColors(prefs.recentColors);
+              setIsDark(prefs.darkMode);
+            }
             setCloudNotesError(null);
             markCloudNotesSyncedNow();
           },
@@ -1175,6 +1785,313 @@ export default function App() {
             }
           }
         );
+
+        unsubTasks = subscribeCloudTasks(
+          firebaseUid,
+          (cloudTasks) => {
+            if (cancelled) return;
+            setCloudTasksSyncedCount(cloudTasks.length);
+            setCloudNotesSyncing(false);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+
+            const journal = cloudTaskJournalRef.current;
+            let journalMutated = false;
+            const onlineNow = typeof navigator === 'undefined' || navigator.onLine;
+            const cloudIds = new Set(cloudTasks.map((t) => t.id));
+
+            // 1. Reconcile offline deletion tombstones against incoming remote snapshot
+            const deletesToFlush: string[] = [];
+            for (const deletedId of Object.keys(journal.deletes)) {
+              if (!cloudIds.has(deletedId)) {
+                delete journal.deletes[deletedId];
+                cloudTaskBaseByIdRef.current.delete(deletedId);
+                journalMutated = true;
+              } else if (onlineNow) {
+                deletesToFlush.push(deletedId);
+              }
+            }
+            if (deletesToFlush.length > 0) {
+              for (const deletedId of deletesToFlush) {
+                void deleteCloudTask(firebaseUid, deletedId)
+                  .then(() => {
+                    if (cloudTaskJournalRef.current.deletes[deletedId] !== undefined) {
+                      delete cloudTaskJournalRef.current.deletes[deletedId];
+                      saveCloudTaskJournal(cloudTaskJournalRef.current);
+                    }
+                    cloudTaskBaseByIdRef.current.delete(deletedId);
+                    lastSyncedTasksFpRef.current.delete(deletedId);
+                  })
+                  .catch(() => {
+                    // Keep tombstone in journal so next reconnect retries silently
+                  });
+              }
+            }
+
+            // 2. Track remote snapshots as latest known cloud base & detect brand-new local-only tasks
+            for (const ct of cloudTasks) {
+              cloudTaskBaseByIdRef.current.set(ct.id, ct);
+            }
+
+            const localOnlyToUpload = !hydratedTasks
+              ? tasksRef.current.filter(
+                  (t) =>
+                    t.source !== 'google' &&
+                    !cloudIds.has(t.id) &&
+                    journal.deletes[t.id] === undefined
+                )
+              : [];
+
+            if (!hydratedTasks) {
+              hydratedTasks = true;
+              for (const lt of localOnlyToUpload) {
+                if (!journal.upserts[lt.id]) {
+                  journal.upserts[lt.id] = { task: lt, editedAt: Date.now() };
+                  journalMutated = true;
+                }
+              }
+              if (onlineNow && localOnlyToUpload.length > 0) {
+                void Promise.allSettled(
+                  localOnlyToUpload.map((lt) =>
+                    upsertCloudTask(firebaseUid, lt).then(() => {
+                      const entry = cloudTaskJournalRef.current.upserts[lt.id];
+                      if (entry && fingerprintCloudTask(entry.task) === fingerprintCloudTask(lt)) {
+                        delete cloudTaskJournalRef.current.upserts[lt.id];
+                        saveCloudTaskJournal(cloudTaskJournalRef.current);
+                      }
+                      cloudTaskBaseByIdRef.current.set(lt.id, lt);
+                      lastSyncedTasksFpRef.current.set(lt.id, fingerprintCloudTask(lt));
+                    })
+                  )
+                );
+              }
+            }
+
+            // 3. Silent 3-way offline-priority reconciliation for all incoming remote tasks
+            const pendingTimers = pendingTaskCloudTimersRef.current;
+            const inFlightIds = inFlightTaskCloudIdsRef.current;
+            const currentLocalById = new Map(
+              tasksRef.current.filter((t) => t.source !== 'google').map((t) => [t.id, t])
+            );
+            const nextFpMap = new Map<string, string>();
+            const reconciledById = new Map<string, TaskItem>();
+
+            for (const ct of cloudTasks) {
+              if (journal.deletes[ct.id] !== undefined) {
+                continue;
+              }
+              const ctFp = fingerprintCloudTask(ct);
+              const dirtyEntry = journal.upserts[ct.id];
+              const isProtected =
+                Boolean(dirtyEntry) || pendingTimers.has(ct.id) || inFlightIds.has(ct.id);
+
+              if (isProtected) {
+                const localCandidate = currentLocalById.get(ct.id) ?? dirtyEntry?.task;
+                if (localCandidate) {
+                  const merged = mergeTaskItemOfflinePriority(
+                    localCandidate,
+                    ct,
+                    dirtyEntry?.baseTask
+                  );
+                  const mergedFp = fingerprintCloudTask(merged);
+                  reconciledById.set(ct.id, merged);
+
+                  if (mergedFp === ctFp && !pendingTimers.has(ct.id) && !inFlightIds.has(ct.id)) {
+                    // Remote has converged with offline edit -> clear journal entry cleanly
+                    if (dirtyEntry) {
+                      delete journal.upserts[ct.id];
+                      journalMutated = true;
+                    }
+                    nextFpMap.set(ct.id, ctFp);
+                  } else {
+                    // Offline edit still ahead of remote -> keep prioritized in journal & trigger silent push
+                    journal.upserts[ct.id] = {
+                      task: merged,
+                      baseTask: ct,
+                      editedAt: dirtyEntry?.editedAt ?? Date.now(),
+                    };
+                    journalMutated = true;
+                    // Leave fingerprint at ctFp (not mergedFp) so the diff-sync effect pushes merged silently
+                    nextFpMap.set(ct.id, ctFp);
+                  }
+                  continue;
+                }
+              }
+
+              reconciledById.set(ct.id, ct);
+              nextFpMap.set(ct.id, ctFp);
+            }
+
+            // 4. Preserve offline-created OR offline-edited tasks missing from remote (e.g. deleted remotely while edited offline)
+            const preservedOfflineExtras: TaskItem[] = [];
+            const seenExtraIds = new Set<string>();
+            for (const lt of tasksRef.current) {
+              if (lt.source === 'google' || cloudIds.has(lt.id) || journal.deletes[lt.id] !== undefined) {
+                continue;
+              }
+              const isKept =
+                Boolean(journal.upserts[lt.id]) ||
+                pendingTimers.has(lt.id) ||
+                inFlightIds.has(lt.id);
+              if (isKept) {
+                preservedOfflineExtras.push(lt);
+                seenExtraIds.add(lt.id);
+              }
+            }
+            for (const [dirtyId, dirtyRec] of Object.entries(journal.upserts)) {
+              if (
+                !cloudIds.has(dirtyId) &&
+                !seenExtraIds.has(dirtyId) &&
+                journal.deletes[dirtyId] === undefined
+              ) {
+                preservedOfflineExtras.push(dirtyRec.task);
+                seenExtraIds.add(dirtyId);
+              }
+            }
+
+            if (journalMutated) {
+              saveCloudTaskJournal(journal);
+            }
+
+            lastSyncedTasksFpRef.current = nextFpMap;
+            cloudWorkspaceHydratedRef.current.tasks = true;
+
+            setTasks(() => {
+              const mergedCloud = cloudTasks
+                .filter((ct) => journal.deletes[ct.id] === undefined)
+                .map((ct) => reconciledById.get(ct.id) ?? ct);
+              return [...preservedOfflineExtras, ...mergedCloud];
+            });
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
+
+        unsubEvents = subscribeCloudEvents(
+          firebaseUid,
+          (cloudEvents) => {
+            if (cancelled) return;
+            setCloudEventsSyncedCount(cloudEvents.length);
+            setCloudNotesSyncing(false);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+
+            const cloudIds = new Set(cloudEvents.map((e) => e.id));
+            const localOnlyToUpload = !hydratedEvents
+              ? eventsRef.current.filter((e) => e.source !== 'google' && !cloudIds.has(e.id))
+              : [];
+
+            if (!hydratedEvents) {
+              hydratedEvents = true;
+              if (localOnlyToUpload.length > 0) {
+                void Promise.allSettled(
+                  localOnlyToUpload.map((e) => upsertCloudEvent(firebaseUid, e))
+                );
+              }
+            }
+
+            const nextFpMap = new Map<string, string>();
+            for (const ce of cloudEvents) {
+              nextFpMap.set(ce.id, fingerprintCloudEvent(ce));
+            }
+            for (const le of localOnlyToUpload) {
+              nextFpMap.set(le.id, fingerprintCloudEvent(le));
+            }
+            for (const pendingId of pendingEventCloudTimersRef.current.keys()) {
+              const existingLocal = eventsRef.current.find((e) => e.id === pendingId);
+              if (existingLocal && existingLocal.source !== 'google') {
+                nextFpMap.set(pendingId, fingerprintCloudEvent(existingLocal));
+              }
+            }
+            lastSyncedEventsFpRef.current = nextFpMap;
+            cloudWorkspaceHydratedRef.current.events = true;
+
+            setEvents((prev) => {
+              const pendingIds = pendingEventCloudTimersRef.current;
+              const prevById = new Map(prev.map((e) => [e.id, e]));
+              const mergedCloud = cloudEvents.map((ce) =>
+                pendingIds.has(ce.id) && prevById.has(ce.id) ? prevById.get(ce.id)! : ce
+              );
+              const keepLocalIds = new Set(localOnlyToUpload.map((e) => e.id));
+              const localExtra = prev.filter(
+                (le) =>
+                  le.source !== 'google' &&
+                  !cloudIds.has(le.id) &&
+                  (pendingIds.has(le.id) || keepLocalIds.has(le.id))
+              );
+              return [...localExtra, ...mergedCloud];
+            });
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
+        unsubLookup = subscribeCloudLookupEntries(
+          firebaseUid,
+          (cloudEntries) => {
+            if (cancelled) return;
+            setCloudLookupSyncedCount(cloudEntries.length);
+            setCloudNotesSyncing(false);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+
+            const cloudIds = new Set(cloudEntries.map((entry) => entry.id));
+            const localOnlyToUpload = !hydratedLookup
+              ? quickCheckEntriesRef.current.filter((entry) => !cloudIds.has(entry.id))
+              : [];
+
+            if (!hydratedLookup) {
+              hydratedLookup = true;
+              if (localOnlyToUpload.length > 0) {
+                void Promise.allSettled(
+                  localOnlyToUpload.map((entry) => upsertCloudLookupEntry(firebaseUid, entry))
+                );
+              }
+            }
+
+            const nextFpMap = new Map<string, string>();
+            for (const ce of cloudEntries) {
+              nextFpMap.set(ce.id, fingerprintCloudLookupEntry(ce));
+            }
+            for (const le of localOnlyToUpload) {
+              nextFpMap.set(le.id, fingerprintCloudLookupEntry(le));
+            }
+            for (const pendingId of pendingLookupCloudTimersRef.current.keys()) {
+              const existingLocal = quickCheckEntriesRef.current.find((e) => e.id === pendingId);
+              if (existingLocal) {
+                nextFpMap.set(pendingId, fingerprintCloudLookupEntry(existingLocal));
+              }
+            }
+            lastSyncedLookupFpRef.current = nextFpMap;
+            cloudWorkspaceHydratedRef.current.lookup = true;
+
+            setQuickCheckEntries((prev) => {
+              const pendingIds = pendingLookupCloudTimersRef.current;
+              const prevById = new Map(prev.map((entry) => [entry.id, entry]));
+              const mergedCloud = cloudEntries.map((ce) =>
+                pendingIds.has(ce.id) && prevById.has(ce.id) ? prevById.get(ce.id)! : ce
+              );
+              const keepLocalIds = new Set(localOnlyToUpload.map((entry) => entry.id));
+              const localExtra = prev.filter(
+                (le) => !cloudIds.has(le.id) && (pendingIds.has(le.id) || keepLocalIds.has(le.id))
+              );
+              return [...mergedCloud, ...localExtra].slice(-30);
+            });
+          },
+          (err) => {
+            if (!cancelled) {
+              setCloudNotesError(formatFriendlyCloudSyncError(err));
+              setCloudNotesSyncing(false);
+            }
+          }
+        );
       } catch (err) {
         if (!cancelled) {
           setCloudNotesError(formatFriendlyCloudSyncError(err));
@@ -1186,11 +2103,440 @@ export default function App() {
     return () => {
       cancelled = true;
       unsubPrefs?.();
+      unsubWorkspacePrefs?.();
       unsubNotes?.();
+      unsubTasks?.();
+      unsubEvents?.();
+      unsubLookup?.();
       pendingNoteSaveTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
       pendingNoteSaveTimersRef.current.clear();
+      pendingNoteSnapshotsRef.current.clear();
+      pendingTaskCloudTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pendingTaskCloudTimersRef.current.clear();
+      pendingTaskSnapshotsRef.current.clear();
+      pendingEventCloudTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pendingEventCloudTimersRef.current.clear();
+      pendingEventSnapshotsRef.current.clear();
+      pendingLookupCloudTimersRef.current.forEach((timerId) => window.clearTimeout(timerId));
+      pendingLookupCloudTimersRef.current.clear();
+      pendingLookupSnapshotsRef.current.clear();
+      if (pendingWorkspacePrefsTimerRef.current !== null) {
+        window.clearTimeout(pendingWorkspacePrefsTimerRef.current);
+        pendingWorkspacePrefsTimerRef.current = null;
+      }
+      pendingWorkspacePrefsPayloadRef.current = null;
+      cloudWorkspaceHydratedRef.current = {
+        tasks: false,
+        events: false,
+        prefs: false,
+        lookup: false,
+      };
     };
   }, [firebaseUid, firebaseEmailVerified, settings.buhCloudSync, markCloudNotesSyncedNow]);
+
+  // Silent diff-based cloud sync for local tasks (with offline-priority journal & in-flight protection)
+  useEffect(() => {
+    const { uid, enabled } = cloudSyncReadyRef.current;
+    if (!uid || !enabled || !cloudWorkspaceHydratedRef.current.tasks || !isOnline) return;
+
+    const journal = cloudTaskJournalRef.current;
+    const localTasks = tasks.filter((t) => t.source !== 'google');
+    const currentIds = new Set<string>();
+    const fpMap = lastSyncedTasksFpRef.current;
+
+    // 1. Flush any persisted offline deletes first
+    for (const deletedId of Object.keys(journal.deletes)) {
+      if (localTasks.some((t) => t.id === deletedId)) continue;
+      fpMap.delete(deletedId);
+      void deleteCloudTask(uid, deletedId)
+        .then(() => {
+          if (cloudTaskJournalRef.current.deletes[deletedId] !== undefined) {
+            delete cloudTaskJournalRef.current.deletes[deletedId];
+            saveCloudTaskJournal(cloudTaskJournalRef.current);
+          }
+          cloudTaskBaseByIdRef.current.delete(deletedId);
+          setCloudNotesError(null);
+          markCloudNotesSyncedNow();
+        })
+        .catch((err) => {
+          setCloudNotesError(formatFriendlyCloudSyncError(err));
+        });
+    }
+
+    // 2. Push any changed or journaled offline tasks
+    for (const task of localTasks) {
+      currentIds.add(task.id);
+      const nextFp = fingerprintCloudTask(task);
+      const isJournaled = Boolean(journal.upserts[task.id]);
+      if (fpMap.get(task.id) === nextFp && !isJournaled) continue;
+
+      // Ensure journal captures this mutation until Firestore confirms it
+      if (!isJournaled) {
+        const baseTask = cloudTaskBaseByIdRef.current.get(task.id);
+        journal.upserts[task.id] = {
+          task,
+          ...(baseTask ? { baseTask } : {}),
+          editedAt: Date.now(),
+        };
+        saveCloudTaskJournal(journal);
+      } else {
+        journal.upserts[task.id] = {
+          ...journal.upserts[task.id],
+          task,
+        };
+      }
+      fpMap.set(task.id, nextFp);
+
+      const existingTimer = pendingTaskCloudTimersRef.current.get(task.id);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+      const taskSnapshot = task;
+      const writeVersion = localTaskEditVersionRef.current.get(task.id) ?? 0;
+      pendingTaskSnapshotsRef.current.set(task.id, taskSnapshot);
+      const timerId = window.setTimeout(() => {
+        pendingTaskCloudTimersRef.current.delete(taskSnapshot.id);
+        pendingTaskSnapshotsRef.current.delete(taskSnapshot.id);
+        const latest = cloudSyncReadyRef.current;
+        if (!latest.uid || !latest.enabled || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+          lastSyncedTasksFpRef.current.delete(taskSnapshot.id);
+          return;
+        }
+        inFlightTaskCloudIdsRef.current.add(taskSnapshot.id);
+        void upsertCloudTask(latest.uid, taskSnapshot)
+          .then(() => {
+            const currentVer = localTaskEditVersionRef.current.get(taskSnapshot.id) ?? 0;
+            if (currentVer === writeVersion) {
+              if (cloudTaskJournalRef.current.upserts[taskSnapshot.id]) {
+                delete cloudTaskJournalRef.current.upserts[taskSnapshot.id];
+                saveCloudTaskJournal(cloudTaskJournalRef.current);
+              }
+              cloudTaskBaseByIdRef.current.set(taskSnapshot.id, taskSnapshot);
+              lastSyncedTasksFpRef.current.set(taskSnapshot.id, nextFp);
+            }
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            lastSyncedTasksFpRef.current.delete(taskSnapshot.id);
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          })
+          .finally(() => {
+            inFlightTaskCloudIdsRef.current.delete(taskSnapshot.id);
+          });
+      }, isJournaled ? 120 : 400);
+      pendingTaskCloudTimersRef.current.set(task.id, timerId);
+    }
+
+    // 3. Delete any previously synced tasks removed from local state
+    for (const prevId of Array.from(fpMap.keys())) {
+      if (!currentIds.has(prevId)) {
+        fpMap.delete(prevId);
+        const existingTimer = pendingTaskCloudTimersRef.current.get(prevId);
+        if (existingTimer !== undefined) {
+          window.clearTimeout(existingTimer);
+          pendingTaskCloudTimersRef.current.delete(prevId);
+        }
+        pendingTaskSnapshotsRef.current.delete(prevId);
+        if (journal.deletes[prevId] === undefined) {
+          journal.deletes[prevId] = Date.now();
+          delete journal.upserts[prevId];
+          saveCloudTaskJournal(journal);
+        }
+        void deleteCloudTask(uid, prevId)
+          .then(() => {
+            if (cloudTaskJournalRef.current.deletes[prevId] !== undefined) {
+              delete cloudTaskJournalRef.current.deletes[prevId];
+              saveCloudTaskJournal(cloudTaskJournalRef.current);
+            }
+            cloudTaskBaseByIdRef.current.delete(prevId);
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          });
+      }
+    }
+  }, [tasks, firebaseUid, firebaseEmailVerified, settings.buhCloudSync, isOnline, markCloudNotesSyncedNow]);
+
+  // Silent diff-based cloud sync for local schedule blocks
+  useEffect(() => {
+    const { uid, enabled } = cloudSyncReadyRef.current;
+    if (!uid || !enabled || !cloudWorkspaceHydratedRef.current.events || !isOnline) return;
+
+    const localEvents = events.filter((e) => e.source !== 'google');
+    const currentIds = new Set<string>();
+    const fpMap = lastSyncedEventsFpRef.current;
+
+    for (const ev of localEvents) {
+      currentIds.add(ev.id);
+      const nextFp = fingerprintCloudEvent(ev);
+      if (fpMap.get(ev.id) === nextFp) continue;
+      fpMap.set(ev.id, nextFp);
+
+      const existingTimer = pendingEventCloudTimersRef.current.get(ev.id);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+      const evSnapshot = ev;
+      pendingEventSnapshotsRef.current.set(ev.id, evSnapshot);
+      const timerId = window.setTimeout(() => {
+        pendingEventCloudTimersRef.current.delete(evSnapshot.id);
+        pendingEventSnapshotsRef.current.delete(evSnapshot.id);
+        const latest = cloudSyncReadyRef.current;
+        if (!latest.uid || !latest.enabled || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+          lastSyncedEventsFpRef.current.delete(evSnapshot.id);
+          return;
+        }
+        void upsertCloudEvent(latest.uid, evSnapshot)
+          .then(() => {
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            lastSyncedEventsFpRef.current.delete(evSnapshot.id);
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          });
+      }, 400);
+      pendingEventCloudTimersRef.current.set(ev.id, timerId);
+    }
+
+    for (const prevId of Array.from(fpMap.keys())) {
+      if (!currentIds.has(prevId)) {
+        fpMap.delete(prevId);
+        const existingTimer = pendingEventCloudTimersRef.current.get(prevId);
+        if (existingTimer !== undefined) {
+          window.clearTimeout(existingTimer);
+          pendingEventCloudTimersRef.current.delete(prevId);
+        }
+        pendingEventSnapshotsRef.current.delete(prevId);
+        void deleteCloudEvent(uid, prevId)
+          .then(() => {
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          });
+      }
+    }
+  }, [events, firebaseUid, firebaseEmailVerified, settings.buhCloudSync, isOnline, markCloudNotesSyncedNow]);
+
+  // Silent diff-based cloud sync for Lookup Q&A history
+  useEffect(() => {
+    const { uid, enabled } = cloudSyncReadyRef.current;
+    if (!uid || !enabled || !cloudWorkspaceHydratedRef.current.lookup || !isOnline) return;
+
+    const currentIds = new Set<string>();
+    const fpMap = lastSyncedLookupFpRef.current;
+
+    for (const entry of quickCheckEntries) {
+      currentIds.add(entry.id);
+      const nextFp = fingerprintCloudLookupEntry(entry);
+      if (fpMap.get(entry.id) === nextFp) continue;
+      fpMap.set(entry.id, nextFp);
+
+      const existingTimer = pendingLookupCloudTimersRef.current.get(entry.id);
+      if (existingTimer !== undefined) {
+        window.clearTimeout(existingTimer);
+      }
+      const entrySnapshot = entry;
+      pendingLookupSnapshotsRef.current.set(entry.id, entrySnapshot);
+      const timerId = window.setTimeout(() => {
+        pendingLookupCloudTimersRef.current.delete(entrySnapshot.id);
+        pendingLookupSnapshotsRef.current.delete(entrySnapshot.id);
+        const latest = cloudSyncReadyRef.current;
+        if (!latest.uid || !latest.enabled || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+          lastSyncedLookupFpRef.current.delete(entrySnapshot.id);
+          return;
+        }
+        void upsertCloudLookupEntry(latest.uid, entrySnapshot)
+          .then(() => {
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            lastSyncedLookupFpRef.current.delete(entrySnapshot.id);
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          });
+      }, 400);
+      pendingLookupCloudTimersRef.current.set(entry.id, timerId);
+    }
+
+    for (const prevId of Array.from(fpMap.keys())) {
+      if (!currentIds.has(prevId)) {
+        fpMap.delete(prevId);
+        const existingTimer = pendingLookupCloudTimersRef.current.get(prevId);
+        if (existingTimer !== undefined) {
+          window.clearTimeout(existingTimer);
+          pendingLookupCloudTimersRef.current.delete(prevId);
+        }
+        pendingLookupSnapshotsRef.current.delete(prevId);
+        void deleteCloudLookupEntry(uid, prevId)
+          .then(() => {
+            setCloudNotesError(null);
+            markCloudNotesSyncedNow();
+          })
+          .catch((err) => {
+            setCloudNotesError(formatFriendlyCloudSyncError(err));
+          });
+      }
+    }
+  }, [
+    quickCheckEntries,
+    firebaseUid,
+    firebaseEmailVerified,
+    settings.buhCloudSync,
+    isOnline,
+    markCloudNotesSyncedNow,
+  ]);
+
+  // Silent diff-based cloud sync for task lists, app settings, visual decisions & dark mode
+  useEffect(() => {
+    const { uid, enabled } = cloudSyncReadyRef.current;
+    if (!uid || !enabled || !cloudWorkspaceHydratedRef.current.prefs || !isOnline) return;
+
+    const payload = {
+      taskLists,
+      settings,
+      decisions,
+      recentColors,
+      darkMode: isDark,
+    };
+    const nextFp = fingerprintWorkspacePreferences(payload);
+    if (lastSyncedWorkspacePrefsFpRef.current === nextFp) return;
+    lastSyncedWorkspacePrefsFpRef.current = nextFp;
+
+    if (pendingWorkspacePrefsTimerRef.current !== null) {
+      window.clearTimeout(pendingWorkspacePrefsTimerRef.current);
+    }
+    pendingWorkspacePrefsPayloadRef.current = payload;
+    pendingWorkspacePrefsTimerRef.current = window.setTimeout(() => {
+      pendingWorkspacePrefsTimerRef.current = null;
+      const latestPayload = pendingWorkspacePrefsPayloadRef.current || payload;
+      pendingWorkspacePrefsPayloadRef.current = null;
+      const latest = cloudSyncReadyRef.current;
+      if (!latest.uid || !latest.enabled || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        lastSyncedWorkspacePrefsFpRef.current = null;
+        return;
+      }
+      void saveCloudWorkspacePreferences(latest.uid, latestPayload)
+        .then(() => {
+          setCloudNotesError(null);
+          markCloudNotesSyncedNow();
+        })
+        .catch((err) => {
+          lastSyncedWorkspacePrefsFpRef.current = null;
+          setCloudNotesError(formatFriendlyCloudSyncError(err));
+        });
+    }, 450);
+  }, [
+    taskLists,
+    settings,
+    decisions,
+    recentColors,
+    isDark,
+    firebaseUid,
+    firebaseEmailVerified,
+    isOnline,
+    markCloudNotesSyncedNow,
+  ]);
+
+  // Flush any debounced buh. Cloud writes immediately before tab hide / app switch / close
+  useEffect(() => {
+    const flushPendingCloudWrites = () => {
+      const { uid, enabled } = cloudSyncReadyRef.current;
+      if (!uid || !enabled) return;
+
+      const fallbackFolder = noteFoldersRef.current[0] || 'Work';
+      pendingNoteSaveTimersRef.current.forEach((timerId, noteId) => {
+        window.clearTimeout(timerId);
+        const snap = pendingNoteSnapshotsRef.current.get(noteId);
+        if (snap && isNoteNonEmpty(snap)) {
+          void upsertCloudNote(uid, snap, fallbackFolder).catch(() => {});
+        }
+      });
+      pendingNoteSaveTimersRef.current.clear();
+      pendingNoteSnapshotsRef.current.clear();
+
+      pendingTaskCloudTimersRef.current.forEach((timerId, taskId) => {
+        window.clearTimeout(timerId);
+        const snap = pendingTaskSnapshotsRef.current.get(taskId);
+        if (snap) {
+          const writeVersion = localTaskEditVersionRef.current.get(taskId) ?? 0;
+          inFlightTaskCloudIdsRef.current.add(taskId);
+          void upsertCloudTask(uid, snap)
+            .then(() => {
+              if ((localTaskEditVersionRef.current.get(taskId) ?? 0) === writeVersion) {
+                if (cloudTaskJournalRef.current.upserts[taskId]) {
+                  delete cloudTaskJournalRef.current.upserts[taskId];
+                  saveCloudTaskJournal(cloudTaskJournalRef.current);
+                }
+                cloudTaskBaseByIdRef.current.set(taskId, snap);
+              }
+            })
+            .catch(() => {
+              lastSyncedTasksFpRef.current.delete(taskId);
+            })
+            .finally(() => {
+              inFlightTaskCloudIdsRef.current.delete(taskId);
+            });
+        }
+      });
+      pendingTaskCloudTimersRef.current.clear();
+      pendingTaskSnapshotsRef.current.clear();
+
+      pendingEventCloudTimersRef.current.forEach((timerId, eventId) => {
+        window.clearTimeout(timerId);
+        const snap = pendingEventSnapshotsRef.current.get(eventId);
+        if (snap) {
+          void upsertCloudEvent(uid, snap).catch(() => {
+            lastSyncedEventsFpRef.current.delete(eventId);
+          });
+        }
+      });
+      pendingEventCloudTimersRef.current.clear();
+      pendingEventSnapshotsRef.current.clear();
+
+      pendingLookupCloudTimersRef.current.forEach((timerId, entryId) => {
+        window.clearTimeout(timerId);
+        const snap = pendingLookupSnapshotsRef.current.get(entryId);
+        if (snap) {
+          void upsertCloudLookupEntry(uid, snap).catch(() => {
+            lastSyncedLookupFpRef.current.delete(entryId);
+          });
+        }
+      });
+      pendingLookupCloudTimersRef.current.clear();
+      pendingLookupSnapshotsRef.current.clear();
+
+      if (pendingWorkspacePrefsTimerRef.current !== null) {
+        window.clearTimeout(pendingWorkspacePrefsTimerRef.current);
+        pendingWorkspacePrefsTimerRef.current = null;
+        const prefsPayload = pendingWorkspacePrefsPayloadRef.current;
+        pendingWorkspacePrefsPayloadRef.current = null;
+        if (prefsPayload) {
+          void saveCloudWorkspacePreferences(uid, prefsPayload).catch(() => {
+            lastSyncedWorkspacePrefsFpRef.current = null;
+          });
+        }
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingCloudWrites();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', flushPendingCloudWrites);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', flushPendingCloudWrites);
+    };
+  }, []);
 
   const handleSyncCloudNotesNow = useCallback(async () => {
     if (!firebaseUid || !firebaseEmailVerified) return;
@@ -1199,20 +2545,56 @@ export default function App() {
     setCloudNotesError(null);
     try {
       await ensureUserWorkspace(firebaseUid);
-      await saveCloudNotePreferences(
-        firebaseUid,
-        noteFoldersRef.current,
-        collapsedNoteFoldersRef.current
-      );
+      await Promise.all([
+        saveCloudNotePreferences(
+          firebaseUid,
+          noteFoldersRef.current,
+          collapsedNoteFoldersRef.current
+        ),
+        saveCloudWorkspacePreferences(firebaseUid, {
+          taskLists: taskListsRef.current,
+          settings: settingsRef.current,
+          decisions: decisionsRef.current,
+          recentColors: recentColorsRef.current,
+          darkMode: isDarkRef.current,
+        }),
+      ]);
       const fallbackFolder = noteFoldersRef.current[0] || 'Work';
-      const localToPush = notesRef.current.filter(isNoteNonEmpty);
-      if (localToPush.length > 0) {
-        await Promise.all(
-          localToPush.map((n) => upsertCloudNote(firebaseUid, n, fallbackFolder))
-        );
+      const localNotesToPush = notesRef.current.filter(isNoteNonEmpty);
+      const localTasksToPush = tasksRef.current.filter((t) => t.source !== 'google');
+      const localEventsToPush = eventsRef.current.filter((e) => e.source !== 'google');
+      const localLookupToPush = quickCheckEntriesRef.current;
+      const pendingTaskDeleteIds = Object.keys(cloudTaskJournalRef.current.deletes).filter(
+        (id) => !localTasksToPush.some((t) => t.id === id)
+      );
+      await Promise.all([
+        ...localNotesToPush.map((n) => upsertCloudNote(firebaseUid, n, fallbackFolder)),
+        ...localTasksToPush.map((t) => upsertCloudTask(firebaseUid, t)),
+        ...pendingTaskDeleteIds.map((id) => deleteCloudTask(firebaseUid, id)),
+        ...localEventsToPush.map((e) => upsertCloudEvent(firebaseUid, e)),
+        ...localLookupToPush.map((entry) => upsertCloudLookupEntry(firebaseUid, entry)),
+      ]);
+      for (const t of localTasksToPush) {
+        delete cloudTaskJournalRef.current.upserts[t.id];
+        cloudTaskBaseByIdRef.current.set(t.id, t);
+        lastSyncedTasksFpRef.current.set(t.id, fingerprintCloudTask(t));
       }
-      const remoteNotes = await fetchAllCloudNotesOnce(firebaseUid);
+      for (const id of pendingTaskDeleteIds) {
+        delete cloudTaskJournalRef.current.deletes[id];
+        cloudTaskBaseByIdRef.current.delete(id);
+        lastSyncedTasksFpRef.current.delete(id);
+      }
+      saveCloudTaskJournal(cloudTaskJournalRef.current);
+      const [remoteNotes, remoteTasks, remoteEvents, remoteLookups] = await Promise.all([
+        fetchAllCloudNotesOnce(firebaseUid),
+        fetchAllCloudTasksOnce(firebaseUid),
+        fetchAllCloudEventsOnce(firebaseUid),
+        fetchAllCloudLookupEntriesOnce(firebaseUid),
+      ]);
       setCloudNotesSyncedCount(remoteNotes.length);
+      setCloudTasksSyncedCount(remoteTasks.length);
+      setCloudEventsSyncedCount(remoteEvents.length);
+      setCloudLookupSyncedCount(remoteLookups.length);
       markCloudNotesSyncedNow();
     } catch (err) {
       setCloudNotesError(formatFriendlyCloudSyncError(err));
@@ -1233,6 +2615,59 @@ export default function App() {
     })();
   }, [isOnline, googleConnected, flushPendingSyncQueue, syncGoogleCalendarEvents, syncGoogleTasksList]);
 
+  // Periodically & on foreground resume pull new Google Tasks (e.g. created in Google Tasks app)
+  // so their reminders trigger automatically in buh. without requiring manual sync
+  const lastAutoGoogleSyncAtRef = useRef<number>(0);
+  useEffect(() => {
+    if (!isOnline || !googleConnected) return;
+    if (!settings.googleTasksSync && !settings.googleCalendarSync) return;
+
+    const triggerQuietRefresh = (minGapMs: number) => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+      if (!isCalendarAccessTokenFresh()) {
+        setGoogleConnected(false);
+        return;
+      }
+      const now = Date.now();
+      if (now - lastAutoGoogleSyncAtRef.current < minGapMs) return;
+      lastAutoGoogleSyncAtRef.current = now;
+      if (pendingSyncQueueRef.current.length > 0) {
+        void flushPendingSyncQueue();
+        return;
+      }
+      const jobs: Promise<unknown>[] = [];
+      if (settingsRef.current.googleTasksSync) {
+        jobs.push(syncGoogleTasksList());
+      }
+      if (settingsRef.current.googleCalendarSync) {
+        jobs.push(syncGoogleCalendarEvents());
+      }
+      if (jobs.length > 0) {
+        void Promise.allSettled(jobs);
+      }
+    };
+
+    const handleResume = () => triggerQuietRefresh(45_000);
+    window.addEventListener('focus', handleResume);
+    document.addEventListener('visibilitychange', handleResume);
+    const intervalId = window.setInterval(() => triggerQuietRefresh(150_000), 60_000);
+
+    return () => {
+      window.removeEventListener('focus', handleResume);
+      document.removeEventListener('visibilitychange', handleResume);
+      window.clearInterval(intervalId);
+    };
+  }, [
+    isOnline,
+    googleConnected,
+    settings.googleTasksSync,
+    settings.googleCalendarSync,
+    flushPendingSyncQueue,
+    syncGoogleCalendarEvents,
+    syncGoogleTasksList,
+  ]);
+
   const handleGoogleSignIn = useCallback(async () => {
     if (googleSigningIn) return;
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -1248,6 +2683,7 @@ export default function App() {
       const hint = googleUserEmail && googleUserEmail.includes('@') ? googleUserEmail : null;
       const { user, accessToken } = await signInWithGoogleCalendar(hint);
       setGoogleConnected(true);
+      setGoogleReconnectDismissed(false);
       setGoogleUserEmail(user.email || user.displayName || 'Google Account');
       setSettings((s) => ({ ...s, googleCalendarSync: true, googleTasksSync: true }));
       const flushed = await flushPendingSyncQueue(accessToken);
@@ -1256,10 +2692,15 @@ export default function App() {
           syncGoogleCalendarEvents(accessToken),
           syncGoogleTasksList(accessToken),
         ]);
+        showOfflineSyncNotice('Google Calendar & Tasks synced');
       }
     } catch (err: unknown) {
       const code = (err as { code?: string })?.code;
-      if (code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
+      if (code === 'auth/popup-blocked') {
+        const msg = 'Browser blocked the sign-in window — tap Sync once more to reconnect.';
+        setGoogleError(msg);
+        setGoogleTasksError(msg);
+      } else if (code !== 'auth/popup-closed-by-user' && code !== 'auth/cancelled-popup-request') {
         const msg = err instanceof Error ? err.message : 'Google sign-in failed.';
         setGoogleError(msg);
         setGoogleTasksError(msg);
@@ -1273,11 +2714,30 @@ export default function App() {
     flushPendingSyncQueue,
     syncGoogleCalendarEvents,
     syncGoogleTasksList,
+    showOfflineSyncNotice,
   ]);
+
+  const handleSyncGoogleCalendarOrReconnect = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    if (!googleConnectedRef.current || !isCalendarAccessTokenFresh()) {
+      await handleGoogleSignIn();
+      return;
+    }
+    await syncGoogleCalendarEvents();
+  }, [handleGoogleSignIn, syncGoogleCalendarEvents]);
+
+  const handleSyncGoogleTasksOrReconnect = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    if (!googleConnectedRef.current || !isCalendarAccessTokenFresh()) {
+      await handleGoogleSignIn();
+      return;
+    }
+    await syncGoogleTasksList();
+  }, [handleGoogleSignIn, syncGoogleTasksList]);
 
   const handleTriggerPendingSync = useCallback(() => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) return;
-    if (googleConnectedRef.current) {
+    if (googleConnectedRef.current && isCalendarAccessTokenFresh()) {
       void flushPendingSyncQueue();
     } else {
       void handleGoogleSignIn();
@@ -1291,6 +2751,7 @@ export default function App() {
       await signOutGoogleCalendar();
     } finally {
       setGoogleConnected(false);
+      setGoogleReconnectDismissed(false);
       setGoogleUserEmail(null);
       setGoogleEvents([]);
       setGoogleLastSyncedAt(null);
@@ -1299,7 +2760,10 @@ export default function App() {
       setGoogleTasksLastSyncedAt(null);
       setDirtyGoogleTaskIds([]);
       setPendingSyncQueue([]);
+      googleTaskBaseByIdRef.current.clear();
       clearOfflineGoogleCache();
+      cloudTaskJournalRef.current = { upserts: {}, deletes: {} };
+      clearCloudTaskJournal();
     }
   }, []);
 
@@ -1311,6 +2775,7 @@ export default function App() {
       startTime: string;
       endTime: string;
       calendarName: string;
+      recurrence?: RecurrenceRule;
     }) => {
       setGoogleError(null);
       const computeMins = () => {
@@ -1338,6 +2803,7 @@ export default function App() {
           endTime: input.endTime,
           durationMinutes: computeMins(),
           calendarName: input.calendarName || 'Google Calendar',
+          recurrence: input.recurrence,
           source: 'google',
         };
         setGoogleEvents((prev) => [...prev, optimistic]);
@@ -1359,10 +2825,12 @@ export default function App() {
 
       try {
         const created = await createGoogleCalendarEvent(input);
-        setGoogleEvents((prev) => [...prev, created]);
-        setGoogleLastSyncedAt(
-          new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        );
+        const createdWithRule: CalendarEvent = {
+          ...created,
+          recurrence: created.recurrence ?? input.recurrence,
+        };
+        setGoogleEvents((prev) => [...prev, createdWithRule]);
+        setGoogleLastSyncedAt(formatClockDate(new Date()));
       } catch (err: unknown) {
         if (isNetworkOrOfflineError(err)) {
           queueOfflineEvent();
@@ -1434,6 +2902,8 @@ export default function App() {
       taskListId?: string;
       category?: string;
       reminders?: TaskReminder[];
+      recurrence?: RecurrenceRule;
+      recurrenceSeriesId?: string;
     }) => {
       setGoogleTasksError(null);
       const matchedList =
@@ -1449,20 +2919,33 @@ export default function App() {
       const queueOfflineTask = () => {
         const stamp = Date.now();
         const tempId = `gtask-offline-${stamp}`;
+        const isInbox = !input.dateKey && !input.recurrence;
+        const dateKey = input.dateKey || (input.recurrence ? getTodayDateKey() : '');
+        const offlineGoogleTaskId = `offline-${stamp}`;
         const optimistic: TaskItem = {
           id: tempId,
           title: input.title,
           timeLabel: input.timeLabel || 'No time set',
-          dateKey: input.dateKey || new Date().toISOString().slice(0, 10),
+          dateKey,
           category: targetListTitle,
           priority: input.priority || 'Normal',
           completed: false,
-          isInbox: !input.dateKey,
+          isInbox,
           notes: input.notes || '',
           subtasks: [],
-          reminders: input.reminders,
+          reminders: buildDefaultGoogleTaskReminders({
+            id: tempId,
+            googleTaskId: offlineGoogleTaskId,
+            completed: false,
+            isInbox,
+            dateKey,
+            recurrence: input.recurrence,
+            reminders: input.reminders,
+          }),
+          recurrence: input.recurrence,
+          recurrenceSeriesId: input.recurrenceSeriesId,
           source: 'google',
-          googleTaskId: `offline-${stamp}`,
+          googleTaskId: offlineGoogleTaskId,
           googleTaskListId: targetListId,
           googleTaskListTitle: targetListTitle,
         };
@@ -1497,18 +2980,20 @@ export default function App() {
           priority: input.priority,
           taskListId: targetListId,
           taskListTitle: targetListTitle,
+          recurrence: input.recurrence,
+          reminders: input.reminders,
         });
 
-        const withReminders: TaskItem =
-          input.reminders && input.reminders.length > 0
-            ? { ...created, reminders: input.reminders }
-            : created;
+        const withMeta: TaskItem = {
+          ...created,
+          ...(input.reminders && input.reminders.length > 0 ? { reminders: input.reminders } : {}),
+          ...(input.recurrence ? { recurrence: input.recurrence } : {}),
+          ...(input.recurrenceSeriesId ? { recurrenceSeriesId: input.recurrenceSeriesId } : {}),
+        };
 
-        setGoogleTasks((prev) => [withReminders, ...prev]);
-        setGoogleTasksLastSyncedAt(
-          new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-        );
-        return withReminders.id;
+        setGoogleTasks((prev) => [withMeta, ...prev]);
+        setGoogleTasksLastSyncedAt(formatClockDate(new Date()));
+        return withMeta.id;
       } catch (err: unknown) {
         if (isNetworkOrOfflineError(err)) {
           return queueOfflineTask();
@@ -1525,9 +3010,19 @@ export default function App() {
     [googleTaskLists]
   );
 
-  const handleUpdateGoogleTask = useCallback(async (task: TaskItem) => {
+  const handleUpdateGoogleTask = useCallback(async (task: TaskItem, expectedVersion?: number) => {
     setGoogleTasksError(null);
+
+    const existingPending = pendingGoogleTaskAutoSyncRef.current.get(task.id);
+    if (existingPending) {
+      window.clearTimeout(existingPending.timerId);
+      pendingGoogleTaskAutoSyncRef.current.delete(task.id);
+    }
+
+    const syncVersion = expectedVersion ?? (googleTaskEditVersionRef.current.get(task.id) ?? 0);
+
     const queueOfflineUpdate = () => {
+      const baseTask = googleTaskBaseByIdRef.current.get(task.id);
       setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? task : t)));
       setDirtyGoogleTaskIds((prev) => (prev.includes(task.id) ? prev : [...prev, task.id]));
       setPendingSyncQueue((prev) =>
@@ -1536,6 +3031,7 @@ export default function App() {
           type: 'gtask-update',
           taskId: task.id,
           task,
+          ...(baseTask ? { baseTask } : {}),
           createdAt: Date.now(),
         })
       );
@@ -1544,21 +3040,62 @@ export default function App() {
     if (
       (typeof navigator !== 'undefined' && !navigator.onLine) ||
       !googleConnectedRef.current ||
+      !isCalendarAccessTokenFresh() ||
       task.googleTaskId?.startsWith('offline-')
     ) {
+      if (googleConnectedRef.current && !isCalendarAccessTokenFresh()) {
+        setGoogleConnected(false);
+      }
       queueOfflineUpdate();
       return;
     }
 
+    inFlightGoogleTaskSyncIdsRef.current.add(task.id);
     try {
-      const updated = await updateGoogleTask(task);
-      setGoogleTasks((prev) =>
-        prev.map((t) => (t.id === task.id ? { ...updated, reminders: task.reminders } : t))
-      );
-      setDirtyGoogleTaskIds((prev) => prev.filter((id) => id !== task.id));
-      setGoogleTasksLastSyncedAt(
-        new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      );
+      let updated: TaskItem;
+      try {
+        updated = await updateGoogleTask(task);
+      } catch (updateErr: unknown) {
+        if (updateErr instanceof Error && updateErr.message === 'TASK_NOT_FOUND') {
+          const recreated = await createGoogleTask({
+            title: task.title,
+            notes: task.notes,
+            dateKey: task.isInbox ? undefined : task.dateKey,
+            timeLabel: task.timeLabel,
+            priority: task.priority,
+            taskListId: task.googleTaskListId || '@default',
+            taskListTitle: task.googleTaskListTitle || task.category || 'My Tasks',
+            recurrence: task.recurrence,
+            reminders: task.reminders,
+          });
+          updated = task.completed
+            ? await updateGoogleTask({
+                ...recreated,
+                completed: true,
+                completedAt: task.completedAt || new Date().toISOString(),
+              })
+            : recreated;
+        } else {
+          throw updateErr;
+        }
+      }
+      const syncedTask: TaskItem = {
+        ...updated,
+        reminders: task.reminders,
+        recurrence: task.recurrence,
+        recurrenceSeriesId: task.recurrenceSeriesId,
+      };
+      googleTaskBaseByIdRef.current.set(syncedTask.id, syncedTask);
+      const latestVersion = googleTaskEditVersionRef.current.get(task.id) ?? 0;
+      if (latestVersion === syncVersion) {
+        setGoogleTasks((prev) =>
+          prev.map((t) => (t.id === task.id ? syncedTask : t))
+        );
+        setDirtyGoogleTaskIds((prev) =>
+          prev.filter((id) => id !== task.id && id !== syncedTask.id)
+        );
+      }
+      setGoogleTasksLastSyncedAt(formatClockDate(new Date()));
     } catch (err: unknown) {
       if (isNetworkOrOfflineError(err)) {
         queueOfflineUpdate();
@@ -1570,72 +3107,181 @@ export default function App() {
         queueOfflineUpdate();
         return;
       }
-      setGoogleTasksError(msg);
-      throw err;
-    }
-  }, []);
-
-  const handleToggleGoogleTask = useCallback(async (task: TaskItem) => {
-    setGoogleTasksError(null);
-    const nextCompleted = !task.completed;
-    const toggled: TaskItem = {
-      ...task,
-      completed: nextCompleted,
-      completedAt: nextCompleted ? new Date().toISOString() : undefined,
-    };
-    const queueOfflineToggle = () => {
-      setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? toggled : t)));
       setDirtyGoogleTaskIds((prev) => (prev.includes(task.id) ? prev : [...prev, task.id]));
-      setPendingSyncQueue((prev) =>
-        enqueueSyncOp(prev, {
-          id: makeSyncOpId(),
-          type: 'gtask-update',
-          taskId: task.id,
-          task: toggled,
-          createdAt: Date.now(),
-        })
-      );
-    };
-
-    if (
-      (typeof navigator !== 'undefined' && !navigator.onLine) ||
-      !googleConnectedRef.current ||
-      task.googleTaskId?.startsWith('offline-')
-    ) {
-      queueOfflineToggle();
-      return;
-    }
-
-    try {
-      const updated = await updateGoogleTask(toggled);
-      setGoogleTasks((prev) =>
-        prev.map((t) => (t.id === task.id ? { ...updated, reminders: task.reminders } : t))
-      );
-      setDirtyGoogleTaskIds((prev) => prev.filter((id) => id !== task.id));
-      setGoogleTasksLastSyncedAt(
-        new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      );
-    } catch (err: unknown) {
-      if (isNetworkOrOfflineError(err)) {
-        queueOfflineToggle();
-        return;
-      }
-      const msg = err instanceof Error ? err.message : 'Failed to update Google Task status.';
-      if (msg === 'NOT_AUTHENTICATED' || msg === 'AUTH_EXPIRED') {
-        setGoogleConnected(false);
-        queueOfflineToggle();
-        return;
-      }
       setGoogleTasksError(msg);
       throw err;
+    } finally {
+      inFlightGoogleTaskSyncIdsRef.current.delete(task.id);
     }
   }, []);
+
+  // Flush any pending debounced Google Task auto-syncs when leaving/hiding the app
+  useEffect(() => {
+    const flushPendingGoogleTaskAutoSyncs = () => {
+      const entries = Array.from(pendingGoogleTaskAutoSyncRef.current.values());
+      if (entries.length === 0) return;
+      pendingGoogleTaskAutoSyncRef.current.clear();
+      for (const entry of entries) {
+        window.clearTimeout(entry.timerId);
+        void handleUpdateGoogleTask(entry.task, entry.version).catch(() => {
+          // Error already recorded in googleTasksError & dirtyGoogleTaskIds
+        });
+      }
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushPendingGoogleTaskAutoSyncs();
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('pagehide', flushPendingGoogleTaskAutoSyncs);
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('pagehide', flushPendingGoogleTaskAutoSyncs);
+      for (const entry of pendingGoogleTaskAutoSyncRef.current.values()) {
+        window.clearTimeout(entry.timerId);
+      }
+      pendingGoogleTaskAutoSyncRef.current.clear();
+    };
+  }, [handleUpdateGoogleTask]);
+
+  const handleToggleGoogleTask = useCallback(
+    async (task: TaskItem) => {
+      setGoogleTasksError(null);
+
+      // Cancel any stale debounced edit timer so it cannot undo this toggle
+      const existingPending = pendingGoogleTaskAutoSyncRef.current.get(task.id);
+      if (existingPending) {
+        window.clearTimeout(existingPending.timerId);
+        pendingGoogleTaskAutoSyncRef.current.delete(task.id);
+      }
+      const toggleVersion = (googleTaskEditVersionRef.current.get(task.id) ?? 0) + 1;
+      googleTaskEditVersionRef.current.set(task.id, toggleVersion);
+
+      const nextCompleted = !task.completed;
+      const toggled: TaskItem = {
+        ...task,
+        completed: nextCompleted,
+        completedAt: nextCompleted ? new Date().toISOString() : undefined,
+      };
+      const maybeSpawnNextGoogleOccurrence = () => {
+        if (!nextCompleted || !task.recurrence) return;
+        const nextOcc = buildNextRecurringTaskInstance(task);
+        if (!nextOcc) return;
+        const seriesId = nextOcc.recurrenceSeriesId;
+        const alreadyExists = googleTasksRef.current.some(
+          (t) =>
+            !t.completed &&
+            t.dateKey === nextOcc.dateKey &&
+            ((seriesId && (t.recurrenceSeriesId === seriesId || t.id === seriesId)) ||
+              (t.title.trim().toLowerCase() === nextOcc.title.trim().toLowerCase() &&
+                t.category === nextOcc.category))
+        );
+        if (alreadyExists) return;
+        void handleCreateGoogleTask({
+          title: nextOcc.title,
+          notes: nextOcc.notes,
+          dateKey: nextOcc.dateKey,
+          timeLabel: nextOcc.timeLabel,
+          priority: nextOcc.priority,
+          taskListId: task.googleTaskListId,
+          category: task.googleTaskListTitle || task.category,
+          reminders: nextOcc.reminders,
+          recurrence: nextOcc.recurrence,
+          recurrenceSeriesId: nextOcc.recurrenceSeriesId,
+        });
+        const label = formatRelativeTaskDate(nextOcc.dateKey, {
+          includeMonthDayForRelative: true,
+        }).label;
+        showOfflineSyncNotice(`Next "${nextOcc.title}" scheduled for ${label}`);
+      };
+
+      const queueOfflineToggle = () => {
+        const baseTask = googleTaskBaseByIdRef.current.get(task.id) ?? task;
+        setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? toggled : t)));
+        setDirtyGoogleTaskIds((prev) => (prev.includes(task.id) ? prev : [...prev, task.id]));
+        setPendingSyncQueue((prev) =>
+          enqueueSyncOp(prev, {
+            id: makeSyncOpId(),
+            type: 'gtask-update',
+            taskId: task.id,
+            task: toggled,
+            baseTask,
+            createdAt: Date.now(),
+          })
+        );
+        maybeSpawnNextGoogleOccurrence();
+      };
+
+      if (
+        (typeof navigator !== 'undefined' && !navigator.onLine) ||
+        !googleConnectedRef.current ||
+        !isCalendarAccessTokenFresh() ||
+        task.googleTaskId?.startsWith('offline-')
+      ) {
+        if (googleConnectedRef.current && !isCalendarAccessTokenFresh()) {
+          setGoogleConnected(false);
+        }
+        queueOfflineToggle();
+        return;
+      }
+
+      // Optimistically update immediately for instant UI responsiveness
+      setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? toggled : t)));
+      inFlightGoogleTaskSyncIdsRef.current.add(task.id);
+      try {
+        const updated = await updateGoogleTask(toggled);
+        const syncedTask: TaskItem = {
+          ...updated,
+          reminders: toggled.reminders,
+          recurrence: toggled.recurrence,
+          recurrenceSeriesId: toggled.recurrenceSeriesId,
+        };
+        googleTaskBaseByIdRef.current.set(syncedTask.id, syncedTask);
+        if ((googleTaskEditVersionRef.current.get(task.id) ?? 0) === toggleVersion) {
+          setGoogleTasks((prev) => prev.map((t) => (t.id === task.id ? syncedTask : t)));
+          setDirtyGoogleTaskIds((prev) => prev.filter((id) => id !== task.id));
+        }
+        setGoogleTasksLastSyncedAt(formatClockDate(new Date()));
+        maybeSpawnNextGoogleOccurrence();
+      } catch (err: unknown) {
+        if (isNetworkOrOfflineError(err)) {
+          queueOfflineToggle();
+          return;
+        }
+        const msg = err instanceof Error ? err.message : 'Failed to update Google Task status.';
+        if (msg === 'NOT_AUTHENTICATED' || msg === 'AUTH_EXPIRED') {
+          setGoogleConnected(false);
+          queueOfflineToggle();
+          return;
+        }
+        setGoogleTasksError(msg);
+        throw err;
+      } finally {
+        inFlightGoogleTaskSyncIdsRef.current.delete(task.id);
+      }
+    },
+    [handleCreateGoogleTask, showOfflineSyncNotice]
+  );
 
   const handleDeleteGoogleTask = useCallback(async (task: TaskItem) => {
     setGoogleTasksError(null);
+    const existingPending = pendingGoogleTaskAutoSyncRef.current.get(task.id);
+    if (existingPending) {
+      window.clearTimeout(existingPending.timerId);
+      pendingGoogleTaskAutoSyncRef.current.delete(task.id);
+    }
+    googleTaskEditVersionRef.current.set(
+      task.id,
+      (googleTaskEditVersionRef.current.get(task.id) ?? 0) + 1
+    );
+
     const queueOfflineDelete = () => {
       setGoogleTasks((prev) => prev.filter((t) => t.id !== task.id));
       setDirtyGoogleTaskIds((prev) => prev.filter((id) => id !== task.id));
+      googleTaskBaseByIdRef.current.delete(task.id);
       if (task.googleTaskId) {
         setPendingSyncQueue((prev) =>
           enqueueSyncOp(prev, {
@@ -1653,8 +3299,12 @@ export default function App() {
     if (
       (typeof navigator !== 'undefined' && !navigator.onLine) ||
       !googleConnectedRef.current ||
+      !isCalendarAccessTokenFresh() ||
       task.googleTaskId?.startsWith('offline-')
     ) {
+      if (googleConnectedRef.current && !isCalendarAccessTokenFresh()) {
+        setGoogleConnected(false);
+      }
       queueOfflineDelete();
       return;
     }
@@ -1664,9 +3314,8 @@ export default function App() {
       await deleteGoogleTask(task.googleTaskListId || '@default', task.googleTaskId);
       setGoogleTasks((prev) => prev.filter((t) => t.id !== task.id));
       setDirtyGoogleTaskIds((prev) => prev.filter((id) => id !== task.id));
-      setGoogleTasksLastSyncedAt(
-        new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      );
+      googleTaskBaseByIdRef.current.delete(task.id);
+      setGoogleTasksLastSyncedAt(formatClockDate(new Date()));
     } catch (err: unknown) {
       if (isNetworkOrOfflineError(err)) {
         queueOfflineDelete();
@@ -1689,14 +3338,7 @@ export default function App() {
       settings.googleCalendarSync && googleEvents.length > 0
         ? [...events, ...googleEvents]
         : events;
-    return [...merged].sort((a, b) => {
-      const d = a.dateKey.localeCompare(b.dateKey);
-      if (d !== 0) return d;
-      const aFull = a.startTime === 'Full';
-      const bFull = b.startTime === 'Full';
-      if (aFull !== bFull) return aFull ? -1 : 1;
-      return a.startTime.localeCompare(b.startTime);
-    });
+    return [...merged].sort(compareEventsAscending);
   }, [events, googleEvents, settings.googleCalendarSync]);
 
   // Show cached Google Tasks even while offline or awaiting reconnect,
@@ -1708,7 +3350,10 @@ export default function App() {
     const years = Math.max(0, Math.floor(settings.completedTaskHistoryYears ?? 0));
     const months = Math.max(0, Math.floor(settings.completedTaskHistoryMonths ?? 0));
     if (years === 0 && months === 0) {
-      return { visibleTasks: merged, hiddenCompletedTasksCount: 0 };
+      return {
+        visibleTasks: [...merged].sort(compareTasksAscending),
+        hiddenCompletedTasksCount: 0,
+      };
     }
 
     const now = new Date();
@@ -1743,6 +3388,7 @@ export default function App() {
       return true;
     });
 
+    filtered.sort(compareTasksAscending);
     return { visibleTasks: filtered, hiddenCompletedTasksCount: hiddenCount };
   }, [
     tasks,
@@ -1764,7 +3410,7 @@ export default function App() {
       error: googleError,
       onSignIn: handleGoogleSignIn,
       onSignOut: handleGoogleSignOut,
-      onSyncNow: () => syncGoogleCalendarEvents(),
+      onSyncNow: handleSyncGoogleCalendarOrReconnect,
       onSyncPending: handleTriggerPendingSync,
       onCreateGoogleEvent: handleCreateGoogleEvent,
       onDeleteGoogleEvent: handleDeleteGoogleEvent,
@@ -1781,7 +3427,7 @@ export default function App() {
       googleError,
       handleGoogleSignIn,
       handleGoogleSignOut,
-      syncGoogleCalendarEvents,
+      handleSyncGoogleCalendarOrReconnect,
       handleTriggerPendingSync,
       handleCreateGoogleEvent,
       handleDeleteGoogleEvent,
@@ -1802,7 +3448,7 @@ export default function App() {
       error: googleTasksError,
       onSignIn: handleGoogleSignIn,
       onSignOut: handleGoogleSignOut,
-      onSyncNow: () => syncGoogleTasksList(),
+      onSyncNow: handleSyncGoogleTasksOrReconnect,
       onSyncPending: handleTriggerPendingSync,
       onCreateGoogleTask: handleCreateGoogleTask,
       onUpdateGoogleTask: handleUpdateGoogleTask,
@@ -1823,7 +3469,7 @@ export default function App() {
       googleTasksError,
       handleGoogleSignIn,
       handleGoogleSignOut,
-      syncGoogleTasksList,
+      handleSyncGoogleTasksOrReconnect,
       handleTriggerPendingSync,
       handleCreateGoogleTask,
       handleUpdateGoogleTask,
@@ -1840,6 +3486,9 @@ export default function App() {
       lastSyncedAt: cloudNotesLastSyncedAt,
       syncedNotesCount: cloudNotesSyncedCount,
       syncedFoldersCount: noteFolders.length,
+      syncedTasksCount: cloudTasksSyncedCount,
+      syncedEventsCount: cloudEventsSyncedCount,
+      syncedLookupCount: cloudLookupSyncedCount,
       error: cloudNotesError,
       onSyncNow: handleSyncCloudNotesNow,
     }),
@@ -1852,10 +3501,30 @@ export default function App() {
       cloudNotesLastSyncedAt,
       cloudNotesSyncedCount,
       noteFolders.length,
+      cloudTasksSyncedCount,
+      cloudEventsSyncedCount,
+      cloudLookupSyncedCount,
       cloudNotesError,
       handleSyncCloudNotesNow,
     ]
   );
+
+  const hasLinkedGoogleSync =
+    Boolean(googleUserEmail) &&
+    (settings.googleCalendarSync || settings.googleTasksSync);
+  const hasCachedGoogleData =
+    googleEvents.length > 0 ||
+    googleTasks.length > 0 ||
+    Boolean(googleLastSyncedAt) ||
+    Boolean(googleTasksLastSyncedAt);
+  const showQuietGoogleRefresh =
+    hasLinkedGoogleSync &&
+    !googleConnected &&
+    !googleReconnectDismissed &&
+    hasCachedGoogleData;
+  const isRefreshingGoogleBanner =
+    googleSigningIn ||
+    ((googleSyncing || googleTasksSyncing) && pendingSyncQueue.length === 0 && !googleConnected);
 
   const isStandaloneAppMode =
     isInstalledPwa || manualFullScreen || (isCoarseTouch && viewportWidth < 1024);
@@ -1913,28 +3582,64 @@ export default function App() {
     themeMeta.setAttribute('content', surfaceHex);
   }, [isDark, decisions.accentColor, decisions.visualStyle, isStandaloneAppMode]);
 
-  useEffect(() => {
+  const pendingPersistPayloadRef = useRef<PersistedReviewState | null>(null);
+  const persistDirtyRef = useRef(false);
+  const persistTimerRef = useRef<number | null>(null);
+
+  const flushPersistedReviewState = useCallback(() => {
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = null;
+    }
+    if (!persistDirtyRef.current || !pendingPersistPayloadRef.current) return;
+    persistDirtyRef.current = false;
     try {
-      const payload: PersistedReviewState = {
-        posture,
-        activeScreen,
-        decisions,
-        recentColors,
-        isDark,
-        tasks,
-        taskLists,
-        noteFolders,
-        collapsedNoteFolders,
-        events,
-        notes,
-        settings,
-        reviewNote,
-        approved,
-      };
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(pendingPersistPayloadRef.current));
     } catch {
       // Ignore storage quota issues
     }
+  }, []);
+
+  useEffect(() => {
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        flushPersistedReviewState();
+      }
+    };
+    window.addEventListener('pagehide', flushPersistedReviewState);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', flushPersistedReviewState);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+      flushPersistedReviewState();
+    };
+  }, [flushPersistedReviewState]);
+
+  useEffect(() => {
+    pendingPersistPayloadRef.current = {
+      posture,
+      activeScreen,
+      decisions,
+      recentColors,
+      isDark,
+      tasks,
+      taskLists,
+      noteFolders,
+      collapsedNoteFolders,
+      events,
+      notes,
+      settings,
+      reviewNote,
+      approved,
+    };
+    persistDirtyRef.current = true;
+
+    if (persistTimerRef.current !== null) {
+      window.clearTimeout(persistTimerRef.current);
+    }
+    persistTimerRef.current = window.setTimeout(() => {
+      flushPersistedReviewState();
+    }, 250);
   }, [
     posture,
     activeScreen,
@@ -1950,6 +3655,7 @@ export default function App() {
     settings,
     reviewNote,
     approved,
+    flushPersistedReviewState,
   ]);
 
   const handlePreviewAccentColor = (hex: string) => {
@@ -1965,38 +3671,48 @@ export default function App() {
     setApproved(false);
   };
 
-  const tasksRef = useRef<TaskItem[]>(tasks);
   const googleTasksRef = useRef<TaskItem[]>(googleTasks);
-  const settingsRef = useRef<AppSettingsState>(settings);
-  useEffect(() => {
-    tasksRef.current = tasks;
-  }, [tasks]);
   useEffect(() => {
     googleTasksRef.current = googleTasks;
   }, [googleTasks]);
-  useEffect(() => {
-    settingsRef.current = settings;
-  }, [settings]);
 
   const checkDueReminders = useCallback(() => {
+    if (!swActionsHydratedRef.current || swWakePendingRef.current) return;
     if (!settingsRef.current.taskRemindersEnabled) return;
     const now = Date.now();
-    const CATCH_UP_WINDOW_MS = 15 * 60_000;
+    const todayDateKey = getTodayDateKey();
+    const CATCH_UP_WINDOW_MS = 60 * 60_000;
+    const SAME_DAY_GOOGLE_CATCH_UP_MS = 16 * 60 * 60_000;
 
     const scanList = (list: TaskItem[]) => {
       const firedByTask = new Map<string, Set<string>>();
-      const triggered: { task: TaskItem; reminder: TaskReminder }[] = [];
+      const triggered: { task: TaskItem; reminder: TaskReminder; triggerMs: number }[] = [];
 
       for (const task of list) {
         if (task.completed || !task.reminders || task.reminders.length === 0) continue;
         for (const rem of task.reminders) {
           if (rem.firedAt) continue;
+          const pairKey = `${task.id}:${rem.id}`;
+          if (dispatchedReminderKeysRef.current.has(pairKey)) continue;
           const triggerMs = computeReminderTriggerMs(task, rem);
           if (triggerMs === null) continue;
-          if (triggerMs <= now && now - triggerMs <= CATCH_UP_WINDOW_MS) {
-            const dedupeKey = `${task.id}:${rem.id}:${triggerMs}`;
-            if (dispatchedReminderKeysRef.current.has(dedupeKey)) continue;
-            dispatchedReminderKeysRef.current.add(dedupeKey);
+          const timedKey = `${task.id}:${rem.id}:${Math.round(triggerMs / 1000)}`;
+          if (dispatchedReminderKeysRef.current.has(timedKey)) continue;
+
+          // Date-only Google Tasks created externally after 9:00 AM still alert once today on sync
+          const isSameDayGoogleDefault =
+            task.source === 'google' &&
+            rem.mode === 'relative' &&
+            rem.id.startsWith('gtask-due-') &&
+            task.timeLabel === 'No time set' &&
+            task.dateKey === todayDateKey;
+          const catchUpWindowMs = isSameDayGoogleDefault
+            ? SAME_DAY_GOOGLE_CATCH_UP_MS
+            : CATCH_UP_WINDOW_MS;
+
+          if (triggerMs <= now && now - triggerMs <= catchUpWindowMs) {
+            dispatchedReminderKeysRef.current.add(pairKey);
+            dispatchedReminderKeysRef.current.add(timedKey);
 
             let set = firedByTask.get(task.id);
             if (!set) {
@@ -2004,7 +3720,7 @@ export default function App() {
               firedByTask.set(task.id, set);
             }
             set.add(rem.id);
-            triggered.push({ task, reminder: rem });
+            triggered.push({ task, reminder: rem, triggerMs });
           }
         }
       }
@@ -2013,17 +3729,21 @@ export default function App() {
     };
 
     const localScan = scanList(tasksRef.current);
-    const googleScan = scanList(googleTasksRef.current);
+    const googleScan = settingsRef.current.googleTasksSync
+      ? scanList(googleTasksRef.current)
+      : { firedByTask: new Map<string, Set<string>>(), triggered: [] };
 
     if (localScan.firedByTask.size > 0) {
       setTasks((prev) =>
         prev.map((t) => {
           const firedIds = localScan.firedByTask.get(t.id);
           if (!firedIds || !t.reminders) return t;
-          return {
+          const updatedTask = {
             ...t,
             reminders: t.reminders.map((r) => (firedIds.has(r.id) ? { ...r, firedAt: now } : r)),
           };
+          recordLocalTaskDirty(updatedTask, t);
+          return updatedTask;
         })
       );
     }
@@ -2047,7 +3767,8 @@ export default function App() {
       if (playSound) {
         playSoftReminderChime();
       }
-      for (const { task, reminder } of allTriggered) {
+      for (const { task, reminder, triggerMs } of allTriggered) {
+        void markReminderFiredInServiceWorker(task.id, reminder.id, triggerMs);
         void dispatchSystemTaskNotification(task, reminder, { silent: !playSound });
       }
       setActiveReminderAlerts((prev) => {
@@ -2068,32 +3789,53 @@ export default function App() {
         return next.slice(0, 5);
       });
     }
-  }, []);
+  }, [recordLocalTaskDirty]);
+
+  const hasPendingReminders = useMemo(() => {
+    const hasUnfired = (list: TaskItem[]) =>
+      list.some(
+        (t) => !t.completed && t.reminders && t.reminders.some((r) => !r.firedAt)
+      );
+    return hasUnfired(tasks) || (settings.googleTasksSync && hasUnfired(googleTasks));
+  }, [tasks, googleTasks, settings.googleTasksSync]);
 
   useEffect(() => {
+    if (!settings.taskRemindersEnabled || !hasPendingReminders) return;
     checkDueReminders();
     const intervalId = window.setInterval(checkDueReminders, 5000);
-    const handleResume = () => {
-      if (document.visibilityState !== 'hidden') {
-        checkDueReminders();
-      }
-    };
-    window.addEventListener('focus', handleResume);
-    document.addEventListener('visibilitychange', handleResume);
     return () => {
       window.clearInterval(intervalId);
-      window.removeEventListener('focus', handleResume);
-      document.removeEventListener('visibilitychange', handleResume);
     };
-  }, [checkDueReminders]);
+  }, [settings.taskRemindersEnabled, hasPendingReminders, checkDueReminders]);
 
+  // Also arm a precise timeout for the single soonest upcoming reminder within 6 hours
   useEffect(() => {
     checkDueReminders();
-  }, [tasks, googleTasks, checkDueReminders]);
-
-  const handleDismissReminderAlert = useCallback((alertId: string) => {
-    setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId));
-  }, []);
+    if (!settings.taskRemindersEnabled) return;
+    const now = Date.now();
+    const HORIZON_MS = 6 * 60 * 60 * 1000;
+    let soonestDelay: number | null = null;
+    const activeTaskPool = settings.googleTasksSync ? [...tasks, ...googleTasks] : tasks;
+    for (const task of activeTaskPool) {
+      if (task.completed || !task.reminders) continue;
+      for (const rem of task.reminders) {
+        if (rem.firedAt) continue;
+        const triggerMs = computeReminderTriggerMs(task, rem);
+        if (triggerMs === null) continue;
+        const delay = triggerMs - now;
+        if (delay > 0 && delay <= HORIZON_MS) {
+          if (soonestDelay === null || delay < soonestDelay) {
+            soonestDelay = delay;
+          }
+        }
+      }
+    }
+    if (soonestDelay === null) return;
+    const timer = window.setTimeout(() => {
+      checkDueReminders();
+    }, soonestDelay + 250);
+    return () => window.clearTimeout(timer);
+  }, [tasks, googleTasks, settings.googleTasksSync, settings.taskRemindersEnabled, checkDueReminders]);
 
   const handleClearReminder = useCallback((taskId?: string, reminderId?: string) => {
     setActiveReminderAlerts((prev) =>
@@ -2107,6 +3849,8 @@ export default function App() {
     );
     if (!taskId || !reminderId) return;
     const now = Date.now();
+    dispatchedReminderKeysRef.current.add(`${taskId}:${reminderId}`);
+    void markReminderFiredInServiceWorker(taskId, reminderId);
     const markFired = (list: TaskItem[]) =>
       list.map((t) =>
         t.id === taskId && t.reminders
@@ -2118,14 +3862,126 @@ export default function App() {
             }
           : t
       );
-    setTasks(markFired);
+    setTasks((prev) =>
+      prev.map((t) => {
+        if (t.id !== taskId || !t.reminders) return t;
+        const updatedTask = {
+          ...t,
+          reminders: t.reminders.map((r) =>
+            r.id === reminderId ? { ...r, firedAt: r.firedAt ?? now } : r
+          ),
+        };
+        recordLocalTaskDirty(updatedTask, t);
+        return updatedTask;
+      })
+    );
     setGoogleTasks(markFired);
-  }, []);
+  }, [recordLocalTaskDirty]);
+
+  const handleDismissReminderAlert = useCallback(
+    (alertId: string) => {
+      const target = activeReminderAlerts.find((a) => a.id === alertId);
+      setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId));
+      if (target) {
+        handleClearReminder(target.taskId, target.reminderId);
+      }
+    },
+    [activeReminderAlerts, handleClearReminder]
+  );
+
+  const handleCompleteFromReminderAlert = useCallback(
+    (alertId: string, taskId: string, reminderId?: string) => {
+      const now = Date.now();
+      setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId && a.taskId !== taskId));
+      if (reminderId) {
+        dispatchedReminderKeysRef.current.add(`${taskId}:${reminderId}`);
+        void markReminderFiredInServiceWorker(taskId, reminderId);
+      }
+
+      const localMatch = tasksRef.current.find((t) => t.id === taskId);
+      if (localMatch) {
+        for (const r of localMatch.reminders ?? []) {
+          dispatchedReminderKeysRef.current.add(`${taskId}:${r.id}`);
+          void markReminderFiredInServiceWorker(taskId, r.id);
+        }
+        const nextOcc =
+          !localMatch.completed && localMatch.recurrence
+            ? buildNextRecurringTaskInstance(localMatch)
+            : null;
+        setTasks((prev) => {
+          const updatedList = prev.map((t) => {
+            if (t.id !== taskId) return t;
+            const completedTask: TaskItem = {
+              ...t,
+              completed: true,
+              completedAt: t.completedAt || new Date().toISOString(),
+              reminders: t.reminders?.map((r) => ({ ...r, firedAt: r.firedAt ?? now })),
+            };
+            recordLocalTaskDirty(completedTask, t);
+            return completedTask;
+          });
+          if (nextOcc) {
+            const seriesId = nextOcc.recurrenceSeriesId;
+            const duplicate = updatedList.some(
+              (t) =>
+                !t.completed &&
+                t.dateKey === nextOcc.dateKey &&
+                ((seriesId && (t.recurrenceSeriesId === seriesId || t.id === seriesId)) ||
+                  (t.title.trim().toLowerCase() === nextOcc.title.trim().toLowerCase() &&
+                    t.category === nextOcc.category))
+            );
+            if (!duplicate) {
+              recordLocalTaskDirty(nextOcc);
+              return [nextOcc, ...updatedList];
+            }
+          }
+          return updatedList;
+        });
+        if (!localMatch.completed) {
+          if (nextOcc) {
+            const nextLabel = formatRelativeTaskDate(nextOcc.dateKey, {
+              includeMonthDayForRelative: true,
+            }).label;
+            showOfflineSyncNotice(`Done · next "${localMatch.title || 'Task'}" on ${nextLabel}`);
+          } else {
+            showOfflineSyncNotice(`Marked "${localMatch.title || 'Task'}" done`);
+          }
+        }
+        return;
+      }
+
+      const googleMatch = googleTasksRef.current.find((t) => t.id === taskId);
+      if (googleMatch) {
+        for (const r of googleMatch.reminders ?? []) {
+          dispatchedReminderKeysRef.current.add(`${taskId}:${r.id}`);
+          void markReminderFiredInServiceWorker(taskId, r.id);
+        }
+        const googleMatchWithFired: TaskItem = googleMatch.reminders
+          ? {
+              ...googleMatch,
+              reminders: googleMatch.reminders.map((r) => ({ ...r, firedAt: r.firedAt ?? now })),
+            }
+          : googleMatch;
+        setGoogleTasks((prev) =>
+          prev.map((t) => (t.id === taskId ? googleMatchWithFired : t))
+        );
+        if (!googleMatchWithFired.completed) {
+          void handleToggleGoogleTask(googleMatchWithFired);
+          showOfflineSyncNotice(`Marked "${googleMatchWithFired.title || 'Task'}" done`);
+        }
+      }
+    },
+    [handleToggleGoogleTask, recordLocalTaskDirty, showOfflineSyncNotice]
+  );
 
   const handleSnoozeReminder = useCallback(
     (taskId: string, reminderId?: string, snoozeMinutes = 10) => {
       const now = Date.now();
       const snoozed = createSnoozedReminder(snoozeMinutes);
+      if (reminderId) {
+        dispatchedReminderKeysRef.current.add(`${taskId}:${reminderId}`);
+        void markReminderFiredInServiceWorker(taskId, reminderId);
+      }
 
       setActiveReminderAlerts((prev) =>
         prev.filter((a) =>
@@ -2145,7 +4001,9 @@ export default function App() {
             const existing = (t.reminders ?? []).map((r) =>
               reminderId && r.id === reminderId ? { ...r, firedAt: r.firedAt ?? now } : r
             );
-            return { ...t, reminders: [...existing, snoozed] };
+            const updatedTask = { ...t, reminders: [...existing, snoozed] };
+            recordLocalTaskDirty(updatedTask, t);
+            return updatedTask;
           })
         );
       } else {
@@ -2168,7 +4026,7 @@ export default function App() {
         showOfflineSyncNotice(`Snoozed "${matchedTitle}" for ${snoozeMinutes}m`);
       }
     },
-    [showOfflineSyncNotice]
+    [recordLocalTaskDirty, showOfflineSyncNotice]
   );
 
   const handleSnoozeReminderAlert = useCallback(
@@ -2179,17 +4037,68 @@ export default function App() {
     [handleSnoozeReminder]
   );
 
-  // Handle Snooze, Clear, and Tap-to-Open events coming from Android Service Worker notifications
+  // Handle Snooze, Done, Clear, Swipe-Away, and Tap-to-Open events coming from Android Service Worker notifications
   useEffect(() => {
-    const processPendingActions = async () => {
-      const pending = await consumePendingSwReminderActions();
-      for (const item of pending) {
-        if (item.action === 'snooze' && item.taskId) {
-          handleSnoozeReminder(item.taskId, item.reminderId, item.snoozeMinutes ?? 10);
-        } else if (item.action === 'clear') {
-          handleClearReminder(item.taskId, item.reminderId);
+    let inFlight: Promise<void> | null = null;
+
+    const applyActionOnce = (item: {
+      actionId?: string;
+      action?: 'snooze' | 'done' | 'clear';
+      taskId?: string;
+      reminderId?: string;
+      snoozeMinutes?: number;
+    }) => {
+      if (item.actionId) {
+        if (processedSwActionIdsRef.current.has(item.actionId)) {
+          return;
+        }
+        processedSwActionIdsRef.current.add(item.actionId);
+        if (processedSwActionIdsRef.current.size > 200) {
+          const first = processedSwActionIdsRef.current.values().next().value;
+          if (first) processedSwActionIdsRef.current.delete(first);
         }
       }
+      if (item.taskId && item.reminderId) {
+        dispatchedReminderKeysRef.current.add(`${item.taskId}:${item.reminderId}`);
+      }
+      if (item.action === 'snooze' && item.taskId) {
+        handleSnoozeReminder(item.taskId, item.reminderId, item.snoozeMinutes ?? 10);
+      } else if (item.action === 'done' && item.taskId) {
+        handleCompleteFromReminderAlert(
+          `${item.taskId}:${item.reminderId || ''}`,
+          item.taskId,
+          item.reminderId
+        );
+      } else if (item.action === 'clear') {
+        handleClearReminder(item.taskId, item.reminderId);
+      }
+    };
+
+    const processPendingActions = () => {
+      if (inFlight) return inFlight;
+      swWakePendingRef.current = true;
+      inFlight = (async () => {
+        try {
+          const [pending, swFired] = await Promise.all([
+            consumePendingSwReminderActions(),
+            getSwFiredReminderKeys(),
+          ]);
+
+          for (const firedKey of Object.keys(swFired)) {
+            dispatchedReminderKeysRef.current.add(firedKey);
+          }
+
+          for (const item of pending) {
+            applyActionOnce(item);
+          }
+        } finally {
+          swActionsHydratedRef.current = true;
+          swWakePendingRef.current = false;
+          inFlight = null;
+          checkDueReminders();
+        }
+      })();
+      return inFlight;
     };
 
     void processPendingActions();
@@ -2198,7 +4107,8 @@ export default function App() {
       const data = event.data as
         | {
             type?: string;
-            action?: 'snooze' | 'clear';
+            actionId?: string;
+            action?: 'snooze' | 'done' | 'clear';
             taskId?: string;
             reminderId?: string;
             snoozeMinutes?: number;
@@ -2206,16 +4116,17 @@ export default function App() {
         | null;
       if (!data || typeof data !== 'object') return;
       if (data.type === 'REMINDER_ACTION') {
-        if (data.action === 'snooze' && data.taskId) {
-          handleSnoozeReminder(data.taskId, data.reminderId, data.snoozeMinutes ?? 10);
-        } else if (data.action === 'clear') {
-          handleClearReminder(data.taskId, data.reminderId);
-        }
+        applyActionOnce(data);
       } else if (data.type === 'REMINDER_OPEN' && data.taskId) {
         setActiveScreen(ScreenId.Tasks);
         setExternalOpenTask({ taskId: data.taskId, nonce: Date.now() });
       } else if (data.type === 'REMINDER_PUSH_DELIVERED' && data.taskId && data.reminderId) {
-        handleClearReminder(data.taskId, data.reminderId);
+        applyActionOnce({
+          actionId: data.actionId,
+          action: 'clear',
+          taskId: data.taskId,
+          reminderId: data.reminderId,
+        });
       } else if (data.type === 'PUSH_SUBSCRIPTION_CHANGED') {
         window.dispatchEvent(new CustomEvent('buh:push-ready'));
       }
@@ -2240,26 +4151,46 @@ export default function App() {
       window.removeEventListener('focus', handleWake);
       document.removeEventListener('visibilitychange', handleWake);
     };
-  }, [handleSnoozeReminder, handleClearReminder]);
+  }, [handleSnoozeReminder, handleClearReminder, handleCompleteFromReminderAlert, checkDueReminders]);
 
   const [pushReadyNonce, setPushReadyNonce] = useState(0);
+  const lastResumePushSyncRef = useRef<number>(0);
 
   useEffect(() => {
     const onPushReady = () => setPushReadyNonce((n) => n + 1);
+    const onResumeRefreshPush = () => {
+      if (document.visibilityState === 'hidden') return;
+      const now = Date.now();
+      if (now - lastResumePushSyncRef.current < 30_000) return;
+      lastResumePushSyncRef.current = now;
+      setPushReadyNonce((n) => n + 1);
+    };
     window.addEventListener('buh:push-ready', onPushReady);
-    return () => window.removeEventListener('buh:push-ready', onPushReady);
+    window.addEventListener('focus', onResumeRefreshPush);
+    window.addEventListener('online', onResumeRefreshPush);
+    document.addEventListener('visibilitychange', onResumeRefreshPush);
+    return () => {
+      window.removeEventListener('buh:push-ready', onPushReady);
+      window.removeEventListener('focus', onResumeRefreshPush);
+      window.removeEventListener('online', onResumeRefreshPush);
+      document.removeEventListener('visibilitychange', onResumeRefreshPush);
+    };
   }, []);
 
-  // Sync upcoming task reminders to the server Web Push scheduler so alerts fire even when the app is completely closed
+  // Sync upcoming reminders to BOTH the local Service Worker (PeriodicSync/BackgroundSync)
+  // AND the server Web Push scheduler so alerts fire even when the app is closed
   useEffect(() => {
-    if (!isOnline) return;
     if (getNotificationPermissionState() !== 'granted') return;
 
     const timer = window.setTimeout(() => {
-      void syncScheduledRemindersToPushServer(visibleTasks, {
+      const opts = {
         enabled: settings.taskRemindersEnabled !== false,
         silent: settings.reminderSound === false,
-      });
+      };
+      void syncRemindersToServiceWorker(visibleTasks, opts);
+      if (isOnline) {
+        void syncScheduledRemindersToPushServer(visibleTasks, opts);
+      }
     }, 350);
 
     return () => window.clearTimeout(timer);
@@ -2271,68 +4202,53 @@ export default function App() {
     pushReadyNonce,
   ]);
 
-  const handleCompleteFromReminderAlert = useCallback(
-    (alertId: string, taskId: string) => {
-      setActiveReminderAlerts((prev) => prev.filter((a) => a.id !== alertId && a.taskId !== taskId));
-      const localMatch = tasksRef.current.find((t) => t.id === taskId);
-      if (localMatch && !localMatch.completed) {
-        setTasks((prev) =>
-          prev.map((t) =>
-            t.id === taskId
-              ? { ...t, completed: true, completedAt: new Date().toISOString() }
-              : t
-          )
-        );
-        return;
-      }
-      const googleMatch = googleTasksRef.current.find((t) => t.id === taskId);
-      if (googleMatch && !googleMatch.completed) {
-        void handleToggleGoogleTask(googleMatch);
-      }
-    },
-    [handleToggleGoogleTask]
-  );
-
-  const rearmRelativeReminders = (prevTask: TaskItem | undefined, updated: TaskItem): TaskItem => {
-    if (
-      !prevTask ||
-      !updated.reminders ||
-      updated.reminders.length === 0 ||
-      (prevTask.dateKey === updated.dateKey && prevTask.timeLabel === updated.timeLabel)
-    ) {
-      return updated;
-    }
-    const now = Date.now();
-    return {
-      ...updated,
-      reminders: updated.reminders.map((r) => {
-        if (r.mode === 'relative' && r.firedAt) {
-          const nextTrigger = computeReminderTriggerMs(updated, r);
-          if (nextTrigger !== null && nextTrigger > now) {
-            return { ...r, firedAt: undefined };
-          }
-        }
-        return r;
-      }),
-    };
-  };
-
   const handleToggleTask = (taskId: string) => {
-    setTasks((prev) =>
-      prev.map((t) => {
+    const existing = tasksRef.current.find((t) => t.id === taskId);
+    const nextOcc =
+      existing && !existing.completed && existing.recurrence
+        ? buildNextRecurringTaskInstance(existing)
+        : null;
+
+    setTasks((prev) => {
+      const mapped = prev.map((t) => {
         if (t.id !== taskId) return t;
         const nextCompleted = !t.completed;
-        return {
+        const toggledTask: TaskItem = {
           ...t,
           completed: nextCompleted,
           completedAt: nextCompleted ? new Date().toISOString() : undefined,
         };
-      })
-    );
+        recordLocalTaskDirty(toggledTask, t);
+        return toggledTask;
+      });
+      if (nextOcc) {
+        const seriesId = nextOcc.recurrenceSeriesId;
+        const alreadyExists = mapped.some(
+          (t) =>
+            !t.completed &&
+            t.dateKey === nextOcc.dateKey &&
+            ((seriesId && (t.recurrenceSeriesId === seriesId || t.id === seriesId)) ||
+              (t.title.trim().toLowerCase() === nextOcc.title.trim().toLowerCase() &&
+                t.category === nextOcc.category))
+        );
+        if (!alreadyExists) {
+          recordLocalTaskDirty(nextOcc);
+          return [nextOcc, ...mapped];
+        }
+      }
+      return mapped;
+    });
+    if (nextOcc) {
+      const nextLabel = formatRelativeTaskDate(nextOcc.dateKey, {
+        includeMonthDayForRelative: true,
+      }).label;
+      showOfflineSyncNotice(`Next "${nextOcc.title}" scheduled for ${nextLabel}`);
+    }
     setActiveReminderAlerts((prev) => prev.filter((a) => a.taskId !== taskId));
   };
 
   const handleAddTask = (newTask: TaskItem) => {
+    recordLocalTaskDirty(newTask);
     setTasks((prev) => [newTask, ...prev]);
   };
 
@@ -2341,37 +4257,76 @@ export default function App() {
       setActiveReminderAlerts((prev) => prev.filter((a) => a.taskId !== updated.id));
     }
     if (updated.source === 'google') {
-      const nextTask = rearmRelativeReminders(
-        googleTasksRef.current.find((t) => t.id === updated.id),
-        updated
-      );
+      const prevGoogleTask = googleTasksRef.current.find((t) => t.id === updated.id);
+      const nextTask = rearmRelativeReminders(prevGoogleTask, updated);
       setGoogleTasks((prev) => prev.map((t) => (t.id === updated.id ? nextTask : t)));
-      setDirtyGoogleTaskIds((prev) => (prev.includes(updated.id) ? prev : [...prev, updated.id]));
-      // Automatically queue offline edits to Google Tasks so they sync once back online
-      if ((typeof navigator !== 'undefined' && !navigator.onLine) || !googleConnectedRef.current) {
+
+      const nextVersion = (googleTaskEditVersionRef.current.get(nextTask.id) ?? 0) + 1;
+      googleTaskEditVersionRef.current.set(nextTask.id, nextVersion);
+
+      const existingPending = pendingGoogleTaskAutoSyncRef.current.get(nextTask.id);
+      if (existingPending) {
+        window.clearTimeout(existingPending.timerId);
+        pendingGoogleTaskAutoSyncRef.current.delete(nextTask.id);
+      }
+
+      const tokenFresh = isCalendarAccessTokenFresh();
+      if (googleConnectedRef.current && !tokenFresh) {
+        setGoogleConnected(false);
+      }
+
+      const canAutoSyncOnline =
+        (typeof navigator === 'undefined' || navigator.onLine) &&
+        googleConnectedRef.current &&
+        tokenFresh &&
+        Boolean(nextTask.googleTaskId) &&
+        !nextTask.googleTaskId?.startsWith('offline-');
+
+      if (!canAutoSyncOnline) {
+        // Queue offline/paused edits to Google Tasks with pre-edit base snapshot so offline edits win on reconciliation
+        const baseTask = googleTaskBaseByIdRef.current.get(nextTask.id) ?? prevGoogleTask;
+        setDirtyGoogleTaskIds((prev) => (prev.includes(nextTask.id) ? prev : [...prev, nextTask.id]));
         setPendingSyncQueue((prev) =>
           enqueueSyncOp(prev, {
             id: makeSyncOpId(),
             type: 'gtask-update',
             taskId: nextTask.id,
             task: nextTask,
+            ...(baseTask ? { baseTask } : {}),
             createdAt: Date.now(),
           })
         );
+        return;
       }
+
+      // Online & connected: auto-sync edited Google Task after a short debounce
+      const timerId = window.setTimeout(() => {
+        pendingGoogleTaskAutoSyncRef.current.delete(nextTask.id);
+        void handleUpdateGoogleTask(nextTask, nextVersion).catch(() => {
+          // Error already recorded in googleTasksError & dirtyGoogleTaskIds
+        });
+      }, 550);
+      pendingGoogleTaskAutoSyncRef.current.set(nextTask.id, {
+        timerId,
+        version: nextVersion,
+        task: nextTask,
+      });
       return;
     }
-    setTasks((prev) =>
-      prev.map((t) => (t.id === updated.id ? rearmRelativeReminders(t, updated) : t))
-    );
+    const prevLocalTask = tasksRef.current.find((t) => t.id === updated.id);
+    const nextLocalTask = rearmRelativeReminders(prevLocalTask, updated);
+    recordLocalTaskDirty(nextLocalTask, prevLocalTask);
+    setTasks((prev) => prev.map((t) => (t.id === updated.id ? nextLocalTask : t)));
   };
 
   const handleDeleteTask = (taskId: string) => {
+    recordLocalTaskDeleted(taskId);
     setTasks((prev) => prev.filter((t) => t.id !== taskId));
     setActiveReminderAlerts((prev) => prev.filter((a) => a.taskId !== taskId));
   };
 
   const handleRestoreTask = (task: TaskItem, index?: number) => {
+    recordLocalTaskDirty(task);
     setTasks((prev) => {
       if (prev.some((t) => t.id === task.id)) return prev;
       const next = [...prev];
@@ -2400,7 +4355,12 @@ export default function App() {
       return prev.map((l) => (l === oldName ? clean : l));
     });
     setTasks((prev) =>
-      prev.map((t) => (t.category === oldName ? { ...t, category: clean } : t))
+      prev.map((t) => {
+        if (t.category !== oldName) return t;
+        const renamed = { ...t, category: clean };
+        recordLocalTaskDirty(renamed, t);
+        return renamed;
+      })
     );
     setEvents((prev) =>
       prev.map((ev) => (ev.calendarName === oldName ? { ...ev, calendarName: clean } : ev))
@@ -2412,7 +4372,12 @@ export default function App() {
     if (remaining.length === 0) return;
     setTaskLists(remaining);
     setTasks((prev) =>
-      prev.map((t) => (t.category === name ? { ...t, category: 'Inbox', isInbox: true } : t))
+      prev.map((t) => {
+        if (t.category !== name) return t;
+        const reassigned = { ...t, category: 'Inbox' };
+        recordLocalTaskDirty(reassigned, t);
+        return reassigned;
+      })
     );
     setEvents((prev) =>
       prev.map((ev) => (ev.calendarName === name ? { ...ev, calendarName: remaining[0] } : ev))
@@ -2572,7 +4537,9 @@ export default function App() {
       isInbox: false,
       notes: ev.location ? `Calendar location: ${ev.location}` : '',
       subtasks: [],
+      ...(ev.recurrence ? { recurrence: ev.recurrence } : {}),
     };
+    recordLocalTaskDirty(created);
     setTasks((prev) => [created, ...prev]);
     return created.id;
   };
@@ -2772,6 +4739,8 @@ export default function App() {
   };
 
   const handleResetDemo = () => {
+    cloudTaskJournalRef.current = { upserts: {}, deletes: {} };
+    clearCloudTaskJournal();
     setTasks(INITIAL_TASKS);
     setTaskLists(INITIAL_LISTS);
     setNoteFolders(INITIAL_NOTE_FOLDERS);
@@ -2793,361 +4762,219 @@ export default function App() {
     }
   };
 
-  const homeTabTitle =
-    decisions.defaultHome === DefaultHome.Inbox ? 'Inbox' : 'Overview';
+  const handleToggleDark = useCallback(() => setIsDark((d) => !d), []);
+  const handleUpdateSettings = useCallback(
+    (patch: Partial<AppSettingsState>) => setSettings((s) => ({ ...s, ...patch })),
+    []
+  );
+  const handleConsumeExternalOpenTask = useCallback(() => setExternalOpenTask(null), []);
+  const handleConsumeExternalShortcut = useCallback(() => setExternalShortcut(null), []);
+  const handleChangeDecisions = useCallback((patch: Partial<DesignDecisions>) => {
+    setDecisions((prev) => ({ ...prev, ...patch }));
+    setApproved(false);
+  }, []);
 
-  const screenTabs: { id: ScreenId; label: string }[] = [
-    { id: ScreenId.Home, label: homeTabTitle },
-    { id: ScreenId.Tasks, label: 'Tasks' },
-    { id: ScreenId.Agent, label: 'Lookup' },
-    { id: ScreenId.Notes, label: 'Notes' },
-    { id: ScreenId.Settings, label: 'Settings' },
-  ];
+  const activeTimeFormat = settings.timeFormat === '12h' ? '12h' : '24h';
+
+  const syncBannerNode = (
+    <OfflineIndicator
+      pendingSyncCount={pendingSyncQueue.length}
+      isSyncingQueue={isSyncingOfflineQueue}
+      isRefreshingGoogle={isRefreshingGoogleBanner}
+      syncNotice={offlineSyncNotice}
+      needsReconnectToSync={!googleConnected}
+      showQuietGoogleRefresh={showQuietGoogleRefresh}
+      reconnectDismissed={googleReconnectDismissed}
+      onSyncPending={handleTriggerPendingSync}
+      onDismissQuietRefresh={() => setGoogleReconnectDismissed(true)}
+    />
+  );
 
   if (isStandaloneAppMode) {
     const standaloneTokens = getDeviceStyleTokens(decisions.visualStyle);
     return (
-      <div
-        className={`fixed inset-x-0 top-[var(--buh-vv-top,0px)] h-[var(--buh-vh,100dvh)] w-full ${standaloneTokens.surfaceBg} text-stone-900 dark:text-stone-100 overflow-hidden`}
-      >
-        <FoldDeviceFrame
-          standalone
-          keyboardOpen={isVirtualKeyboardOpen}
-          onExitStandalone={
-            manualFullScreen && !isInstalledPwa ? () => setManualFullScreen(false) : undefined
-          }
-          posture={adaptiveNativePosture}
-          decisions={decisions}
-          activeScreen={activeScreen}
-          onChangeScreen={setActiveScreen}
-          isDark={isDark}
-          onToggleDark={() => setIsDark((d) => !d)}
-          showHingeGuide={false}
-          tasks={visibleTasks}
-          taskLists={taskLists}
-          noteFolders={noteFolders}
-          collapsedNoteFolders={collapsedNoteFolders}
-          events={visibleEvents}
-          notes={notes}
-          settings={settings}
-          onAddTask={handleAddTask}
-          onToggleTask={handleToggleTask}
-          onUpdateTask={handleUpdateTask}
-          onDeleteTask={handleDeleteTask}
-          onRestoreTask={handleRestoreTask}
-          onAddEvent={handleAddEvent}
-          onDeleteEvent={handleDeleteEvent}
-          onRestoreEvent={handleRestoreEvent}
-          onConvertEventToTask={handleConvertEventToTask}
-          onUpdateNote={handleUpdateNote}
-          onDeleteNote={handleDeleteNote}
-          onRestoreNote={handleRestoreNote}
-          onCreateNote={handleCreateNote}
-          onReorderNote={handleReorderNote}
-          onUpdateSettings={(patch) => setSettings((s) => ({ ...s, ...patch }))}
-          onAddList={handleAddList}
-          onRenameList={handleRenameList}
-          onDeleteList={handleDeleteList}
-          onReorderList={handleReorderList}
-          onAddNoteFolder={handleAddNoteFolder}
-          onRenameNoteFolder={handleRenameNoteFolder}
-          onDeleteNoteFolder={handleDeleteNoteFolder}
-          onReorderNoteFolder={handleReorderNoteFolder}
-          onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
-          onExpandNoteFolder={handleExpandNoteFolder}
-          recentColors={recentColors}
-          onPreviewAccentColor={handlePreviewAccentColor}
-          onSelectAccentColor={handleSelectAccentColor}
-          googleCalendar={googleCalendarState}
-          googleTasks={googleTasksState}
-          cloudNotesSync={cloudNotesSyncState}
-          activeReminderAlerts={activeReminderAlerts}
-          onDismissReminderAlert={handleDismissReminderAlert}
-          onSnoozeReminderAlert={handleSnoozeReminderAlert}
-          onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
-          externalOpenTask={externalOpenTask}
-          onConsumeExternalOpenTask={() => setExternalOpenTask(null)}
-          externalShortcut={externalShortcut}
-          onConsumeExternalShortcut={() => setExternalShortcut(null)}
-          hiddenCompletedTasksCount={hiddenCompletedTasksCount}
-        />
-        <OfflineIndicator
-          pendingSyncCount={pendingSyncQueue.length}
-          isSyncingQueue={isSyncingOfflineQueue}
-          syncNotice={offlineSyncNotice}
-          needsReconnectToSync={!googleConnected}
-          onSyncPending={handleTriggerPendingSync}
-        />
-        {showExitToast && (
+      <TimeFormatProvider value={activeTimeFormat}>
+        <div
+          className={`fixed inset-x-0 top-[var(--buh-vv-top,0px)] h-[var(--buh-vh,100dvh)] w-full ${standaloneTokens.surfaceBg} text-stone-900 dark:text-stone-100 overflow-hidden`}
+        >
           <div
-            role="status"
-            aria-live="polite"
-            className="pointer-events-none fixed bottom-20 left-1/2 -translate-x-1/2 z-[60] rounded-xl bg-stone-900/95 dark:bg-stone-100/95 px-4 py-2.5 text-[13px] font-medium text-white dark:text-stone-900 shadow-xl border border-stone-700/60 dark:border-stone-300/60 whitespace-nowrap"
+            style={dpiCompensationZoom > 1.01 ? { zoom: dpiCompensationZoom } : undefined}
+            className="h-full w-full overflow-hidden"
           >
-            Press back again to exit
+            <FoldDeviceFrame
+              standalone
+              keyboardOpen={isVirtualKeyboardOpen}
+              onExitStandalone={
+                manualFullScreen && !isInstalledPwa ? () => setManualFullScreen(false) : undefined
+              }
+              posture={adaptiveNativePosture}
+              decisions={decisions}
+              activeScreen={activeScreen}
+              onChangeScreen={setActiveScreen}
+              isDark={isDark}
+              onToggleDark={handleToggleDark}
+              showHingeGuide={false}
+              tasks={visibleTasks}
+              taskLists={taskLists}
+              noteFolders={noteFolders}
+              collapsedNoteFolders={collapsedNoteFolders}
+              events={visibleEvents}
+              notes={notes}
+              settings={settings}
+              onAddTask={handleAddTask}
+              onToggleTask={handleToggleTask}
+              onUpdateTask={handleUpdateTask}
+              onDeleteTask={handleDeleteTask}
+              onRestoreTask={handleRestoreTask}
+              onAddEvent={handleAddEvent}
+              onDeleteEvent={handleDeleteEvent}
+              onRestoreEvent={handleRestoreEvent}
+              onConvertEventToTask={handleConvertEventToTask}
+              onUpdateNote={handleUpdateNote}
+              onDeleteNote={handleDeleteNote}
+              onRestoreNote={handleRestoreNote}
+              onCreateNote={handleCreateNote}
+              onReorderNote={handleReorderNote}
+              onUpdateSettings={handleUpdateSettings}
+              onAddList={handleAddList}
+              onRenameList={handleRenameList}
+              onDeleteList={handleDeleteList}
+              onReorderList={handleReorderList}
+              onAddNoteFolder={handleAddNoteFolder}
+              onRenameNoteFolder={handleRenameNoteFolder}
+              onDeleteNoteFolder={handleDeleteNoteFolder}
+              onReorderNoteFolder={handleReorderNoteFolder}
+              onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
+              onExpandNoteFolder={handleExpandNoteFolder}
+              recentColors={recentColors}
+              onPreviewAccentColor={handlePreviewAccentColor}
+              onSelectAccentColor={handleSelectAccentColor}
+              googleCalendar={googleCalendarState}
+              googleTasks={googleTasksState}
+              cloudNotesSync={cloudNotesSyncState}
+              quickCheckEntries={quickCheckEntries}
+              onChangeQuickCheckEntries={setQuickCheckEntries}
+              activeReminderAlerts={activeReminderAlerts}
+              onDismissReminderAlert={handleDismissReminderAlert}
+              onSnoozeReminderAlert={handleSnoozeReminderAlert}
+              onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
+              externalOpenTask={externalOpenTask}
+              onConsumeExternalOpenTask={handleConsumeExternalOpenTask}
+              externalShortcut={externalShortcut}
+              onConsumeExternalShortcut={handleConsumeExternalShortcut}
+              hiddenCompletedTasksCount={hiddenCompletedTasksCount}
+              syncBanner={syncBannerNode}
+            />
+            {showExitToast && (
+              <div
+                role="status"
+                aria-live="polite"
+                className="pointer-events-none fixed bottom-20 left-1/2 -translate-x-1/2 z-[60] rounded-xl bg-stone-900/95 dark:bg-stone-100/95 px-4 py-2.5 text-[13px] font-medium text-white dark:text-stone-900 shadow-xl border border-stone-700/60 dark:border-stone-300/60 whitespace-nowrap"
+              >
+                Press back again to exit
+              </div>
+            )}
           </div>
-        )}
-      </div>
+        </div>
+      </TimeFormatProvider>
     );
   }
 
   return (
-    <div className="min-h-screen bg-[#F6F7F5] dark:bg-[#0D100E] text-stone-900 dark:text-stone-100 transition-colors">
-      <StudioHeader onApproveClick={() => setApprovalOpen(true)} approved={approved} />
-
-      <main className="max-w-[1440px] mx-auto px-6 py-4 space-y-4">
-        {/* Compact Workspace Title + Quick Actions */}
-        <section id="preview" className="flex flex-wrap items-center justify-between gap-4">
-          <div>
-            <h1 className="font-display text-xl sm:text-2xl font-semibold tracking-tight text-stone-900 dark:text-stone-100">
-              Galaxy Z Fold 8 UI Review
-            </h1>
-            <p className="text-xs text-stone-500 dark:text-stone-400">
-              Switch postures, test live screens, and lock in your design preferences.
-            </p>
-          </div>
-
-          <div className="flex flex-wrap items-center gap-2 shrink-0">
-            <PWAInstallButton />
-            <button
-              type="button"
-              onClick={() => setManualFullScreen(true)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white dark:bg-[#161917] border border-stone-200 dark:border-stone-800 text-stone-700 dark:text-stone-200 hover:bg-stone-50 dark:hover:bg-stone-800 transition-colors whitespace-nowrap"
-            >
-              <Maximize2 className="w-3.5 h-3.5" />
-              App mode
-            </button>
-            <button
-              type="button"
-              onClick={handleDownloadSource}
-              disabled={exportingSource}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white dark:bg-[#161917] border border-stone-200 dark:border-stone-800 text-stone-700 dark:text-stone-200 hover:bg-stone-50 dark:hover:bg-stone-800 transition-colors whitespace-nowrap disabled:opacity-60"
-            >
-              {exportingSource ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <Download className="w-3.5 h-3.5" />
-              )}
-              {exportingSource ? 'Exporting...' : 'Download source (.zip)'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setIsDark((d) => !d)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white dark:bg-[#161917] border border-stone-200 dark:border-stone-800 text-stone-700 dark:text-stone-200 hover:bg-stone-50 dark:hover:bg-stone-800 transition-colors whitespace-nowrap"
-            >
-              {isDark ? <Sun className="w-3.5 h-3.5" /> : <Moon className="w-3.5 h-3.5" />}
-              {isDark ? 'Light' : 'Dark'}
-            </button>
-            <button
-              type="button"
-              onClick={handleResetDemo}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-white dark:bg-[#161917] border border-stone-200 dark:border-stone-800 text-stone-700 dark:text-stone-200 hover:bg-stone-50 dark:hover:bg-stone-800 transition-colors whitespace-nowrap"
-            >
-              <RotateCcw className="w-3.5 h-3.5" />
-              Reset data
-            </button>
-          </div>
-        </section>
-
-        {/* Single-Viewport Workspace: Simulator Stage (Left) + Design Decisions Inspector (Right) */}
-        <section className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-          {/* Left Stage: Galaxy Z Fold 8 Simulator */}
-          <div className="lg:col-span-7 xl:col-span-8 space-y-3">
-            {/* Unified Posture & Screen Toolbar */}
-            <div
-              id="screen-bar"
-              className="flex flex-wrap items-center justify-between gap-2 bg-white dark:bg-[#161917] border border-stone-200/80 dark:border-stone-800 rounded-2xl p-2"
-            >
-              {/* Posture Switcher */}
-              <div className="flex items-center gap-1 p-0.5 bg-stone-100 dark:bg-stone-800/80 rounded-xl">
-                <button
-                  type="button"
-                  onClick={() => setPosture(FoldPosture.Cover)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-                    posture === FoldPosture.Cover
-                      ? 'bg-white dark:bg-[#1E2220] text-stone-900 dark:text-stone-100 shadow-xs'
-                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100'
-                  }`}
-                >
-                  <Smartphone className="w-3.5 h-3.5" />
-                  Cover 10:16
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPosture(FoldPosture.Inner)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-                    posture === FoldPosture.Inner
-                      ? 'bg-white dark:bg-[#1E2220] text-stone-900 dark:text-stone-100 shadow-xs'
-                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100'
-                  }`}
-                >
-                  <Tablet className="w-3.5 h-3.5" />
-                  Inner 4:3
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setPosture(FoldPosture.Flex)}
-                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-                    posture === FoldPosture.Flex
-                      ? 'bg-white dark:bg-[#1E2220] text-stone-900 dark:text-stone-100 shadow-xs'
-                      : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100'
-                  }`}
-                >
-                  <SplitSquareVertical className="w-3.5 h-3.5" />
-                  Flex
-                </button>
-              </div>
-
-              {/* Screen Quick-Jump Tabs + Optional Hinge Guide */}
-              <div className="flex flex-wrap items-center gap-1.5">
-                {posture === FoldPosture.Inner && (
-                  <button
-                    type="button"
-                    onClick={() => setShowHingeGuide((v) => !v)}
-                    className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
-                      showHingeGuide
-                        ? 'bg-[var(--tf-accent-soft)] border-[var(--tf-accent-border)] text-[var(--tf-accent-text)]'
-                        : 'border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-50 dark:hover:bg-stone-800'
-                    }`}
-                  >
-                    <Columns2 className="w-3 h-3" />
-                    Hinge
-                  </button>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => setSimulatedKeyboardOpen((v) => !v)}
-                  aria-pressed={simulatedKeyboardOpen}
-                  title="Toggle simulated Android on-screen keyboard inside the device preview"
-                  className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
-                    simulatedKeyboardOpen
-                      ? 'bg-[var(--tf-accent-soft)] border-[var(--tf-accent-border)] text-[var(--tf-accent-text)]'
-                      : 'border-stone-200 dark:border-stone-700 text-stone-600 dark:text-stone-300 hover:bg-stone-50 dark:hover:bg-stone-800'
-                  }`}
-                >
-                  <Keyboard className="w-3.5 h-3.5" />
-                  Android KB
-                </button>
-
-                <div className="flex items-center gap-0.5 p-0.5 bg-stone-100 dark:bg-stone-800/80 rounded-xl">
-                  {screenTabs.map((tab) => {
-                    const active = activeScreen === tab.id;
-                    return (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        onClick={() => setActiveScreen(tab.id)}
-                        className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-colors whitespace-nowrap ${
-                          active
-                            ? 'bg-[var(--tf-accent-soft)] text-[var(--tf-accent-text)]'
-                            : 'text-stone-600 dark:text-stone-400 hover:text-stone-900 dark:hover:text-stone-100'
-                        }`}
-                      >
-                        {tab.label}
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-
-            {/* Interactive Device Canvas */}
-            <div className="bg-[#ECEEE9] dark:bg-[#131614] border border-stone-200/80 dark:border-stone-800 rounded-3xl p-4 sm:p-5 flex items-center justify-center">
-              <FoldDeviceFrame
-                posture={posture}
-                keyboardOpen={simulatedKeyboardOpen}
-                onDismissKeyboard={() => setSimulatedKeyboardOpen(false)}
-                decisions={decisions}
-                activeScreen={activeScreen}
-                onChangeScreen={setActiveScreen}
-                isDark={isDark}
-                onToggleDark={() => setIsDark((d) => !d)}
-                showHingeGuide={showHingeGuide}
-                tasks={visibleTasks}
-                taskLists={taskLists}
-                noteFolders={noteFolders}
-                collapsedNoteFolders={collapsedNoteFolders}
-                events={visibleEvents}
-                notes={notes}
-                settings={settings}
-                onAddTask={handleAddTask}
-                onToggleTask={handleToggleTask}
-                onUpdateTask={handleUpdateTask}
-                onDeleteTask={handleDeleteTask}
-                onRestoreTask={handleRestoreTask}
-                onAddEvent={handleAddEvent}
-                onDeleteEvent={handleDeleteEvent}
-                onRestoreEvent={handleRestoreEvent}
-                onConvertEventToTask={handleConvertEventToTask}
-                onUpdateNote={handleUpdateNote}
-                onDeleteNote={handleDeleteNote}
-                onRestoreNote={handleRestoreNote}
-                onCreateNote={handleCreateNote}
-                onReorderNote={handleReorderNote}
-                onUpdateSettings={(patch) => setSettings((s) => ({ ...s, ...patch }))}
-                onAddList={handleAddList}
-                onRenameList={handleRenameList}
-                onDeleteList={handleDeleteList}
-                onReorderList={handleReorderList}
-                onAddNoteFolder={handleAddNoteFolder}
-                onRenameNoteFolder={handleRenameNoteFolder}
-                onDeleteNoteFolder={handleDeleteNoteFolder}
-                onReorderNoteFolder={handleReorderNoteFolder}
-                onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
-                onExpandNoteFolder={handleExpandNoteFolder}
-                recentColors={recentColors}
-                onPreviewAccentColor={handlePreviewAccentColor}
-                onSelectAccentColor={handleSelectAccentColor}
-                googleCalendar={googleCalendarState}
-                googleTasks={googleTasksState}
-                cloudNotesSync={cloudNotesSyncState}
-                activeReminderAlerts={activeReminderAlerts}
-                onDismissReminderAlert={handleDismissReminderAlert}
-                onSnoozeReminderAlert={handleSnoozeReminderAlert}
-                onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
-                externalOpenTask={externalOpenTask}
-                onConsumeExternalOpenTask={() => setExternalOpenTask(null)}
-                externalShortcut={externalShortcut}
-                onConsumeExternalShortcut={() => setExternalShortcut(null)}
-                hiddenCompletedTasksCount={hiddenCompletedTasksCount}
-              />
-            </div>
-          </div>
-
-          {/* Right Rail: Compact Design Decisions & Notes */}
-          <aside className="lg:col-span-5 xl:col-span-4 bg-white dark:bg-[#161917] border border-stone-200/80 dark:border-stone-800 rounded-2xl p-4 sm:p-5">
-            <DesignDecisionsPanel
-              decisions={decisions}
-              onChangeDecisions={(patch) => {
-                setDecisions((prev) => ({ ...prev, ...patch }));
-                setApproved(false);
-              }}
-              onSelectAccentColor={handleSelectAccentColor}
-              reviewNote={reviewNote}
-              onChangeReviewNote={setReviewNote}
-            />
-          </aside>
-        </section>
-      </main>
-
-      <ApprovalModal
-        open={approvalOpen}
-        decisions={decisions}
-        reviewNote={reviewNote}
-        onClose={() => setApprovalOpen(false)}
-        onConfirmApprove={() => {
-          setApproved(true);
-          setApprovalOpen(false);
-        }}
-      />
-      <OfflineIndicator
-        pendingSyncCount={pendingSyncQueue.length}
-        isSyncingQueue={isSyncingOfflineQueue}
-        syncNotice={offlineSyncNotice}
-        needsReconnectToSync={!googleConnected}
-        onSyncPending={handleTriggerPendingSync}
-      />
+    <TimeFormatProvider value={activeTimeFormat}>
+      <Suspense fallback={<div className="min-h-screen bg-[#F6F7F5] dark:bg-[#0D100E]" />}>
+        <StudioPreviewShell
+          posture={posture}
+          onChangePosture={setPosture}
+          activeScreen={activeScreen}
+          onChangeScreen={setActiveScreen}
+          decisions={decisions}
+          onChangeDecisions={handleChangeDecisions}
+          onSelectAccentColor={handleSelectAccentColor}
+          reviewNote={reviewNote}
+          onChangeReviewNote={setReviewNote}
+          approved={approved}
+          approvalOpen={approvalOpen}
+          onOpenApproval={() => setApprovalOpen(true)}
+          onCloseApproval={() => setApprovalOpen(false)}
+          onConfirmApprove={() => {
+            setApproved(true);
+            setApprovalOpen(false);
+          }}
+          isDark={isDark}
+          onToggleDark={handleToggleDark}
+          showHingeGuide={showHingeGuide}
+          onToggleHingeGuide={() => setShowHingeGuide((v) => !v)}
+          simulatedKeyboardOpen={simulatedKeyboardOpen}
+          onToggleSimulatedKeyboard={() => setSimulatedKeyboardOpen((v) => !v)}
+          exportingSource={exportingSource}
+          onDownloadSource={handleDownloadSource}
+          onResetDemo={handleResetDemo}
+          onEnterAppMode={() => setManualFullScreen(true)}
+        >
+          <FoldDeviceFrame
+            posture={posture}
+            keyboardOpen={simulatedKeyboardOpen}
+            onDismissKeyboard={() => setSimulatedKeyboardOpen(false)}
+            decisions={decisions}
+            activeScreen={activeScreen}
+            onChangeScreen={setActiveScreen}
+            isDark={isDark}
+            onToggleDark={handleToggleDark}
+            showHingeGuide={showHingeGuide}
+            tasks={visibleTasks}
+            taskLists={taskLists}
+            noteFolders={noteFolders}
+            collapsedNoteFolders={collapsedNoteFolders}
+            events={visibleEvents}
+            notes={notes}
+            settings={settings}
+            onAddTask={handleAddTask}
+            onToggleTask={handleToggleTask}
+            onUpdateTask={handleUpdateTask}
+            onDeleteTask={handleDeleteTask}
+            onRestoreTask={handleRestoreTask}
+            onAddEvent={handleAddEvent}
+            onDeleteEvent={handleDeleteEvent}
+            onRestoreEvent={handleRestoreEvent}
+            onConvertEventToTask={handleConvertEventToTask}
+            onUpdateNote={handleUpdateNote}
+            onDeleteNote={handleDeleteNote}
+            onRestoreNote={handleRestoreNote}
+            onCreateNote={handleCreateNote}
+            onReorderNote={handleReorderNote}
+            onUpdateSettings={handleUpdateSettings}
+            onAddList={handleAddList}
+            onRenameList={handleRenameList}
+            onDeleteList={handleDeleteList}
+            onReorderList={handleReorderList}
+            onAddNoteFolder={handleAddNoteFolder}
+            onRenameNoteFolder={handleRenameNoteFolder}
+            onDeleteNoteFolder={handleDeleteNoteFolder}
+            onReorderNoteFolder={handleReorderNoteFolder}
+            onToggleNoteFolderCollapsed={handleToggleNoteFolderCollapsed}
+            onExpandNoteFolder={handleExpandNoteFolder}
+            recentColors={recentColors}
+            onPreviewAccentColor={handlePreviewAccentColor}
+            onSelectAccentColor={handleSelectAccentColor}
+            googleCalendar={googleCalendarState}
+            googleTasks={googleTasksState}
+            cloudNotesSync={cloudNotesSyncState}
+            quickCheckEntries={quickCheckEntries}
+            onChangeQuickCheckEntries={setQuickCheckEntries}
+            activeReminderAlerts={activeReminderAlerts}
+            onDismissReminderAlert={handleDismissReminderAlert}
+            onSnoozeReminderAlert={handleSnoozeReminderAlert}
+            onCompleteFromReminderAlert={handleCompleteFromReminderAlert}
+            externalOpenTask={externalOpenTask}
+            onConsumeExternalOpenTask={handleConsumeExternalOpenTask}
+            externalShortcut={externalShortcut}
+            onConsumeExternalShortcut={handleConsumeExternalShortcut}
+            hiddenCompletedTasksCount={hiddenCompletedTasksCount}
+            syncBanner={syncBannerNode}
+          />
+        </StudioPreviewShell>
+      </Suspense>
       {showExitToast && (
         <div
           role="status"
@@ -3157,6 +4984,6 @@ export default function App() {
           Press back again to exit
         </div>
       )}
-    </div>
+    </TimeFormatProvider>
   );
 }

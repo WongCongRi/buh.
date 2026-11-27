@@ -56,6 +56,59 @@
       },
       "required": ["ownerId", "folders", "collapsedFolders", "createdAt", "updatedAt"]
     },
+    "WorkspacePreferences": {
+      "title": "WorkspacePreferences",
+      "description": "Per-user task lists, app settings, theme/appearance decisions, and recent accent colors for silent buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "taskLists": {
+          "type": "array",
+          "description": "Ordered list of custom task list names (1 to 50 items, each 1 to 100 chars)."
+        },
+        "settings": {
+          "type": "object",
+          "description": "User application settings map matching AppSettingsState."
+        },
+        "decisions": {
+          "type": "object",
+          "description": "User visual style, navigation mode, quick capture, default home, and hex accent color."
+        },
+        "recentColors": {
+          "type": "array",
+          "description": "Recently used accent hex colors (0 to 12 items, each #RRGGBB)."
+        },
+        "darkMode": {
+          "type": "boolean",
+          "description": "Whether dark mode is enabled."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when workspace preferences were created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when workspace preferences were last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "taskLists",
+        "settings",
+        "decisions",
+        "recentColors",
+        "darkMode",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
     "CloudNote": {
       "title": "CloudNote",
       "description": "A user-owned note document synchronized across devices via buh. Cloud Sync.",
@@ -128,6 +181,302 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "CloudTask": {
+      "title": "CloudTask",
+      "description": "A user-owned local task synchronized silently across devices via buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier matching the Firestore document ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the task owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Task title text.",
+          "maxLength": 300
+        },
+        "timeLabel": {
+          "type": "string",
+          "description": "Task due time label (e.g., '09:00 AM' or 'No time set').",
+          "maxLength": 40
+        },
+        "dateKey": {
+          "type": "string",
+          "description": "Local due date key in YYYY-MM-DD format (or empty string).",
+          "maxLength": 20
+        },
+        "category": {
+          "type": "string",
+          "description": "Task list / category name.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "priority": {
+          "type": "string",
+          "description": "Task priority level.",
+          "enum": ["High", "Normal", "Low"]
+        },
+        "completed": {
+          "type": "boolean",
+          "description": "Whether the task is completed."
+        },
+        "completedAt": {
+          "type": "string",
+          "description": "Optional ISO timestamp when task was completed.",
+          "maxLength": 40
+        },
+        "isInbox": {
+          "type": "boolean",
+          "description": "Whether the task belongs to Inbox."
+        },
+        "notes": {
+          "type": "string",
+          "description": "Task detail notes.",
+          "maxLength": 10000
+        },
+        "subtasks": {
+          "type": "array",
+          "description": "Ordered list of subtasks (up to 100 maps with id, title, done)."
+        },
+        "reminders": {
+          "type": "array",
+          "description": "Task reminder triggers (up to 20 maps)."
+        },
+        "recurrence": {
+          "type": "object",
+          "description": "Optional recurrence rule map (frequency, interval, optional daysOfWeek, optional endDateKey)."
+        },
+        "recurrenceSeriesId": {
+          "type": "string",
+          "description": "Optional recurrence series identifier.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the task was created in cloud sync."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the task was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "timeLabel",
+        "dateKey",
+        "category",
+        "priority",
+        "completed",
+        "isInbox",
+        "notes",
+        "subtasks",
+        "reminders",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudEvent": {
+      "title": "CloudEvent",
+      "description": "A user-owned local schedule block synchronized silently across devices via buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier matching the Firestore document ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the schedule block owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "description": "Schedule block title.",
+          "maxLength": 300
+        },
+        "dateKey": {
+          "type": "string",
+          "description": "Start date key in YYYY-MM-DD format.",
+          "maxLength": 20
+        },
+        "endDateKey": {
+          "type": "string",
+          "description": "Optional multi-day end date key in YYYY-MM-DD format.",
+          "maxLength": 20
+        },
+        "startTime": {
+          "type": "string",
+          "description": "Start time in HH:MM format.",
+          "maxLength": 10
+        },
+        "endTime": {
+          "type": "string",
+          "description": "End time in HH:MM format.",
+          "maxLength": 10
+        },
+        "durationMinutes": {
+          "type": "number",
+          "description": "Duration in minutes (1 to 10080)."
+        },
+        "calendarName": {
+          "type": "string",
+          "description": "Category / calendar name.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "location": {
+          "type": "string",
+          "description": "Optional location string.",
+          "maxLength": 300
+        },
+        "linkedTaskId": {
+          "type": "string",
+          "description": "Optional linked task identifier.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recurrence": {
+          "type": "object",
+          "description": "Optional recurrence rule map."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the schedule block was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the schedule block was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "dateKey",
+        "startTime",
+        "endTime",
+        "durationMinutes",
+        "calendarName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "CloudLookupEntry": {
+      "title": "CloudLookupEntry",
+      "description": "A user-owned Lookup Q&A history entry synchronized across devices via buh. Cloud Sync.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique identifier matching the Firestore document ID.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "description": "Firebase Auth UID of the Lookup entry owner.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "prompt": {
+          "type": "string",
+          "description": "User Lookup query text.",
+          "maxLength": 2000
+        },
+        "answer": {
+          "type": "string",
+          "description": "Rendered Lookup answer text.",
+          "maxLength": 40000
+        },
+        "sources": {
+          "type": "array",
+          "description": "Grounded citation sources (up to 30 maps with title and uri)."
+        },
+        "media": {
+          "type": "array",
+          "description": "Grounded image and video preview items (up to 20 maps)."
+        },
+        "webSearchQueries": {
+          "type": "array",
+          "description": "Search queries executed for grounding (up to 20 strings, each <= 300 chars)."
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "Formatted display timestamp string.",
+          "maxLength": 60
+        },
+        "usedAgenda": {
+          "type": "boolean",
+          "description": "Whether personal agenda context was included in this Lookup query."
+        },
+        "savedTask": {
+          "type": "boolean",
+          "description": "Whether this Lookup entry has been saved as a task."
+        },
+        "savedTaskId": {
+          "type": "string",
+          "description": "Optional ID of the task created from this Lookup entry.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "savedNote": {
+          "type": "boolean",
+          "description": "Whether this Lookup entry has been saved as a note."
+        },
+        "savedNoteId": {
+          "type": "string",
+          "description": "Optional ID of the note created from this Lookup entry.",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "orderMs": {
+          "type": "number",
+          "description": "Epoch milliseconds for stable chronological ordering across devices."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the Lookup entry was created in cloud sync."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the Lookup entry was last updated."
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "prompt",
+        "answer",
+        "sources",
+        "media",
+        "webSearchQueries",
+        "timestamp",
+        "usedAgenda",
+        "orderMs",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -141,13 +490,31 @@
       "schema": {
         "$ref": "#/entities/NotePreferences"
       },
-      "description": "User note folder order and collapsed folder preferences (document ID 'notes')."
+      "description": "User preference documents: 'notes' (NotePreferences) and 'workspace' (WorkspacePreferences)."
     },
     "/users/{userId}/notes/{noteId}": {
       "schema": {
         "$ref": "#/entities/CloudNote"
       },
       "description": "User-owned notes synced in real time across devices."
+    },
+    "/users/{userId}/tasks/{taskId}": {
+      "schema": {
+        "$ref": "#/entities/CloudTask"
+      },
+      "description": "User-owned local tasks synced silently in real time across devices."
+    },
+    "/users/{userId}/events/{eventId}": {
+      "schema": {
+        "$ref": "#/entities/CloudEvent"
+      },
+      "description": "User-owned local schedule time blocks synced silently in real time across devices."
+    },
+    "/users/{userId}/lookupEntries/{entryId}": {
+      "schema": {
+        "$ref": "#/entities/CloudLookupEntry"
+      },
+      "description": "User-owned Lookup Q&A history entries synced silently in real time across devices."
     }
   }
 }
